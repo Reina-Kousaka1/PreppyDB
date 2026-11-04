@@ -383,7 +383,9 @@ fn login_flow_and_session_tokens() {
     // runs it orders of magnitude slower than native hardware, so the default 10 s client
     // timeout is not enough there.
     let slow = std::time::Duration::from_secs(120);
-    let mut client = Client::anonymous(&server.base_url).unwrap().with_timeout(slow);
+    let mut client = Client::anonymous(&server.base_url)
+        .unwrap()
+        .with_timeout(slow);
     // The server notices edits to auth.json when it handles a request; on filesystems
     // with whole-second timestamps (and under emulation) that can take a moment.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -409,7 +411,9 @@ fn login_flow_and_session_tokens() {
         client.stats().is_ok(),
         "session token must work for API calls"
     );
-    let mut wrong = Client::anonymous(&server.base_url).unwrap().with_timeout(slow);
+    let mut wrong = Client::anonymous(&server.base_url)
+        .unwrap()
+        .with_timeout(slow);
     let err = wrong.login("admin", "wrong password!!").unwrap_err();
     assert_eq!(err.status(), Some(401));
     // No secret ever leaks in the login response.
