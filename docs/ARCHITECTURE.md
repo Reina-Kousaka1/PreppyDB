@@ -43,7 +43,7 @@ hand-written and only as good as its tests. See [TESTING.md](TESTING.md) and
 
 ```
 <data-dir>/
-  LOCK                      advisory lock (pid + start time); one writer per directory
+  LOCK                      OS advisory lock (pid/version metadata); one writer per directory
   MANIFEST                  current generation: snapshot ref + last sequence number
   auth.json                 credentials and API tokens (mode 0600)
   pricing-audit.log         append-only pricing audit chain
@@ -112,9 +112,11 @@ the manifest points at a snapshot that is not fully written and flushed.
 
 ## Concurrency model
 
-* **Cross-process:** a lock file holding pid and process start time. A second process
-  (server or CLI) fails with `database_locked` (HTTP 503) rather than corrupting data.
-  Stale locks from dead processes are taken over.
+* **Cross-process:** an OS advisory lock (`File::try_lock` → `flock`/`LockFileEx`) on the
+  `LOCK` file, which the kernel releases when the owner dies. A second process (server or
+  CLI) fails with `database_locked` (HTTP 503) rather than corrupting data, and a crash
+  never leaves a lock that has to be removed by hand. The file also records the owner's
+  pid, start time and version for diagnostics.
 * **In-process:** one writer mutex; readers take a read lock on the store. Readers never
   block readers, writers never interleave.
 * **HTTP:** a bounded worker pool (default 4) with a request queue; each request is

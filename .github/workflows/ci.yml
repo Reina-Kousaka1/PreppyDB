@@ -41,6 +41,9 @@ jobs:
       - name: Unit and integration tests
         run: cargo test --workspace --locked
 
+      - name: Build the binaries used by the end-to-end scripts
+        run: cargo build --locked --bin preppydb-server --bin preppydb
+
       - name: Crash recovery (kill -9 a live server, restart, verify)
         run: bash scripts/crash-recovery-test.sh
 
@@ -135,6 +138,9 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
+          # The crash test re-executes the test binary; qemu-user cannot do that without
+          # binfmt_misc. It runs on the native x86-64 and Windows jobs instead.
+          PREPPYDB_SKIP_CHILD_CRASH: "1"
         run: cargo test --workspace --locked --target aarch64-unknown-linux-gnu
 
   # ------------------------------------------------------------------- Lua client

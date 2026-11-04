@@ -31,7 +31,11 @@ covered by the tests enumerated in [docs/TESTING.md](docs/TESTING.md); the items
 * Consistency checks (`verify`) over manifest, snapshots and every WAL segment.
 * Backup archive format (`PPDBBAK1`) with per-member and whole-file SHA-256, verified
   restore that never deletes existing data.
-* Single-writer lock per directory with stale-lock takeover.
+* Single-writer lock per directory, implemented as an OS advisory lock
+  (`File::try_lock`) so the kernel releases it when the owner dies — no stale pid files.
+* `replace_file` helper: the temp-file-then-rename pattern used by the manifest,
+  snapshots, backups and `auth.json` also works on Windows, where a plain rename cannot
+  replace an existing file.
 
 **Server (`preppydb-server`)**
 
@@ -65,6 +69,11 @@ covered by the tests enumerated in [docs/TESTING.md](docs/TESTING.md); the items
   Docker architectures (build only, never pushed).
 * Documentation: architecture, API, operations, data model, pricing, CLI, testing,
   security policy.
+
+### Requirements
+
+* Rust **1.89** or newer (the lock uses the stabilised `File::try_lock`), `cargo test`
+  needs only the standard library.
 
 ### Not verified in the 0.1.0 environment
 

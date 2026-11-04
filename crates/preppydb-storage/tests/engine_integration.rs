@@ -361,6 +361,14 @@ fn ttl_expires_and_sweep_is_logged() {
 fn crash_recovery_keeps_committed_writes() {
     // A child process writes documents and then aborts without any clean shutdown.
     // Everything that was committed with sync=always must be present afterwards.
+    //
+    // Running the tests under emulation (CI uses qemu-user for aarch64) cannot exec the
+    // test binary a second time without binfmt_misc, so the job sets this flag and the
+    // test is skipped there instead of failing for the wrong reason.
+    if std::env::var_os("PREPPYDB_SKIP_CHILD_CRASH").is_some() {
+        eprintln!("skipping crash test: PREPPYDB_SKIP_CHILD_CRASH is set (emulated run)");
+        return;
+    }
     let dir = tempdir("crash");
     let exe = std::env::current_exe().unwrap();
     let status = std::process::Command::new(&exe)

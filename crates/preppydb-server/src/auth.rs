@@ -333,7 +333,7 @@ impl AuthStore {
         let tmp = self.path.with_extension("json.tmp");
         preppydb_storage::lock::write_private(&tmp, text.as_bytes())
             .map_err(|err| AuthError(err.to_string()))?;
-        std::fs::rename(&tmp, &self.path)
+        preppydb_storage::fsutil::replace_file(&tmp, &self.path)
             .map_err(|err| AuthError(format!("replacing auth file: {err}")))?;
         Ok(())
     }

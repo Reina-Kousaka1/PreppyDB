@@ -5,17 +5,15 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 /// Encode bytes using the URL-safe alphabet without padding.
 pub fn base64_url_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    let mut chunks = data.chunks_exact(3);
-    for chunk in &mut chunks {
-        let n = ((chuk_byte(chunk, 0) as u32) << 16)
-            | ((chuk_byte(chunk, 1) as u32) << 8)
-            | chuk_byte(chunk, 2) as u32;
+    let (chunks, remainder) = data.as_chunks::<3>();
+    for chunk in chunks {
+        let n = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | chunk[2] as u32;
         out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
         out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
         out.push(ALPHABET[(n >> 6) as usize & 0x3f] as char);
         out.push(ALPHABET[n as usize & 0x3f] as char);
     }
-    match chunks.remainder() {
+    match remainder {
         [] => {}
         [a] => {
             let n = (*a as u32) << 16;
@@ -31,10 +29,6 @@ pub fn base64_url_encode(data: &[u8]) -> String {
         _ => unreachable!("chunks_exact leaves at most two bytes"),
     }
     out
-}
-
-fn chuk_byte(chunk: &[u8], idx: usize) -> u8 {
-    chunk[idx]
 }
 
 /// Decode URL-safe base64. Padding characters are tolerated at the end.

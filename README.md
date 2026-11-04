@@ -163,7 +163,8 @@ at the cost of hand-written JSON/crypto primitives (see
   snapshot, atomically replaces the manifest and deletes retired segments. Recovery
   replays surviving segments after the snapshot sequence number and truncates a torn
   tail with an explicit report instead of silently guessing.
-* **Concurrency.** One process owns the directory (advisory lock file). Inside the
+* **Concurrency.** One process owns the directory (OS advisory lock, released by the
+  kernel when the process dies). Inside the
   process a writer mutex serialises mutations; readers use the in-memory store under a
   read lock. Transactions are read-committed with read-your-writes buffering and
   version validation at commit; there is no automatic retry, conflicts surface as

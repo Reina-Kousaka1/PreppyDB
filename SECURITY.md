@@ -64,8 +64,9 @@ These controls exist in the code today; each is covered by the tests listed in
 
 **Operational hygiene**
 
-* One writer per directory, enforced with a pid+start-time lock file, so two processes
-  cannot interleave writes.
+* One writer per directory, enforced with an OS advisory lock on the `LOCK` file
+  (`flock`/`LockFileEx`), so two processes cannot interleave writes and a crash cannot
+  leave a stale lock behind.
 * No telemetry, no outbound connections, no update checks, no third-party dependencies.
   `cargo tree` shows only workspace members.
 

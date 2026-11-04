@@ -34,7 +34,8 @@ docker buildx build --platform linux/arm64 -f docker/Dockerfile -t preppydb:arm6
 
 ### Native binary
 
-Requires Rust 1.75+ (the repository pins `stable` in `rust-toolchain.toml`).
+Requires Rust 1.89+ (the repository pins `stable` in `rust-toolchain.toml`; the
+single-writer lock uses the stabilised `File::try_lock`).
 
 ```bash
 cargo build --release
@@ -295,7 +296,7 @@ Measure with your own documents (`GET /v1/stats` reports per-collection document
 
 | Symptom | Likely cause | Action |
 | --- | --- | --- |
-| `database_locked` (503) | another server or CLI holds the lock | stop the other process; check for a stale `LOCK` file |
+| `database_locked` (503) | another server or CLI holds the lock | stop the other process; the lock is released by the OS when it exits, so `LOCK` may remain on disk harmlessly |
 | server exits with code 64 (container) | no credentials configured | set `PREPPYDB_ADMIN_PASSWORD` once, or run `--init-admin`/`--bootstrap-token` |
 | `401 authentication_required` | missing `Authorization` header | pass `-H "Authorization: Bearer …"` |
 | `429 rate_limited` | per-token limit exceeded | back off, honour `Retry-After`, raise the limit for trusted clients |

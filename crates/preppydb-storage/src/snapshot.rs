@@ -190,7 +190,7 @@ pub fn write_snapshot(
     file.sync_all()
         .map_err(|err| DbError::io("syncing snapshot", err))?;
     drop(file);
-    std::fs::rename(&tmp_path, path).map_err(|err| {
+    crate::fsutil::replace_file(&tmp_path, path).map_err(|err| {
         DbError::io(
             format!("renaming {} to {}", tmp_path.display(), path.display()),
             err,

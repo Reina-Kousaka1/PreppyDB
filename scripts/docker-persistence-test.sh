@@ -46,11 +46,15 @@ cleanup
 
 echo "==> first start on a fresh volume"
 # The token is printed once; the container exits before serving (--init-only).
-TOKEN_LINE=$(
+# The entrypoint prints progress lines *and* the server prints the token once, so pick the
+# token by shape (32 random bytes, base64url without padding) instead of by line number.
+TOKEN=$(
   docker run --rm -v "${VOLUME}:/var/lib/preppydb" -e PREPPYDB_BOOTSTRAP_TOKEN=ci "$IMAGE" \
-    --bootstrap-token ci --init-only 2>&1 | sed -n '2p'
+    --bootstrap-token ci --init-only 2>&1 \
+  | tr -d '\r' \
+  | grep -E '^[A-Za-z0-9_-]{40,}$' \
+  | head -n 1
 )
-TOKEN=$(printf '%s' "$TOKEN_LINE" | tr -d '\r\n ')
 [ -n "$TOKEN" ] || fail "no bootstrap token printed"
 echo "    token length: ${#TOKEN}"
 

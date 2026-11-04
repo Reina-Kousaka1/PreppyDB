@@ -194,7 +194,7 @@ impl Manifest {
         file.sync_all()
             .map_err(|err| DbError::io("syncing manifest", err))?;
         drop(file);
-        std::fs::rename(&tmp, &path)
+        crate::fsutil::replace_file(&tmp, &path)
             .map_err(|err| DbError::io("renaming manifest into place", err))?;
         fsync_dir(dir)?;
         Ok(())

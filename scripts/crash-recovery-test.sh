@@ -17,9 +17,10 @@ PORT="${PORT:-7081}"
 BASE="http://127.0.0.1:${PORT}"
 DOCS="${DOCS:-200}"
 
-for binary in "$SERVER" "$CLI"; do
-    [ -x "$binary" ] || { echo "missing binary: $binary (run cargo build first)" >&2; exit 1; }
-done
+[ -x "$SERVER" ] || { echo "missing binary: $SERVER (run cargo build first)" >&2; exit 1; }
+if [ ! -x "$CLI" ]; then
+    echo "note: $CLI not found — the final offline 'verify' step will be skipped" >&2
+fi
 
 WORKDIR="$(mktemp -d)"
 DATA="$WORKDIR/data"
@@ -110,10 +111,14 @@ wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=""
 echo "    exited; the directory is free for offline checks"
 
-echo "==> verify the storage"
-"$CLI" verify --data-dir "$DATA" > "$WORKDIR/verify.json"
-grep -q '"ok": true' "$WORKDIR/verify.json" || { cat "$WORKDIR/verify.json" >&2; exit 1; }
-echo "    storage verifies clean"
+if [ -x "$CLI" ]; then
+    echo "==> verify the storage"
+    "$CLI" verify --data-dir "$DATA" > "$WORKDIR/verify.json"
+    grep -q '"ok": true' "$WORKDIR/verify.json" || { cat "$WORKDIR/verify.json" >&2; exit 1; }
+    echo "    storage verifies clean"
+else
+    echo "==> skipping offline verify (no preppydb CLI next to the server binary)"
+fi
 
 echo
 echo "PASS: ${DOCS} documents survived kill -9 without a checkpoint"

@@ -19,6 +19,7 @@ pub mod catalog;
 pub mod clock;
 pub mod engine;
 pub mod error;
+pub mod fsutil;
 pub mod lock;
 pub mod manifest;
 pub mod record;

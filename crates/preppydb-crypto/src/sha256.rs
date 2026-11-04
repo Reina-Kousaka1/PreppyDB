@@ -81,7 +81,7 @@ impl Sha256 {
         let mut pad = vec![0x80u8];
         let rem = (self.buffered + 1) % 64;
         let zeros = if rem <= 56 { 56 - rem } else { 64 + 56 - rem };
-        pad.extend(std::iter::repeat(0u8).take(zeros));
+        pad.extend(std::iter::repeat_n(0u8, zeros));
         pad.extend_from_slice(&bit_len.to_be_bytes());
         // Feed directly, bypassing the length counter.
         let mut data = pad.as_slice();

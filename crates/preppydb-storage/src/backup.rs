@@ -240,7 +240,7 @@ pub fn create_backup(
     file.sync_all()
         .map_err(|err| DbError::io("syncing archive", err))?;
     drop(file);
-    std::fs::rename(&tmp, archive)
+    crate::fsutil::replace_file(&tmp, archive)
         .map_err(|err| DbError::io("renaming archive into place", err))?;
 
     let (bytes, file_hash) = crate::snapshot::file_sha256(archive)?;
@@ -535,13 +535,13 @@ pub fn restore_backup(archive: &Path, target: &Path, force: bool) -> Result<Rest
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "db".into())
         ));
-        std::fs::rename(target, &aside)
+        crate::fsutil::replace_file(target, &aside)
             .map_err(|err| DbError::io("moving existing database aside", err))?;
         Some(aside.display().to_string())
     } else {
         None
     };
-    std::fs::rename(&temp, target)
+    crate::fsutil::replace_file(&temp, target)
         .map_err(|err| DbError::io("moving restored database into place", err))?;
     fsync_dir(parent)?;
 
