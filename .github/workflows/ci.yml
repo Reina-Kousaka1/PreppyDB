@@ -76,7 +76,9 @@ jobs:
         run: |
           cargo test --workspace --locked 2>&1 | Tee-Object -FilePath tests.log
           if ($LASTEXITCODE -ne 0) {
-            Get-Content tests.log -Tail 60 | ForEach-Object { Write-Host "::error::$_" }
+            Select-String -Path tests.log -Pattern '^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^\s+--> ' |
+              Select-Object -First 10 |
+              ForEach-Object { Write-Host "::error::L$($_.LineNumber): $($_.Line)" }
             exit 1
           }
 
@@ -159,9 +161,8 @@ jobs:
         run: |
           set -o pipefail
           if ! cargo test --workspace --locked --target aarch64-unknown-linux-gnu 2>&1 | tee qemu-test.log; then
-            tail -n 60 qemu-test.log | while IFS= read -r line; do
-              echo "::error::$line"
-            done
+            grep -nE '^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|qemu|Exec format' qemu-test.log \
+              | head -10 | while IFS= read -r line; do echo "::error::$line"; done
             exit 1
           fi
 
@@ -261,9 +262,8 @@ jobs:
         run: |
           set -o pipefail
           if ! bash -x scripts/docker-persistence-test.sh 2>&1 | tee persistence.log; then
-            tail -n 60 persistence.log | while IFS= read -r line; do
-              echo "::error::$line"
-            done
+            grep -nE 'FAIL:|exit=|writable|refusing|preppydb:|Error|error' persistence.log \
+              | head -10 | while IFS= read -r line; do echo "::error::$line"; done
             exit 1
           fi
 
