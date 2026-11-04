@@ -72,7 +72,22 @@ jobs:
           shared-key: windows-x86_64
 
       - name: Tests
-        run: cargo test --workspace --locked
+        shell: pwsh
+        run: |
+          cargo test --workspace --locked 2>&1 | Tee-Object -FilePath tests.log
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content tests.log -Tail 60 | ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
+
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-log
+          path: tests.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Release build
         run: cargo build --workspace --release --locked
@@ -141,7 +156,23 @@ jobs:
           # The crash test re-executes the test binary; qemu-user cannot do that without
           # binfmt_misc. It runs on the native x86-64 and Windows jobs instead.
           PREPPYDB_SKIP_CHILD_CRASH: "1"
-        run: cargo test --workspace --locked --target aarch64-unknown-linux-gnu
+        run: |
+          set -o pipefail
+          if ! cargo test --workspace --locked --target aarch64-unknown-linux-gnu 2>&1 | tee qemu-test.log; then
+            tail -n 60 qemu-test.log | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
+
+      - name: Upload qemu test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-test-log
+          path: qemu-test.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   # ------------------------------------------------------------------- Lua client
   lua-client:
@@ -227,7 +258,23 @@ jobs:
       - name: Persistence test
         env:
           IMAGE: preppydb:ci
-        run: bash scripts/docker-persistence-test.sh
+        run: |
+          set -o pipefail
+          if ! bash -x scripts/docker-persistence-test.sh 2>&1 | tee persistence.log; then
+            tail -n 60 persistence.log | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
+
+      - name: Upload persistence log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-persistence-log
+          path: persistence.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   # --------------------------------------------------------------------- summary
   ci-status:
