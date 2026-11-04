@@ -71,6 +71,18 @@ preppydb-cli:      0 tests (verified manually, see below)
 * **Lua client live suite** — `python3 clients/luvit/tests/run_with_lupa.py --live` against
   a running server: 40 checks, covering auth errors, schema validation, unicode keys and
   values, CAS conflicts, batch atomicity, pricing tick/offer/purchase, and cleanup.
+* **Configuration handling** — `--print-config` reflects a config file; an unknown key is
+  rejected with a non-zero exit; binding to `0.0.0.0` without `allow_public_bind` is
+  refused with an explanatory message.
+* **Read-only mode** — a server started with `--read-only` reports
+  `{"ready":true,"read_only":true}` and rejects writes with `403 read_only`.
+* **Container entrypoint** (without Docker) — `docker/entrypoint.sh` exits 64 with
+  instructions when no credential exists and none is configured, creates the first admin
+  token when `PREPPYDB_BOOTSTRAP_TOKEN` is set, starts the server for `0.0.0.0:…`
+  (adding `--allow-public-bind`), and the resulting server passes `preppydb health`.
+* **Committed tree** — a fresh `git clone` of the branch builds and passes the same
+  `cargo test --workspace --locked` run (170 passed), proving no source, asset or lockfile
+  is missing from the commit.
 * **Process-level crash recovery** — `bash scripts/crash-recovery-test.sh`: a real server
   wrote 200 documents in acknowledged batches, was killed with `kill -9` (no checkpoint,
   no graceful shutdown), restarted on the same directory, reported the same 200 documents,

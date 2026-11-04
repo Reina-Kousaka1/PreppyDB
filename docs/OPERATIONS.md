@@ -288,7 +288,8 @@ Power loss or a kill -9 leaves the directory recoverable:
 | Rate limit | 50/s, burst 100 | `rate_limit_per_second`, `rate_limit_burst` |
 
 The working set lives in memory: size the host so the whole dataset fits with headroom.
-A 1-million-document collection of 2 KiB documents needs roughly 2–3 GiB.
+Measure with your own documents (`GET /v1/stats` reports per-collection document counts and
+`GET /v1/metrics` the engine counters) instead of trusting a rule of thumb.
 
 ## 6. Troubleshooting
 
