@@ -33,13 +33,31 @@ jobs:
           shared-key: linux-x86_64
 
       - name: Formatting
-        run: cargo fmt --all --check
+        run: |
+          set -o pipefail
+          cargo fmt --all --check 2>&1 | tee fmt.log || {
+            awk '/^Diff in / {print; n=4; next} n>0 {print; n--}' fmt.log | head -12 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          }
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee clippy.log || {
+            awk '/^error(\[|:)|^warning: / {print; n=4; next} n>0 {print; n--}' clippy.log | head -12 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          }
 
       - name: Unit and integration tests
-        run: cargo test --workspace --locked
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked 2>&1 | tee tests.log || {
+            awk '/^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^---- / {print; n=2; next} n>0 {print; n--}' tests.log | head -12 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          }
 
       - name: Build the binaries used by the end-to-end scripts
         run: cargo build --locked --bin preppydb-server --bin preppydb

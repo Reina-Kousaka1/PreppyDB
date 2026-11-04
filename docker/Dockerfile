@@ -80,8 +80,11 @@ EXPOSE 7077
 USER root
 WORKDIR /var/lib/preppydb
 
-# tini reaps children and forwards SIGTERM, so `docker stop` reaches the server's signal
-# handler and it shuts down gracefully (checkpoint + WAL close, exit status 0).
+# tini reaps children and forwards SIGTERM to the server. The server has no in-process
+# signal handler (the crate forbids `unsafe`, so there is no way to install one without a
+# dependency), so the process is terminated and the write-ahead log is replayed on the
+# next start -- which is exactly what the crash-recovery test proves. tini still gives
+# the container correct PID 1 zombie reaping and signal forwarding.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/preppydb-entrypoint"]
 CMD []
 

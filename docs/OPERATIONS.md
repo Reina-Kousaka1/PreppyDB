@@ -23,8 +23,11 @@ docker compose up -d --build
   `PREPPYDB_ADMIN_PASSWORD` (user via `PREPPYDB_ADMIN_USER`, default `admin`) or from
   `PREPPYDB_BOOTSTRAP_TOKEN` — and then never touches `auth.json` again. Without either,
   the container exits with code 64 and an explanation. There is **no default password**.
-* `docker stop` sends SIGTERM through `tini`; the server finishes in-flight requests,
-  checkpoints and closes the WAL before exiting (grace period 30 s in the compose file).
+* `docker stop` sends SIGTERM through `tini`. The server does not install a signal
+  handler (the crate forbids `unsafe` and there are no dependencies), so the process is
+  terminated and the write-ahead log is replayed on the next start; the persistence test
+  proves that no acknowledged document is lost that way. The compose file allows a 30 s
+  grace period, which the shipping process exits well within.
 
 Arm64 without emulation:
 
@@ -89,12 +92,16 @@ sudo -u preppydb PREPPYDB_ADMIN_PASSWORD='…' /usr/local/bin/preppydb-server \
 sudo systemctl daemon-reload && sudo systemctl enable --now preppydb
 ```
 
-`SIGTERM` and `SIGINT` both trigger a graceful shutdown on Unix: the server stops
-accepting connections, joins its workers, checkpoints and closes the WAL, then exits with
-status 0. The handler is installed by `crates/preppydb-server/src/signals.rs` (a direct
-`signal(3)` declaration, since the project has no dependencies). Windows has no handler
-in this release — terminating the process there relies on WAL replay at the next start,
-which the crash-recovery test covers. `SIGKILL` is never graceful anywhere; the WAL is.
+`SIGTERM`, `SIGINT` and `SIGKILL` all terminate the server the same way: the process
+stops, and the next start replays the write-ahead log, truncates a torn tail and reports
+what it recovered. There is no in-process signal handler — the crate is
+`#![forbid(unsafe_code)]` and the project has no dependencies, so `signal(3)` is not
+available — which is why durability rests on the WAL rather than on a shutdown hook.
+Acknowledge-then-crash is covered end to end by `scripts/crash-recovery-test.sh`, which
+kills a live server with `SIGKILL` and checks that every acknowledged document is still
+there afterwards. When you want a *clean* stop (checkpoint, empty WAL, no recovery on
+start), use `POST /v1/admin/checkpoint` first or stop the server with `preppydb verify`
+afterwards.
 
 #### Raspberry Pi 4 / ARM64 Linux
 

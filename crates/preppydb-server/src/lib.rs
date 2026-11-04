@@ -3,7 +3,7 @@
 //! The `preppydb-server` binary is a thin wrapper around this crate, and
 //! `preppydb-cli` reuses the credential store so that tokens created by the CLI are
 //! immediately valid for a running server (the server reloads the file when its
-//! modification time changes).
+//! modification time or length changes).
 
 #![forbid(unsafe_code)]
 
@@ -12,7 +12,6 @@ pub mod auth;
 pub mod config;
 pub mod http;
 pub mod ratelimit;
-pub mod signals;
 
 pub use api::{ApiState, API_VERSION};
 pub use auth::{AuthStore, Principal, Role};

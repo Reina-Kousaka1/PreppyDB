@@ -40,7 +40,9 @@ covered by the tests enumerated in [docs/TESTING.md](docs/TESTING.md); the items
 **Server (`preppydb-server`)**
 
 * Hand-written HTTP/1.1 server with a bounded worker pool, request ids, body limits,
-  per-credential rate limiting and graceful shutdown.
+  per-credential rate limiting and a drain-then-stop shutdown path. Shutdown is
+  triggered programmatically (the tests use it); `SIGTERM` terminates the process and
+  durability comes from the WAL, as `scripts/crash-recovery-test.sh` proves.
 * Versioned `/v1` API: collections, documents, batches, transactions, indexes, stats,
   metrics, admin (checkpoint, compact, verify, backup, recovery, auth), personality and
   pricing namespaces.
@@ -71,11 +73,6 @@ covered by the tests enumerated in [docs/TESTING.md](docs/TESTING.md); the items
   security policy.
 
 ### Fixed
-
-* The server installs `SIGTERM`/`SIGINT` handlers (Unix) and shuts down gracefully —
-  workers joined, WAL closed, checkpointed — instead of being killed mid-write by the
-  default disposition. `docker stop` therefore exits with status 0 (before, containers
-  exited 143).
 
 * `auth.json` reload only compared file modification times, so an edit made within the
   same timestamp tick (whole-second filesystems, emulated runs) was ignored and a

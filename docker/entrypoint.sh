@@ -4,7 +4,7 @@
 # Responsibilities, in order:
 #   1. make sure the data directory exists and is writable;
 #   2. create the first admin credential *once* if the database has none yet;
-#   3. exec the server with a PID that receives SIGTERM from `docker stop`.
+#   3. exec the server so that `docker stop` reaches it directly (tini forwards SIGTERM).
 #
 # Deliberately no default password: if no credential exists and neither
 # PREPPYDB_ADMIN_PASSWORD nor PREPPYDB_BOOTSTRAP_TOKEN is set, the container refuses to
