@@ -1,0 +1,239 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Treat compiler warnings as errors so the tree stays clean.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ------------------------------------------------------------------ Linux x86-64
+  linux-x86_64:
+    name: Linux x86-64 (fmt, clippy, tests)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-x86_64
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Unit and integration tests
+        run: cargo test --workspace --locked
+
+      - name: Crash recovery (kill -9 a live server, restart, verify)
+        run: bash scripts/crash-recovery-test.sh
+
+      - name: Release build
+        run: cargo build --workspace --release --locked
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-linux-x86_64
+          path: |
+            target/release/preppydb-server
+            target/release/preppydb
+          if-no-files-found: error
+          retention-days: 14
+
+  # ----------------------------------------------------------------- Windows x86-64
+  windows-x86_64:
+    name: Windows x86-64 (build + tests)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x86_64
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Release build
+        run: cargo build --workspace --release --locked
+
+      # A short smoke test proves the server actually starts on Windows and serves HTTP.
+      - name: Smoke test (PowerShell)
+        shell: pwsh
+        run: |
+          $data = Join-Path $env:RUNNER_TEMP "preppydb-smoke"
+          $init = & .\target\release\preppydb-server.exe --data-dir $data --bootstrap-token ci --init-only
+          $token = ($init | Select-Object -Skip 1 -First 1).Trim()
+          if (-not $token) { throw "no bootstrap token was printed" }
+          $server = Start-Process -FilePath .\target\release\preppydb-server.exe `
+              -ArgumentList "--data-dir", $data, "--listen", "127.0.0.1:7070" -PassThru
+          try {
+            $healthy = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Milliseconds 500
+              try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:7070/healthz" -TimeoutSec 2
+                if ($health.status -eq "ok") { $healthy = $true; break }
+              } catch { }
+            }
+            if (-not $healthy) { throw "server did not become healthy" }
+            $headers = @{ Authorization = "Bearer $token" }
+            $body = '{"name":"windows_smoke"}'
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections" `
+                -Headers $headers -ContentType "application/json" -Body $body | Out-Null
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents" `
+                -Headers $headers -ContentType "application/json" -Body '{"key":"k","value":{"ok":true}}' | Out-Null
+            $doc = Invoke-RestMethod -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents/k" -Headers $headers
+            if ($doc.data.value.ok -ne $true) { throw "document did not round-trip" }
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }
+
+  # -------------------------------------------------- Linux ARM64 (build + emulated tests)
+  linux-arm64:
+    name: Linux ARM64 (build, emulated tests)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-arm64
+
+      - name: Cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
+
+      - name: Build for aarch64
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --workspace --locked --target aarch64-unknown-linux-gnu
+
+      # These tests run under qemu-user, i.e. emulated ARM64 — not on a Raspberry Pi.
+      # Real-hardware validation is listed as an open item in docs/TESTING.md.
+      - name: Tests under qemu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
+        run: cargo test --workspace --locked --target aarch64-unknown-linux-gnu
+
+  # ------------------------------------------------------------------- Lua client
+  lua-client:
+    name: Lua/Luvit client (offline + live)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lua-client
+
+      - name: Install lupa and luvit
+        run: |
+          python3 -m pip install --user lupa
+          # Luvit is optional: the runner falls back to the Python-bridged transport.
+          curl -sSL https://github.com/luvit/luvit/releases/download/2.18.1/luvit-2.18.1-linux-x86_64.tar.gz -o /tmp/luvit.tgz \
+            && tar xzf /tmp/luvit.tgz -C /tmp \
+            && sudo cp /tmp/luvit /usr/local/bin/luvit || echo "luvit download skipped"
+
+      - name: Build server
+        run: cargo build --locked -p preppydb-server
+
+      - name: Start server and run the Lua suites
+        run: |
+          DATA=$(mktemp -d)
+          ./target/debug/preppydb-server --data-dir "$DATA" --bootstrap-token ci --init-only > /tmp/init.txt
+          TOKEN=$(sed -n '2p' /tmp/init.txt)
+          ./target/debug/preppydb-server --data-dir "$DATA" --listen 127.0.0.1:7077 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:7077/healthz > /dev/null; then break; fi
+            sleep 0.5
+          done
+          PREPPYDB_URL=http://127.0.0.1:7077 PREPPYDB_TOKEN="$TOKEN" \
+            python3 clients/luvit/tests/run_with_lupa.py --live
+
+      - name: Luvit transport (when luvit is available)
+        continue-on-error: true
+        run: |
+          if command -v luvit > /dev/null; then
+            DATA=$(mktemp -d)
+            ./target/debug/preppydb-server --data-dir "$DATA" --bootstrap-token ci --init-only > /tmp/init2.txt
+            TOKEN=$(sed -n '2p' /tmp/init2.txt)
+            ./target/debug/preppydb-server --data-dir "$DATA" --listen 127.0.0.1:7079 &
+            for i in $(seq 1 60); do
+              if curl -fsS http://127.0.0.1:7079/healthz > /dev/null; then break; fi
+              sleep 0.5
+            done
+            PREPPYDB_URL=http://127.0.0.1:7079 PREPPYDB_TOKEN="$TOKEN" \
+              luvit clients/luvit/tests/test_live.lua
+          else
+            echo "luvit not installed — skipping the native transport run"
+          fi
+
+  # --------------------------------------------------------------------- Docker
+  docker-images:
+    name: Docker images (amd64 + arm64, never pushed)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      # push: false is deliberate. Publishing images needs an explicit maintainer
+      # decision; this workflow only proves that both architectures build.
+      - name: Build multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  docker-persistence:
+    name: Docker persistence (restart + recreate)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build amd64 image
+        run: docker build -f docker/Dockerfile -t preppydb:ci .
+      - name: Persistence test
+        env:
+          IMAGE: preppydb:ci
+        run: bash scripts/docker-persistence-test.sh
+
+  # --------------------------------------------------------------------- summary
+  ci-status:
+    name: CI status
+    runs-on: ubuntu-22.04
+    needs: [linux-x86_64, windows-x86_64, linux-arm64, lua-client, docker-images, docker-persistence]
+    if: always()
+    steps:
+      - name: Fail if any job failed
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "one or more jobs failed"
+            exit 1
+          fi
+          echo "all jobs passed"

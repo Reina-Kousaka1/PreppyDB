@@ -1,0 +1,49 @@
+# PreppyDB — local / single-host example.
+#
+#   export PREPPYDB_ADMIN_PASSWORD='choose-a-long-password'
+#   docker compose up -d --build
+#   curl -s http://127.0.0.1:7077/healthz
+#
+# The password is only used on the very first start, when the data volume is still
+# empty; afterwards the credential file on the volume is used. There is intentionally
+# no default password: compose fails fast if PREPPYDB_ADMIN_PASSWORD is missing.
+
+services:
+  preppydb:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        CARGO_PROFILE: release
+    image: preppydb:local
+    container_name: preppydb
+    restart: unless-stopped
+    environment:
+      PREPPYDB_ADMIN_USER: ${PREPPYDB_ADMIN_USER:-admin}
+      PREPPYDB_ADMIN_PASSWORD: ${PREPPYDB_ADMIN_PASSWORD:?set PREPPYDB_ADMIN_PASSWORD (min. 12 characters) before starting}
+      PREPPYDB_LISTEN: 0.0.0.0:7077
+      PREPPYDB_READ_ONLY: ${PREPPYDB_READ_ONLY:-0}
+    ports:
+      # Publish on the loopback interface by default. Change to "7077:7077" only if the
+      # API must be reachable from other hosts, and put TLS in front of it.
+      - "127.0.0.1:7077:7077"
+    volumes:
+      - preppydb-data:/var/lib/preppydb
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    # Offline-friendly resource limits (adjust to the host).
+    mem_limit: 512m
+    cpus: "2.0"
+    healthcheck:
+      test: ["CMD-SHELL", "preppydb health --url http://127.0.0.1:7077"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  # A named volume survives `docker compose down` and container recreation.
+  # `docker compose down -v` removes it — that is the only command that deletes data.
+  preppydb-data:
+    name: preppydb-data
