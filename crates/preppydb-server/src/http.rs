@@ -321,8 +321,7 @@ fn handle_connection(
                 counters
                     .bytes_out
                     .fetch_add(response.body.len() as u64, Ordering::Relaxed);
-                let keep_alive =
-                    wants_keep_alive(&request) && !shutdown.load(Ordering::SeqCst);
+                let keep_alive = wants_keep_alive(&request) && !shutdown.load(Ordering::SeqCst);
                 if write_response(reader.get_mut(), &response, keep_alive).is_err() {
                     break;
                 }
