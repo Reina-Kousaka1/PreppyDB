@@ -15,6 +15,10 @@ docker compose up -d --build
 * Image: `docker/Dockerfile`, multi-stage, `--platform linux/amd64,linux/arm64`.
 * Runtime user: uid/gid `10001`, no shell, no capabilities added, `no-new-privileges`.
 * Data: `/var/lib/preppydb` (a declared `VOLUME`), owner `10001:10001`, mode `0700`.
+* The container starts as root *only* to take ownership of a freshly created
+  (root-owned) volume, then `exec gosu 10001:10001` before the database starts — the
+  server itself never runs as root. With a bind mount that is already writable by uid
+  10001 you can also pass `--user 10001:10001` and skip this step entirely.
 * The entrypoint creates the first admin credential once — from
   `PREPPYDB_ADMIN_PASSWORD` (user via `PREPPYDB_ADMIN_USER`, default `admin`) or from
   `PREPPYDB_BOOTSTRAP_TOKEN` — and then never touches `auth.json` again. Without either,

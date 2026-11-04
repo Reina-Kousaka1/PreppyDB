@@ -79,6 +79,11 @@ Read these before exposing PreppyDB to anything:
 2. **Hand-written crypto.** SHA-256/HMAC/PBKDF2/CRC32C are implemented in-tree to keep the
    dependency tree empty. They are tested against standard vectors, but they have not had
    the scrutiny of an audited library such as `ring` or `sha2` (RustCrypto).
+   Token/salt randomness comes from `/dev/urandom` on Unix; on other platforms (Windows)
+   the standard library exposes no OS RNG, so a SHA-256 DRBG seeded from `RandomState`
+   (OS-seeded), the clock and the pid is used instead. That is a real, documented
+   weakness on Windows: prefer running the server on Linux until an audited RNG is
+   wired in.
 3. **Hand-written HTTP parser.** Only `GET`/`POST`/`PUT`/`DELETE`, no chunked request
    bodies, `Connection: close` per request. It is intentionally minimal, which reduces
    attack surface but also means it is not battle-tested.

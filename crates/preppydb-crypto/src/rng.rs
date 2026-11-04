@@ -1,17 +1,17 @@
 //! Randomness: an OS-seeded source for tokens/salts and a deterministic ChaCha20
 //! stream generator for reproducible (seeded) pricing runs and tests.
 
-use std::io::Read;
-
 /// Fill `buf` from the operating system.
 ///
-/// On Unix this reads `/dev/urandom`. If that is unavailable (or on non-Unix targets
-/// without a system RNG binding) the function falls back to a SHA-256 based DRBG seeded
-/// from time, process id and stack address. The fallback is *weaker* — it is documented
-/// here and in `docs/SECURITY.md` rather than silently trusted.
+/// On Unix this reads `/dev/urandom`. Elsewhere — and if `/dev/urandom` is unavailable —
+/// the function falls back to a SHA-256 based DRBG seeded from `RandomState` (which the
+/// standard library seeds from the OS), the clock, the process id and a stack address.
+/// That fallback is *weaker* than a real CSPRNG ([`crate::rng`] makes no such claim for
+/// it); it is documented here and in `SECURITY.md` rather than silently trusted.
 pub fn os_random(buf: &mut [u8]) -> Result<(), String> {
     #[cfg(unix)]
     {
+        use std::io::Read;
         if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
             let mut filled = 0;
             while filled < buf.len() {
@@ -40,6 +40,16 @@ fn fallback_random(buf: &mut [u8]) {
     let local = 0u8;
     let addr = &local as *const u8 as usize;
     let mut seed_material = Vec::new();
+    // `RandomState` is seeded from the OS by the standard library, so mixing several
+    // instances in gives the fallback real (if unproven) entropy on platforms without
+    // `/dev/urandom`, such as Windows.
+    for round in 0..8u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(now as u64 ^ round);
+        hasher.write_u32(std::process::id());
+        seed_material.extend_from_slice(&hasher.finish().to_le_bytes());
+    }
     seed_material.extend_from_slice(&now.to_le_bytes());
     seed_material.extend_from_slice(&std::process::id().to_le_bytes());
     seed_material.extend_from_slice(&addr.to_le_bytes());

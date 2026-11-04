@@ -13,6 +13,20 @@ set -eu
 
 DATA_DIR="${PREPPYDB_DATA_DIR:-/var/lib/preppydb}"
 LISTEN="${PREPPYDB_LISTEN:-0.0.0.0:7077}"
+APP_UID="${PREPPYDB_APP_UID:-10001}"
+APP_GID="${PREPPYDB_APP_GID:-10001}"
+
+# A named volume mounted over /var/lib/preppydb is created root-owned, so the
+# unprivileged user could not write to it. Take ownership once (not recursively — the
+# files in it belong to the app user already) and re-exec as that user.
+if [ "$(id -u)" = "0" ]; then
+    mkdir -p "$DATA_DIR"
+    if [ "$(stat -c %u "$DATA_DIR")" != "$APP_UID" ]; then
+        echo "preppydb: taking ownership of $DATA_DIR for uid $APP_UID"
+        chown "$APP_UID:$APP_GID" "$DATA_DIR"
+    fi
+    exec gosu "$APP_UID:$APP_GID" "$0" "$@"
+fi
 
 mkdir -p "$DATA_DIR"
 if [ ! -w "$DATA_DIR" ]; then

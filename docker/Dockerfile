@@ -49,8 +49,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM debian:bookworm-slim AS runtime
 
+# gosu lets the entrypoint fix the ownership of a fresh (root-owned) volume and then
+# drop to the unprivileged user without any shell or setuid binary of our own.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tini \
+    && apt-get install -y --no-install-recommends ca-certificates gosu tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 preppydb \
     && useradd --uid 10001 --gid preppydb --shell /usr/sbin/nologin --no-create-home preppydb \
@@ -63,13 +65,19 @@ RUN chmod 0755 /usr/local/bin/preppydb-server /usr/local/bin/preppydb /usr/local
 
 ENV PREPPYDB_DATA_DIR=/var/lib/preppydb \
     PREPPYDB_LISTEN=0.0.0.0:7077 \
+    PREPPYDB_APP_UID=10001 \
+    PREPPYDB_APP_GID=10001 \
     RUST_BACKTRACE=1
 
 # Data lives on a volume so a container restart/recreate keeps every document.
 VOLUME ["/var/lib/preppydb"]
 EXPOSE 7077
 
-USER 10001:10001
+# The container starts as root *only* so the entrypoint can take ownership of a freshly
+# created (root-owned) volume and then `exec gosu 10001:10001` — the database process
+# itself never runs as root. `docker run --user 10001:10001` also works and skips that
+# step, as long as the mounted directory is writable by that uid.
+USER root
 WORKDIR /var/lib/preppydb
 
 # tini reaps children and forwards SIGTERM, so `docker stop` triggers the server's

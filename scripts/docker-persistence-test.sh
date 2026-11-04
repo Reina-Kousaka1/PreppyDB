@@ -26,6 +26,17 @@ trap cleanup EXIT
 
 fail() {
   echo "FAIL: $*" >&2
+  echo "---- docker ps -a ----" >&2
+  docker ps -a >&2 || true
+  for container in "$C1" "$C2"; do
+    if docker inspect "$container" > /dev/null 2>&1; then
+      echo "---- $container: state ----" >&2
+      docker inspect --format 'exit={{.State.ExitCode}} status={{.State.Status}} oom={{.State.OOMKilled}} error={{.State.Error}}' \
+        "$container" >&2 || true
+      echo "---- $container: logs ----" >&2
+      docker logs "$container" 2>&1 >&2 || true
+    fi
+  done
   exit 1
 }
 
