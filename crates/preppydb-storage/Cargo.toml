@@ -1,0 +1,13 @@
+[package]
+name = "preppydb-storage"
+description = "Persistent NoSQL storage engine with WAL, snapshots, transactions and recovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+preppydb-json.workspace = true
+preppydb-crypto.workspace = true

@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/preppydb-json",
+    "crates/preppydb-crypto",
+    "crates/preppydb-storage",
+    "crates/preppydb-pricing",
+    "crates/preppydb-model",
+    "crates/preppydb-client",
+    "crates/preppydb-server",
+    "crates/preppydb-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/Reina-Kousaka1/PreppyDB"
+authors = ["PreppyDB contributors"]
+
+[workspace.dependencies]
+preppydb-json = { path = "crates/preppydb-json" }
+preppydb-crypto = { path = "crates/preppydb-crypto" }
+preppydb-storage = { path = "crates/preppydb-storage" }
+preppydb-pricing = { path = "crates/preppydb-pricing" }
+preppydb-model = { path = "crates/preppydb-model" }
+preppydb-client = { path = "crates/preppydb-client" }
+preppydb-server = { path = "crates/preppydb-server" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+codegen-units = 1

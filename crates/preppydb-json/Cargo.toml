@@ -1,0 +1,11 @@
+[package]
+name = "preppydb-json"
+description = "Dependency-free JSON value type, parser and serializer used by PreppyDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
