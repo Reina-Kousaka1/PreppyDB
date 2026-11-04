@@ -107,9 +107,14 @@ echo "    ${RECOVERY}" | head -c 300; echo
 
 echo "==> stop the restarted server gracefully (SIGTERM)"
 kill -TERM "$SERVER_PID"
-wait "$SERVER_PID" 2>/dev/null || true
+if wait "$SERVER_PID"; then
+    echo "    graceful shutdown, exit status 0"
+else
+    echo "FAIL: SIGTERM did not produce a graceful shutdown" >&2
+    exit 1
+fi
 SERVER_PID=""
-echo "    exited; the directory is free for offline checks"
+echo "    the directory is free for offline checks"
 
 if [ -x "$CLI" ]; then
     echo "==> verify the storage"

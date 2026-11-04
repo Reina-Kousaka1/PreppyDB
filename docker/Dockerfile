@@ -80,8 +80,8 @@ EXPOSE 7077
 USER root
 WORKDIR /var/lib/preppydb
 
-# tini reaps children and forwards SIGTERM, so `docker stop` triggers the server's
-# graceful shutdown (checkpoint + WAL close) instead of killing it abruptly.
+# tini reaps children and forwards SIGTERM, so `docker stop` reaches the server's signal
+# handler and it shuts down gracefully (checkpoint + WAL close, exit status 0).
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/preppydb-entrypoint"]
 CMD []
 

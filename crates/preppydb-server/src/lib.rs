@@ -12,6 +12,7 @@ pub mod auth;
 pub mod config;
 pub mod http;
 pub mod ratelimit;
+pub mod signals;
 
 pub use api::{ApiState, API_VERSION};
 pub use auth::{AuthStore, Principal, Role};

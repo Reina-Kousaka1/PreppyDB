@@ -89,7 +89,12 @@ sudo -u preppydb PREPPYDB_ADMIN_PASSWORD='…' /usr/local/bin/preppydb-server \
 sudo systemctl daemon-reload && sudo systemctl enable --now preppydb
 ```
 
-`SIGTERM` and `SIGINT` both trigger a graceful shutdown (checkpoint + close).
+`SIGTERM` and `SIGINT` both trigger a graceful shutdown on Unix: the server stops
+accepting connections, joins its workers, checkpoints and closes the WAL, then exits with
+status 0. The handler is installed by `crates/preppydb-server/src/signals.rs` (a direct
+`signal(3)` declaration, since the project has no dependencies). Windows has no handler
+in this release — terminating the process there relies on WAL replay at the next start,
+which the crash-recovery test covers. `SIGKILL` is never graceful anywhere; the WAL is.
 
 #### Raspberry Pi 4 / ARM64 Linux
 

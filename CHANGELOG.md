@@ -72,6 +72,11 @@ covered by the tests enumerated in [docs/TESTING.md](docs/TESTING.md); the items
 
 ### Fixed
 
+* The server installs `SIGTERM`/`SIGINT` handlers (Unix) and shuts down gracefully —
+  workers joined, WAL closed, checkpointed — instead of being killed mid-write by the
+  default disposition. `docker stop` therefore exits with status 0 (before, containers
+  exited 143).
+
 * `auth.json` reload only compared file modification times, so an edit made within the
   same timestamp tick (whole-second filesystems, emulated runs) was ignored and a
   freshly created user could not log in. The length is compared as well.

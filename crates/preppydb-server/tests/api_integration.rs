@@ -390,7 +390,14 @@ fn login_flow_and_session_tokens() {
                 assert_eq!(err.status(), Some(401), "unexpected login failure: {err:?}");
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(err) => panic!("login did not succeed within 5s: {err:?}"),
+            Err(err) => {
+                let path = server.dir.join("auth.json");
+                let text = std::fs::read_to_string(&path).unwrap_or_else(|e| format!("<{e}>"));
+                let meta = std::fs::metadata(&path)
+                    .map(|m| format!("len={} modified={:?}", m.len(), m.modified()))
+                    .unwrap_or_else(|e| format!("<{e}>"));
+                panic!("login did not succeed within 5s: {err:?}; {meta}; auth.json = {text}");
+            }
         }
     };
     assert!(outcome.get_str("token").is_some());

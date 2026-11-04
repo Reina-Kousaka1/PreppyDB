@@ -17,6 +17,7 @@ use preppydb_server::api::ApiState;
 use preppydb_server::auth::{AuthStore, Role};
 use preppydb_server::config::ServerConfig;
 use preppydb_server::http::{self, HttpLimits, ServerCounters};
+use preppydb_server::signals;
 use preppydb_storage::engine::Engine;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -223,6 +224,23 @@ fn run() -> Result<(), String> {
         workers: config.workers,
         ..Default::default()
     };
+
+    // SIGTERM/SIGINT: stop serving, join the workers and close the engine instead of
+    // letting the default action kill the process mid-write.
+    signals::install();
+    {
+        let shutdown = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            while !shutdown.load(Ordering::SeqCst) {
+                if signals::requested() {
+                    println!("PreppyDB: shutdown signal received, stopping");
+                    shutdown.store(true, Ordering::SeqCst);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        });
+    }
 
     // Background TTL sweeper: expired documents are removed with an explicit,
     // logged `ttl_expiry` batch so the removal is auditable.

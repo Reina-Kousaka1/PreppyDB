@@ -76,9 +76,15 @@ jobs:
         run: |
           cargo test --workspace --locked 2>&1 | Tee-Object -FilePath tests.log
           if ($LASTEXITCODE -ne 0) {
-            Select-String -Path tests.log -Pattern '^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^\s+--> ' |
-              Select-Object -First 10 |
-              ForEach-Object { Write-Host "::error::L$($_.LineNumber): $($_.Line)" }
+            $lines = Get-Content tests.log
+            $hits = @()
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^---- ') {
+                $hits += $lines[$i]
+                for ($j = 1; $j -le 2 -and ($i + $j) -lt $lines.Count; $j++) { $hits += $lines[$i + $j] }
+              }
+            }
+            $hits | Select-Object -First 12 | ForEach-Object { Write-Host "::error::$_" }
             exit 1
           }
 
@@ -161,8 +167,10 @@ jobs:
         run: |
           set -o pipefail
           if ! cargo test --workspace --locked --target aarch64-unknown-linux-gnu 2>&1 | tee qemu-test.log; then
-            grep -nE '^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|qemu|Exec format' qemu-test.log \
-              | head -10 | while IFS= read -r line; do echo "::error::$line"; done
+            # GitHub keeps only a handful of annotations per step, so print the failing
+            # test names, compiler errors and panic messages (plus two lines of context).
+            awk '/^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^---- |Exec format/ {print; n=2; next} n>0 {print; n--}' \
+              qemu-test.log | head -12 | while IFS= read -r line; do echo "::error::$line"; done
             exit 1
           fi
 
