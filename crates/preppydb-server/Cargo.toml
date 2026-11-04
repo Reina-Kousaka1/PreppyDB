@@ -17,6 +17,7 @@ name = "preppydb-server"
 path = "src/main.rs"
 
 [dependencies]
+ctrlc = { version = "3.5.2", features = ["termination"] }
 preppydb-json.workspace = true
 preppydb-crypto.workspace = true
 preppydb-storage.workspace = true

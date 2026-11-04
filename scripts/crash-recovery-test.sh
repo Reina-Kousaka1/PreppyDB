@@ -4,9 +4,9 @@
 #   1. start a real server, write 200 documents from 20 clients' worth of batches;
 #   2. kill -9 the process (no graceful shutdown, no checkpoint);
 #   3. restart it on the same directory;
-#   4. assert every acknowledged document is still readable and storage verifies clean.
+#   4. assert every acknowledged document is readable and SIGTERM/SIGINT shut down cleanly.
 #
-# This complements the in-process `abort()` test in
+# This also checks signal-driven shutdown. It complements the in-process `abort()` test in
 # crates/preppydb-storage/tests/engine_integration.rs: here the whole HTTP server dies.
 set -euo pipefail
 
@@ -105,15 +105,22 @@ echo "==> recovery report"
 RECOVERY=$(curl -fsS "${BASE}/v1/admin/recovery" "${AUTH[@]}")
 echo "    ${RECOVERY}" | head -c 300; echo
 
-echo "==> stop the restarted server (SIGTERM)"
+echo "==> stop the restarted server gracefully (SIGTERM)"
 kill -TERM "$SERVER_PID"
 STATUS=0
 wait "$SERVER_PID" 2>/dev/null || STATUS=$?
 SERVER_PID=""
-# There is no signal handler (the crate forbids `unsafe`), so the process is terminated
-# by the default disposition: 128 + 15 = 143. The point of the check is that the
-# directory is intact *after* such a stop, which the verify below confirms.
-echo "    exit status $STATUS (143 = terminated by SIGTERM, expected)"
+[ "$STATUS" -eq 0 ] || { echo "FAIL: SIGTERM shutdown returned $STATUS" >&2; exit 1; }
+echo "    SIGTERM shutdown exited cleanly"
+
+echo "==> restart and stop gracefully (SIGINT)"
+start_server
+kill -INT "$SERVER_PID"
+STATUS=0
+wait "$SERVER_PID" 2>/dev/null || STATUS=$?
+SERVER_PID=""
+[ "$STATUS" -eq 0 ] || { echo "FAIL: SIGINT shutdown returned $STATUS" >&2; exit 1; }
+echo "    SIGINT shutdown exited cleanly"
 
 if [ -x "$CLI" ]; then
     echo "==> verify the storage"

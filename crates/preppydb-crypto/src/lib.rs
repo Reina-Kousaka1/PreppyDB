@@ -1,16 +1,16 @@
-//! Dependency-free cryptographic and checksum primitives used by PreppyDB.
+#![forbid(unsafe_code)]
+
+//! Cryptographic and checksum primitives used by PreppyDB.
 //!
-//! Rationale: PreppyDB ships as a single static binary and the project deliberately
-//! keeps its dependency tree empty so that every security-relevant byte of code can be
-//! audited here. All primitives below are validated against published test vectors
-//! (NIST/RFC) in this crate's unit tests.
+//! Hashing, authentication, password derivation, checksums, and encoding are implemented
+//! in this crate. The `getrandom` dependency supplies operating-system entropy for secret
+//! tokens and salts; this crate does not implement its own OS RNG.
 //!
 //! Scope and non-goals:
 //! * SHA-256, HMAC-SHA-256, PBKDF2-HMAC-SHA-256, CRC-32C and base64url are implemented.
 //! * No TLS, no asymmetric crypto, no authenticated encryption (see `docs/SECURITY.md`).
-//! * The RNG is a ChaCha20-based DRBG seeded from the OS; on Unix that seed comes from
-//!   `/dev/urandom`. Where `/dev/urandom` is unavailable (e.g. some Windows builds) we
-//!   fall back to a time/pid/address mixed seed and *document* the weaker guarantee.
+//! * The ChaCha20 generator is deterministic and only used for reproducible pricing runs
+//!   and tests. Secret randomness comes directly from the operating system.
 
 pub mod base64;
 pub mod crc32c;

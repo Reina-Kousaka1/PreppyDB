@@ -29,7 +29,7 @@ services:
       - "127.0.0.1:7077:7077"
     volumes:
       - preppydb-data:/var/lib/preppydb
-    stop_grace_period: 30s
+    stop_grace_period: 35s
     security_opt:
       - no-new-privileges:true
     # Offline-friendly resource limits (adjust to the host).

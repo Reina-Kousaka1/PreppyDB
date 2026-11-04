@@ -117,7 +117,7 @@ collections, documents, pricing and backups from there.
 
 ```
 crates/preppydb-json      dependency-free JSON value, parser, canonical form
-crates/preppydb-crypto    SHA-256, HMAC, PBKDF2, CRC32C, base64, hex, RNG (std only)
+crates/preppydb-crypto    SHA-256, HMAC, PBKDF2, CRC32C, base64, hex, OS RNG via `getrandom`
 crates/preppydb-storage   engine: records, WAL, snapshots, catalog, txn, backup
 crates/preppydb-pricing   price rules, offers, purchases, audit log
 crates/preppydb-model     personality/shop collection model
@@ -130,10 +130,11 @@ scripts/                  crash-recovery and Docker-persistence test scripts
 docs/                     architecture, API, operations, testing, model, pricing
 ```
 
-The whole workspace has **no third-party dependencies**: everything is `std` plus this
-repository's own crates. That keeps builds offline-capable and the supply chain empty,
-at the cost of hand-written JSON/crypto primitives (see
-[docs/ARCHITECTURE.md#why-no-dependencies](docs/ARCHITECTURE.md)).
+The workspace directly uses two focused runtime dependencies: `getrandom` for
+OS-backed entropy and `ctrlc` for signal handling. The database, JSON, crypto, and HTTP
+implementations stay in this repository. `Cargo.lock` pins the dependency graph; the first
+build needs the crates cached or reachable from crates.io. See
+[docs/ARCHITECTURE.md#minimal-dependencies](docs/ARCHITECTURE.md#minimal-dependencies).
 
 ---
 

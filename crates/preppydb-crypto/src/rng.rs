@@ -1,83 +1,12 @@
-//! Randomness: an OS-seeded source for tokens/salts and a deterministic ChaCha20
+//! Randomness: an OS-backed source for tokens/salts and a deterministic ChaCha20
 //! stream generator for reproducible (seeded) pricing runs and tests.
 
-/// Fill `buf` from the operating system.
+/// Fill `buf` with bytes from the operating system's cryptographic random source.
 ///
-/// On Unix this reads `/dev/urandom`. Elsewhere — and if `/dev/urandom` is unavailable —
-/// the function falls back to a SHA-256 based DRBG seeded from `RandomState` (which the
-/// standard library seeds from the OS), the clock, the process id and a stack address.
-/// That fallback is *weaker* than a real CSPRNG ([`crate::rng`] makes no such claim for
-/// it); it is documented here and in `SECURITY.md` rather than silently trusted.
+/// This fails closed when the OS RNG is unavailable; secrets must never fall back to
+/// time, process metadata, or other non-cryptographic sources.
 pub fn os_random(buf: &mut [u8]) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-            let mut filled = 0;
-            while filled < buf.len() {
-                match file.read(&mut buf[filled..]) {
-                    Ok(0) => break,
-                    Ok(n) => filled += n,
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(err) => return Err(format!("failed to read /dev/urandom: {err}")),
-                }
-            }
-            if filled == buf.len() {
-                return Ok(());
-            }
-        }
-    }
-    fallback_random(buf);
-    Ok(())
-}
-
-fn fallback_random(buf: &mut [u8]) {
-    use crate::sha256::{sha256, Sha256};
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let local = 0u8;
-    let addr = &local as *const u8 as usize;
-    let mut seed_material = Vec::new();
-    // `RandomState` is seeded from the OS by the standard library, so mixing several
-    // instances in gives the fallback real (if unproven) entropy on platforms without
-    // `/dev/urandom`, such as Windows.
-    for round in 0..8u64 {
-        use std::hash::{BuildHasher, Hasher};
-        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-        hasher.write_u64(now as u64 ^ round);
-        hasher.write_u32(std::process::id());
-        seed_material.extend_from_slice(&hasher.finish().to_le_bytes());
-    }
-    seed_material.extend_from_slice(&now.to_le_bytes());
-    seed_material.extend_from_slice(&std::process::id().to_le_bytes());
-    seed_material.extend_from_slice(&addr.to_le_bytes());
-    seed_material.extend_from_slice(
-        &std::thread::current()
-            .name()
-            .unwrap_or("unnamed")
-            .len()
-            .to_le_bytes(),
-    );
-    let mut counter: u64 = 0;
-    let mut offset = 0;
-    while offset < buf.len() {
-        let mut hasher = Sha256::new();
-        hasher.update(b"PreppyDB fallback RNG v1");
-        hasher.update(&seed_material);
-        hasher.update(&counter.to_le_bytes());
-        let block = hasher.finish();
-        let take = (buf.len() - offset).min(32);
-        buf[offset..offset + take].copy_from_slice(&block[..take]);
-        offset += take;
-        counter += 1;
-    }
-    // Mix in one more hash so identical seeds still diverge a little across calls.
-    let extra = sha256(&seed_material);
-    for (idx, byte) in buf.iter_mut().enumerate() {
-        *byte ^= extra[idx % 32];
-    }
+    getrandom::fill(buf).map_err(|err| format!("failed to obtain OS randomness: {err}"))
 }
 
 /// Convenience wrapper around [`os_random`].

@@ -67,8 +67,9 @@ These controls exist in the code today; each is covered by the tests listed in
 * One writer per directory, enforced with an OS advisory lock on the `LOCK` file
   (`flock`/`LockFileEx`), so two processes cannot interleave writes and a crash cannot
   leave a stale lock behind.
-* No telemetry, no outbound connections, no update checks, no third-party dependencies.
-  `cargo tree` shows only workspace members.
+* No telemetry, outbound connections, or update checks. The direct runtime dependencies are
+  `getrandom` for OS entropy and `ctrlc` for signal handling; neither contacts a service.
+  `cargo tree` shows the workspace crates and their pinned dependencies.
 
 ## Known limitations and accepted risks
 
@@ -76,14 +77,13 @@ Read these before exposing PreppyDB to anything:
 
 1. **No TLS inside the server.** Plain HTTP only; without a proxy, tokens and data travel
    in the clear.
-2. **Hand-written crypto.** SHA-256/HMAC/PBKDF2/CRC32C are implemented in-tree to keep the
-   dependency tree empty. They are tested against standard vectors, but they have not had
-   the scrutiny of an audited library such as `ring` or `sha2` (RustCrypto).
-   Token/salt randomness comes from `/dev/urandom` on Unix; on other platforms (Windows)
-   the standard library exposes no OS RNG, so a SHA-256 DRBG seeded from `RandomState`
-   (OS-seeded), the clock and the pid is used instead. That is a real, documented
-   weakness on Windows: prefer running the server on Linux until an audited RNG is
-   wired in.
+2. **Hand-written crypto.** SHA-256/HMAC/PBKDF2/CRC32C are implemented in-tree. They are
+   tested against standard vectors, but have not had the scrutiny of an audited library.
+   API-token and password-salt bytes come from `getrandom`, which delegates to the
+   operating system's cryptographic RNG on supported platforms, including Windows. If
+   that source fails, the call returns an error; PreppyDB does not fall back to time or
+   process metadata.
+
 3. **Hand-written HTTP parser.** Only `GET`/`POST`/`PUT`/`DELETE`, no chunked request
    bodies, `Connection: close` per request. It is intentionally minimal, which reduces
    attack surface but also means it is not battle-tested.

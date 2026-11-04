@@ -1,6 +1,6 @@
 [package]
 name = "preppydb-crypto"
-description = "Auditable, dependency-free primitives (SHA-256, HMAC, PBKDF2, CRC32C, base64) for PreppyDB"
+description = "Auditable crypto/checksum primitives and OS entropy source for PreppyDB"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,4 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+getrandom = "0.4.3"

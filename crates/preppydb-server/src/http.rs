@@ -212,7 +212,7 @@ pub fn serve(
                 break;
             }
             counters.active.fetch_add(1, Ordering::Relaxed);
-            handle_connection(stream, handler.as_ref(), &limits, &counters);
+            handle_connection(stream, handler.as_ref(), &limits, &counters, &shutdown);
             counters.active.fetch_sub(1, Ordering::Relaxed);
         }));
     }
@@ -292,6 +292,7 @@ fn handle_connection(
     handler: &dyn Handler,
     limits: &HttpLimits,
     counters: &ServerCounters,
+    shutdown: &AtomicBool,
 ) {
     let peer = stream
         .peer_addr()
@@ -302,13 +303,15 @@ fn handle_connection(
     let mut reader = BufReader::new(stream);
 
     for _ in 0..limits.max_requests_per_connection {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
         match read_request(&mut reader, limits, &peer) {
             Ok(request) => {
                 counters.requests.fetch_add(1, Ordering::Relaxed);
                 counters
                     .bytes_in
                     .fetch_add(request.body.len() as u64, Ordering::Relaxed);
-                let keep_alive = wants_keep_alive(&request);
                 let response = handler.handle(&request);
                 if response.status >= 500 {
                     counters.errors_5xx.fetch_add(1, Ordering::Relaxed);
@@ -318,6 +321,8 @@ fn handle_connection(
                 counters
                     .bytes_out
                     .fetch_add(response.body.len() as u64, Ordering::Relaxed);
+                let keep_alive =
+                    wants_keep_alive(&request) && !shutdown.load(Ordering::SeqCst);
                 if write_response(reader.get_mut(), &response, keep_alive).is_err() {
                     break;
                 }

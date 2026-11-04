@@ -218,6 +218,12 @@ fn run() -> Result<(), String> {
         .unwrap_or_else(|_| config.listen.clone());
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    let signal_shutdown = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || {
+        signal_shutdown.store(true, Ordering::SeqCst);
+    })
+    .map_err(|err| format!("cannot install shutdown signal handler: {err}"))?;
+
     let limits = HttpLimits {
         max_body_bytes: config.max_body_bytes,
         workers: config.workers,
@@ -231,7 +237,7 @@ fn run() -> Result<(), String> {
         let shutdown = Arc::clone(&shutdown);
         std::thread::spawn(move || {
             while !shutdown.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(interval.max(100)));
+                std::thread::park_timeout(std::time::Duration::from_millis(interval.max(100)));
                 if shutdown.load(Ordering::SeqCst) {
                     break;
                 }
@@ -268,6 +274,7 @@ fn run() -> Result<(), String> {
 
     shutdown.store(true, Ordering::SeqCst);
     if let Some(handle) = sweeper {
+        handle.thread().unpark();
         let _ = handle.join();
     }
     let _ = state.engine.shutdown();

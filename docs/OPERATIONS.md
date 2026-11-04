@@ -23,11 +23,9 @@ docker compose up -d --build
   `PREPPYDB_ADMIN_PASSWORD` (user via `PREPPYDB_ADMIN_USER`, default `admin`) or from
   `PREPPYDB_BOOTSTRAP_TOKEN` — and then never touches `auth.json` again. Without either,
   the container exits with code 64 and an explanation. There is **no default password**.
-* `docker stop` sends SIGTERM through `tini`. The server does not install a signal
-  handler (the crate forbids `unsafe` and there are no dependencies), so the process is
-  terminated and the write-ahead log is replayed on the next start; the persistence test
-  proves that no acknowledged document is lost that way. The compose file allows a 30 s
-  grace period, which the shipping process exits well within.
+* `docker stop` sends SIGTERM through `tini`. The server handles SIGTERM and SIGINT through
+  `ctrlc`, stops accepting new connections, finishes in-flight requests, wakes the TTL
+  sweeper, and shuts down the engine. Compose allows 35 seconds for that drain.
 
 Arm64 without emulation:
 
@@ -50,8 +48,9 @@ sudo install -m 0755 target/release/preppydb-server /usr/local/bin/
 sudo install -m 0755 target/release/preppydb        /usr/local/bin/
 ```
 
-The workspace has no third-party dependencies, so the build also works fully offline
-(`cargo build --offline`).
+The workspace has two focused runtime dependencies, `getrandom` for OS entropy and
+`ctrlc` for signal handling. The first build needs these locked crates cached or available
+from crates.io; subsequent builds can run offline.
 
 #### Linux with systemd
 
@@ -71,7 +70,7 @@ Group=preppydb
 ExecStart=/usr/local/bin/preppydb-server --data-dir /var/lib/preppydb --config /etc/preppydb/config.json
 Restart=on-failure
 RestartSec=2
-TimeoutStopSec=30
+TimeoutStopSec=35
 StateDirectory=preppydb
 StateDirectoryMode=0700
 NoNewPrivileges=true
@@ -92,16 +91,11 @@ sudo -u preppydb PREPPYDB_ADMIN_PASSWORD='…' /usr/local/bin/preppydb-server \
 sudo systemctl daemon-reload && sudo systemctl enable --now preppydb
 ```
 
-`SIGTERM`, `SIGINT` and `SIGKILL` all terminate the server the same way: the process
-stops, and the next start replays the write-ahead log, truncates a torn tail and reports
-what it recovered. There is no in-process signal handler — the crate is
-`#![forbid(unsafe_code)]` and the project has no dependencies, so `signal(3)` is not
-available — which is why durability rests on the WAL rather than on a shutdown hook.
-Acknowledge-then-crash is covered end to end by `scripts/crash-recovery-test.sh`, which
-kills a live server with `SIGKILL` and checks that every acknowledged document is still
-there afterwards. When you want a *clean* stop (checkpoint, empty WAL, no recovery on
-start), use `POST /v1/admin/checkpoint` first or stop the server with `preppydb verify`
-afterwards.
+SIGINT, SIGTERM and SIGHUP enter the graceful shutdown path: the server stops accepting
+new connections, finishes in-flight requests, wakes the TTL sweeper and shuts down the
+storage engine. SIGKILL cannot be handled; the WAL recovery path still protects
+acknowledged writes, which `scripts/crash-recovery-test.sh` checks. For a clean checkpoint
+before a maintenance window, call `POST /v1/admin/checkpoint`.
 
 #### Raspberry Pi 4 / ARM64 Linux
 
@@ -135,6 +129,10 @@ $env:PREPPYDB_ADMIN_PASSWORD = "at-least-12-characters"
 * Run as a Windows service with [NSSM](https://nssm.cc/) or `sc.exe` if needed:
   `nssm install PreppyDB C:\PreppyDB\preppydb-server.exe --data-dir C:\PreppyDB\data`.
 * Paths with spaces must be quoted; the CLI accepts both `C:\data` and `C:/data`.
+* On Windows, Ctrl+C/Ctrl+Break request a clean drain and shutdown. On Unix, SIGINT,
+  SIGTERM and SIGHUP do the same. Windows has no POSIX SIGTERM event; service managers should send
+  the supported console control event. The compose example allows 35 seconds for active
+  requests to finish.
 
 ## 2. Configuration
 

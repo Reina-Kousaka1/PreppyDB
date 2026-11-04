@@ -17,11 +17,11 @@ preppydb-model ──┘                     ├─> preppydb-pricing
 | Crate | Responsibility | Depends on |
 | --- | --- | --- |
 | `preppydb-json` | JSON value type, parser, canonical serialisation, pretty printing | — |
-| `preppydb-crypto` | SHA-256, HMAC-SHA-256, PBKDF2, CRC32C, base64, hex, OS RNG | — |
+| `preppydb-crypto` | SHA-256, HMAC-SHA-256, PBKDF2, CRC32C, base64, hex, OS RNG | `getrandom` |
 | `preppydb-storage` | Catalog, records, WAL, snapshots, manifest, transactions, backup | json, crypto |
 | `preppydb-pricing` | Price rules, price changes, offers, purchases, audit log | json, crypto |
 | `preppydb-model` | Personality/shop collection definitions (schemas, indexes, limits) | json |
-| `preppydb-server` | HTTP/1.1 server, routing, auth, rate limiting, web UI | storage, pricing, model |
+| `preppydb-server` | HTTP/1.1 server, routing, auth, rate limiting, web UI | storage, pricing, model, `ctrlc` |
 | `preppydb-client` | Blocking HTTP client for the `/v1` API | json |
 | `preppydb-cli` | Administration and diagnostics against a data directory or a server | storage, pricing, model, server, client |
 
@@ -29,15 +29,16 @@ Layering rules that are actually enforced by Cargo: storage knows nothing about 
 the server never links the CLI; the CLI is the only crate that may link both storage and
 the HTTP client (it needs both local maintenance commands and `preppydb health`).
 
-## Why no dependencies
+## Minimal dependencies
 
-There is no crates.io access in the environment this was built in, so every primitive is
-implemented in-tree against `std` only: JSON parsing, SHA-256/HMAC/PBKDF2, CRC32C,
-base64, a thread pool, an HTTP/1.1 server, a random source. The consequence is an
-explicitly empty dependency tree (`cargo tree` shows only workspace members), fully
-offline builds, and no supply-chain surface — but also that the crypto and HTTP code is
-hand-written and only as good as its tests. See [TESTING.md](TESTING.md) and
-[../SECURITY.md](../SECURITY.md) for what that does and does not cover.
+The workspace directly uses two focused third-party runtime crates: `getrandom` supplies
+OS-backed entropy for secrets, and `ctrlc` connects Unix SIGINT/SIGTERM/SIGHUP and Windows console
+interrupts to the server's safe shutdown path. The database's JSON, cryptographic
+primitives, HTTP server and storage remain implemented in-tree. `Cargo.lock` pins the
+dependency graph; a first build needs these crates cached or reachable from crates.io.
+This avoids custom platform RNG and signal handling code while keeping the runtime
+dependency set small. See [TESTING.md](TESTING.md) and [../SECURITY.md](../SECURITY.md)
+for scope and verification.
 
 ## On-disk layout
 
@@ -194,7 +195,7 @@ data intact.
 | Snapshot = whole store | Recovery is trivially correct | Checkpoint cost grows with data |
 | JSON values, no binary codec | Inspectable, client-neutral, tests are readable | Larger WAL/snapshots than a columnar format |
 | No SQL | Out of scope by requirement | Ad-hoc analytics need exports |
-| Empty dependency tree | Offline, auditable | Hand-written crypto/HTTP |
+| Two focused runtime dependencies | OS-specific entropy and signal handling | First build needs crates.io or cache |
 
 ## Inspirations (no code reused)
 

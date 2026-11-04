@@ -40,9 +40,9 @@ covered by the tests enumerated in [docs/TESTING.md](docs/TESTING.md); the items
 **Server (`preppydb-server`)**
 
 * Hand-written HTTP/1.1 server with a bounded worker pool, request ids, body limits,
-  per-credential rate limiting and a drain-then-stop shutdown path. Shutdown is
-  triggered programmatically (the tests use it); `SIGTERM` terminates the process and
-  durability comes from the WAL, as `scripts/crash-recovery-test.sh` proves.
+  per-credential rate limiting and a drain-then-stop shutdown path. Unix SIGINT/SIGTERM/
+  SIGHUP and Windows Ctrl+C/Ctrl+Break now enter it through the safe `ctrlc` handler; the process
+  smoke test checks the Unix signals.
 * Versioned `/v1` API: collections, documents, batches, transactions, indexes, stats,
   metrics, admin (checkpoint, compact, verify, backup, recovery, auth), personality and
   pricing namespaces.
@@ -74,6 +74,11 @@ covered by the tests enumerated in [docs/TESTING.md](docs/TESTING.md); the items
 
 ### Fixed
 
+* OS token and salt randomness now comes directly from the platform RNG through
+  `getrandom`; failure is reported instead of falling back to time and process metadata.
+* The server handles termination signals without local unsafe code, finishes in-flight
+  requests, wakes its TTL sweeper, and shuts down the storage engine cleanly.
+
 * `auth.json` reload only compared file modification times, so an edit made within the
   same timestamp tick (whole-second filesystems, emulated runs) was ignored and a
   freshly created user could not log in. The length is compared as well.
@@ -85,8 +90,8 @@ covered by the tests enumerated in [docs/TESTING.md](docs/TESTING.md); the items
 
 ### Requirements
 
-* Rust **1.89** or newer (the lock uses the stabilised `File::try_lock`), `cargo test`
-  needs only the standard library.
+* Rust **1.89** or newer (the lock uses the stabilised `File::try_lock`). The first build
+  needs the locked crates available from crates.io or the local Cargo cache.
 
 ### Not verified in the 0.1.0 environment
 

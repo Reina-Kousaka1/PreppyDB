@@ -13,7 +13,7 @@ is marked as such.
 | Formatting | rustfmt 1.10.0-stable |
 | Linting | clippy 0.1.99 |
 | Lua | Lua 5.5 embedded through `lupa` (no `luvit`, no system Lua) |
-| Network | crates.io unreachable → workspace has **zero** external dependencies |
+| Dependencies | Direct runtime dependencies `getrandom` and `ctrlc` are pinned in `Cargo.lock`; first build needs crates.io or a Cargo cache |
 
 ## Test inventory
 
@@ -86,12 +86,14 @@ preppydb-cli:      0 tests (verified manually, see below)
 * **Process-level crash recovery** — `bash scripts/crash-recovery-test.sh`: a real server
   wrote 200 documents in acknowledged batches, was killed with `kill -9` (no checkpoint,
   no graceful shutdown), restarted on the same directory, reported the same 200 documents,
-  served sampled documents intact, then shut down on SIGTERM and passed `preppydb verify`.
+  served sampled documents intact, then shut down cleanly via SIGTERM and SIGINT and
+  passed `preppydb verify`.
 
 ## What was NOT executed
 
-The sandbox that produced this tree has no Docker daemon, no Windows and no ARM64
-hardware, so those legs run only in GitHub Actions. The current state, kept honest:
+The original build sandbox had no Docker daemon, Windows host, or ARM64 hardware, so those
+legs are covered in GitHub Actions. This workspace has no attached Raspberry Pi; the ARM64
+CI test is emulated. The current state, kept honest:
 
 | Item | State | How it is covered |
 | --- | --- | --- |
@@ -99,7 +101,7 @@ hardware, so those legs run only in GitHub Actions. The current state, kept hone
 | Windows x86-64 build + full test suite + PowerShell smoke | **green in CI** | `windows-x86_64` job |
 | Docker image build (amd64 + arm64) | **green in CI** | `docker-images` job, build only — never pushed |
 | `scripts/docker-persistence-test.sh` (restart + recreation) | **green in CI** | `docker-persistence` job |
-| Linux ARM64 build and emulated tests | CI only | `linux-arm64` job under `qemu-user`; this is emulation, **not** real ARM64 hardware |
+| Linux ARM64 build and emulated tests | CI only | `linux-arm64` job under `qemu-user`; this is emulation, **not** real ARM64 hardware. |
 | `docker-compose.yml` | not started | the persistence test drives `docker run` directly |
 | `luvit` as the Lua runtime | not run | luvit is not installed; the suite ran under embedded Lua with a substituted transport |
 | Long-running soak / memory profiling | not run | out of scope for this phase |
