@@ -90,18 +90,27 @@ preppydb-cli:      0 tests (verified manually, see below)
 
 ## What was NOT executed
 
-These are written but **unverified**. They are listed here so nobody mistakes them for
-tested functionality:
+The sandbox that produced this tree has no Docker daemon, no Windows and no ARM64
+hardware, so those legs run only in GitHub Actions. The current state, kept honest:
 
-| Item | State | Why |
+| Item | State | How it is covered |
 | --- | --- | --- |
-| Docker image build (amd64) | not built | no Docker daemon in the sandbox |
-| Docker image build (arm64) | not built | same, plus no buildx |
-| `docker-compose.yml` | not started | same |
-| `scripts/docker-persistence-test.sh` | not run | needs Docker; the script itself is syntax-checked (`bash -n`) |
-| Windows x86-64 build/test/smoke | not run | no Windows host; `.github/workflows/ci.yml` runs it on `windows-2022` |
-| Linux ARM64 build and qemu tests | not run | no ARM64 toolchain/qemu in the sandbox; CI job exists |
-| GitHub Actions workflows | not executed | no Actions runner available here |
+| Linux x86-64 fmt/clippy/tests, crash recovery, release build | **green in CI** | `linux-x86_64` job |
+| Windows x86-64 build + full test suite + PowerShell smoke | **green in CI** | `windows-x86_64` job |
+| Docker image build (amd64 + arm64) | **green in CI** | `docker-images` job, build only — never pushed |
+| `scripts/docker-persistence-test.sh` (restart + recreation) | **green in CI** | `docker-persistence` job |
+| Linux ARM64 build and emulated tests | CI only | `linux-arm64` job under `qemu-user`; this is emulation, **not** real ARM64 hardware |
+| `docker-compose.yml` | not started | the persistence test drives `docker run` directly |
+| `luvit` as the Lua runtime | not run | luvit is not installed; the suite ran under embedded Lua with a substituted transport |
+| Long-running soak / memory profiling | not run | out of scope for this phase |
+| Replication | not implemented | later module |
+
+Note for the emulated job: password verification is PBKDF2-HMAC-SHA-256 with 120k
+iterations in portable Rust, which `qemu-user` executes roughly two orders of magnitude
+slower than native code. Tests that log in therefore use an explicit, generous client
+timeout (`with_timeout`) instead of the 10 s default.
+
+Workflow: <https://github.com/Reina-Kousaka1/PreppyDB/actions/workflows/ci.yml>.
 | `luvit` as the Lua runtime | not run | luvit is not installed; the suite ran under embedded Lua 5.5 with a Python-bridged transport, so the luvit `http` transport itself is unexercised |
 | Long-running soak / memory profiling | not run | out of scope for this phase |
 | Replication | not implemented | later module |

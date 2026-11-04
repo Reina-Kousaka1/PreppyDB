@@ -111,7 +111,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-test-log
-          path: tests.log
+          path: |
+            tests.log
+            ${{ runner.temp }}/smoke-server.out
+            ${{ runner.temp }}/smoke-server.err
           if-no-files-found: ignore
           retention-days: 7
 
@@ -122,16 +125,26 @@ jobs:
       - name: Smoke test (PowerShell)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $data = Join-Path $env:RUNNER_TEMP "preppydb-smoke"
-          $init = & .\target\release\preppydb-server.exe --data-dir $data --bootstrap-token ci --init-only
-          $token = ($init | Select-Object -Skip 1 -First 1).Trim()
-          if (-not $token) { throw "no bootstrap token was printed" }
-          $server = Start-Process -FilePath .\target\release\preppydb-server.exe `
-              -ArgumentList "--data-dir", $data, "--listen", "127.0.0.1:7070" -PassThru
+          $out = Join-Path $env:RUNNER_TEMP "smoke-server.out"
+          $err = Join-Path $env:RUNNER_TEMP "smoke-server.err"
+          $server = $null
           try {
+            $init = & .\target\release\preppydb-server.exe --data-dir $data --bootstrap-token ci --init-only 2>&1
+            $init | ForEach-Object { Write-Host "init: $_" }
+            # Pick the token by shape (32 random bytes, base64url) rather than by line number.
+            $token = ($init | Where-Object { $_ -match '^[A-Za-z0-9_-]{40,}$' } | Select-Object -First 1)
+            if (-not $token) { throw "no bootstrap token was printed" }
+            $server = Start-Process -FilePath .\target\release\preppydb-server.exe `
+                -ArgumentList "--data-dir", $data, "--listen", "127.0.0.1:7070" `
+                -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
             $healthy = $false
             for ($i = 0; $i -lt 30; $i++) {
               Start-Sleep -Milliseconds 500
+              if ($server.HasExited) {
+                throw "server exited with code $($server.ExitCode) before becoming healthy"
+              }
               try {
                 $health = Invoke-RestMethod -Uri "http://127.0.0.1:7070/healthz" -TimeoutSec 2
                 if ($health.status -eq "ok") { $healthy = $true; break }
@@ -139,15 +152,22 @@ jobs:
             }
             if (-not $healthy) { throw "server did not become healthy" }
             $headers = @{ Authorization = "Bearer $token" }
-            $body = '{"name":"windows_smoke"}'
             Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections" `
-                -Headers $headers -ContentType "application/json" -Body $body | Out-Null
+                -Headers $headers -ContentType "application/json" -Body '{"name":"windows_smoke"}' | Out-Null
             Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents" `
                 -Headers $headers -ContentType "application/json" -Body '{"key":"k","value":{"ok":true}}' | Out-Null
             $doc = Invoke-RestMethod -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents/k" -Headers $headers
             if ($doc.data.value.ok -ne $true) { throw "document did not round-trip" }
+            Write-Host "smoke test passed"
+          } catch {
+            Write-Host "::error::$($_.Exception.Message)"
+            if (Test-Path $out) { Get-Content $out -Tail 30 | ForEach-Object { Write-Host "server-out: $_" } }
+            if (Test-Path $err) { Get-Content $err -Tail 30 | ForEach-Object { Write-Host "server-err: $_" } }
+            exit 1
           } finally {
-            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            if ($server -and -not $server.HasExited) {
+              Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            }
           }
 
   # -------------------------------------------------- Linux ARM64 (build + emulated tests)

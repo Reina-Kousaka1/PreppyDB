@@ -379,10 +379,14 @@ fn login_flow_and_session_tokens() {
     auth.create_user("admin", "correct horse battery", vec![Role::Admin])
         .unwrap();
     drop(auth);
-    let mut client = Client::anonymous(&server.base_url).unwrap();
+    // Password verification is PBKDF2 with 120k iterations, and the emulated ARM64 job
+    // runs it orders of magnitude slower than native hardware, so the default 10 s client
+    // timeout is not enough there.
+    let slow = std::time::Duration::from_secs(120);
+    let mut client = Client::anonymous(&server.base_url).unwrap().with_timeout(slow);
     // The server notices edits to auth.json when it handles a request; on filesystems
     // with whole-second timestamps (and under emulation) that can take a moment.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let outcome = loop {
         match client.login("admin", "correct horse battery") {
             Ok(outcome) => break outcome,
@@ -396,7 +400,7 @@ fn login_flow_and_session_tokens() {
                 let meta = std::fs::metadata(&path)
                     .map(|m| format!("len={} modified={:?}", m.len(), m.modified()))
                     .unwrap_or_else(|e| format!("<{e}>"));
-                panic!("login did not succeed within 5s: {err:?}; {meta}; auth.json = {text}");
+                panic!("login did not succeed within 60s: {err:?}; {meta}; auth.json = {text}");
             }
         }
     };
@@ -405,7 +409,7 @@ fn login_flow_and_session_tokens() {
         client.stats().is_ok(),
         "session token must work for API calls"
     );
-    let mut wrong = Client::anonymous(&server.base_url).unwrap();
+    let mut wrong = Client::anonymous(&server.base_url).unwrap().with_timeout(slow);
     let err = wrong.login("admin", "wrong password!!").unwrap_err();
     assert_eq!(err.status(), Some(401));
     // No secret ever leaks in the login response.
