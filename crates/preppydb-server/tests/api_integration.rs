@@ -380,7 +380,19 @@ fn login_flow_and_session_tokens() {
         .unwrap();
     drop(auth);
     let mut client = Client::anonymous(&server.base_url).unwrap();
-    let outcome = client.login("admin", "correct horse battery").unwrap();
+    // The server notices edits to auth.json when it handles a request; on filesystems
+    // with whole-second timestamps (and under emulation) that can take a moment.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let outcome = loop {
+        match client.login("admin", "correct horse battery") {
+            Ok(outcome) => break outcome,
+            Err(err) if std::time::Instant::now() < deadline => {
+                assert_eq!(err.status(), Some(401), "unexpected login failure: {err:?}");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(err) => panic!("login did not succeed within 5s: {err:?}"),
+        }
+    };
     assert!(outcome.get_str("token").is_some());
     assert!(
         client.stats().is_ok(),

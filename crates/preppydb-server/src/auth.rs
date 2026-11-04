@@ -253,6 +253,7 @@ pub struct AuthStore {
     tokens: Vec<TokenRecord>,
     sessions: BTreeMap<String, Session>,
     loaded_mtime: Option<SystemTime>,
+    loaded_len: Option<u64>,
 }
 
 impl AuthStore {
@@ -265,6 +266,7 @@ impl AuthStore {
             tokens: Vec::new(),
             sessions: BTreeMap::new(),
             loaded_mtime: None,
+            loaded_len: None,
         };
         store.load()?;
         Ok(store)
@@ -296,6 +298,7 @@ impl AuthStore {
             }
             Err(err) => return Err(AuthError(format!("reading {}: {err}", self.path.display()))),
         }
+        self.loaded_len = std::fs::metadata(&self.path).ok().map(|m| m.len());
         self.loaded_mtime = std::fs::metadata(&self.path)
             .ok()
             .and_then(|m| m.modified().ok());
@@ -303,11 +306,19 @@ impl AuthStore {
     }
 
     /// Re-read the file when another process (the CLI) changed it.
+    /// Reload the credential file if it changed on disk.
+    ///
+    /// Timestamps are not enough: several filesystems (and some container/overlay
+    /// setups, including emulated test runs) only carry whole-second mtime resolution,
+    /// so a rewrite within the same second would be missed. The length is compared as
+    /// well, which catches every realistic edit (adding or removing a user or token
+    /// changes the file length).
     pub fn reload_if_changed(&mut self) {
-        let mtime = std::fs::metadata(&self.path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        if mtime != self.loaded_mtime && mtime.is_some() {
+        let metadata = std::fs::metadata(&self.path).ok();
+        let mtime = metadata.as_ref().and_then(|m| m.modified().ok());
+        let len = metadata.as_ref().map(|m| m.len());
+        let changed = metadata.is_some() && (mtime != self.loaded_mtime || len != self.loaded_len);
+        if changed {
             let _ = self.load();
         }
     }

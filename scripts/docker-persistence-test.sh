@@ -11,6 +11,9 @@
 set -euo pipefail
 
 IMAGE="${IMAGE:-preppydb:ci}"
+DATA_DIR="${DATA_DIR:-/var/lib/preppydb}"
+APP_UID="${APP_UID:-10001}"
+APP_GID="${APP_GID:-10001}"
 VOLUME="${VOLUME:-preppydb-persistence-test}"
 C1="preppydb-persist-1"
 C2="preppydb-persist-2"
@@ -100,15 +103,30 @@ AFTER_RECREATE=$(curl -fsS "${BASE}/v1/collections/persistence/documents/survivo
 echo "$AFTER_RECREATE" | grep -q "still here" || fail "document lost after recreation: $AFTER_RECREATE"
 echo "    recreation: document survived"
 
-echo "==> verify the on-disk state after the graceful shutdown"
-docker exec "$C2" preppydb verify --data-dir /var/lib/preppydb | tee /tmp/persist-verify.json > /dev/null
-grep -q '"ok": true' /tmp/persist-verify.json || fail "verify reported problems"
+echo "==> verify the storage through the admin API"
+# `preppydb verify` would need the directory lock the running server holds, so the check
+# goes through the same verification code over HTTP.
+VERIFY=$(curl -fsS -X POST "${BASE}/v1/admin/verify" "${AUTH[@]}")
+echo "$VERIFY" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true' || fail "verify reported problems: $VERIFY"
 echo "    storage verifies clean"
 
 echo "==> credentials file is private"
-PERMS=$(docker exec "$C2" stat -c '%a' /var/lib/preppydb/auth.json)
+PERMS=$(docker exec "$C2" stat -c '%a' "${DATA_DIR}/auth.json")
 [ "$PERMS" = "600" ] || fail "auth.json permissions are $PERMS, expected 600"
 echo "    auth.json mode: $PERMS"
+
+echo "==> graceful stop"
+docker stop -t 30 "$C2" > /dev/null
+EXIT_CODE=$(docker inspect --format '{{.State.ExitCode}}' "$C2")
+[ "$EXIT_CODE" = "0" ] || fail "graceful stop exited with $EXIT_CODE"
+echo "    SIGTERM produced exit code 0"
+
+echo "==> offline verify on the stopped directory"
+# As the app user, so the volume keeps its ownership and the lock file can be created.
+OFFLINE=$(docker run --rm --user "${APP_UID}:${APP_GID}" \
+  -v "${VOLUME}:${DATA_DIR}" --entrypoint preppydb "$IMAGE" verify --data-dir "${DATA_DIR}")
+echo "$OFFLINE" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true' || fail "offline verify reported problems: $OFFLINE"
+echo "    offline verify clean after checkpoint + shutdown"
 
 echo
 echo "PASS: data survived restart and container recreation"

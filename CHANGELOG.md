@@ -70,6 +70,17 @@ covered by the tests enumerated in [docs/TESTING.md](docs/TESTING.md); the items
 * Documentation: architecture, API, operations, data model, pricing, CLI, testing,
   security policy.
 
+### Fixed
+
+* `auth.json` reload only compared file modification times, so an edit made within the
+  same timestamp tick (whole-second filesystems, emulated runs) was ignored and a
+  freshly created user could not log in. The length is compared as well.
+* The Docker image starts as root only to take ownership of a fresh, root-owned named
+  volume and then re-execs as uid 10001, so the data directory is writable while the
+  database process itself never runs as root.
+* The Linux lock file can only be read through the holding handle on Windows (an
+  exclusive byte-range lock blocks other readers); `FileLock::metadata` does that.
+
 ### Requirements
 
 * Rust **1.89** or newer (the lock uses the stabilised `File::try_lock`), `cargo test`

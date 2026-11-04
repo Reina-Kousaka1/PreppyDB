@@ -105,6 +105,22 @@ impl FileLock {
     pub fn is_held(&self) -> bool {
         self.file.is_some()
     }
+
+    /// The descriptive metadata stored in the lock file.
+    ///
+    /// Read through the held handle: on Windows the exclusive byte-range lock blocks
+    /// readers that open the file separately, so going through our own handle is the
+    /// only portable way to look at it while the lock is held.
+    pub fn metadata(&mut self) -> Option<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let file = self.file.as_mut()?;
+        if file.seek(SeekFrom::Start(0)).is_err() {
+            return None;
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text).ok()?;
+        Some(text)
+    }
 }
 
 impl Drop for FileLock {
@@ -209,8 +225,8 @@ mod tests {
         drop(lock);
 
         // And the metadata now names us.
-        let lock = FileLock::acquire(&dir).unwrap();
-        let text = std::fs::read_to_string(lock.path()).unwrap();
+        let mut lock = FileLock::acquire(&dir).unwrap();
+        let text = lock.metadata().expect("lock metadata is readable");
         let expected = format!("\"pid\":{}", std::process::id());
         assert!(text.contains(&expected), "lock metadata was {text}");
         drop(lock);
