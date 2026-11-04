@@ -1,0 +1,27 @@
+[package]
+name = "preppydb-server"
+description = "PreppyDB HTTP API server and web administration interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "preppydb_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "preppydb-server"
+path = "src/main.rs"
+
+[dependencies]
+preppydb-json.workspace = true
+preppydb-crypto.workspace = true
+preppydb-storage.workspace = true
+preppydb-pricing.workspace = true
+preppydb-model.workspace = true
+
+[dev-dependencies]
+preppydb-client.workspace = true
