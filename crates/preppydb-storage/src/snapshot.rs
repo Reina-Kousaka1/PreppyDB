@@ -50,11 +50,13 @@ impl SnapshotHeader {
     }
 
     pub fn from_json(value: &Json) -> Result<SnapshotHeader> {
+        let format_version = value
+            .get("format_version")
+            .and_then(|value| value.as_u64())
+            .and_then(|version| u32::try_from(version).ok())
+            .ok_or_else(|| DbError::corrupt("snapshot header", "invalid format version"))?;
         Ok(SnapshotHeader {
-            format_version: value
-                .get("format_version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32,
+            format_version,
             generation: value
                 .get("generation")
                 .and_then(|v| v.as_u64())
@@ -272,6 +274,17 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
                     "snapshot body SHA-256 does not match the footer",
                 ));
             }
+            let mut trailing = [0u8; 1];
+            if reader
+                .read(&mut trailing)
+                .map_err(|err| DbError::io("checking snapshot end of file", err))?
+                != 0
+            {
+                return Err(DbError::corrupt(
+                    path.display().to_string(),
+                    "unexpected bytes after snapshot footer",
+                ));
+            }
             if collections.iter().map(|(_, d)| d.len() as u64).sum::<u64>() != header.doc_count {
                 return Err(DbError::corrupt(
                     path.display().to_string(),
@@ -468,11 +481,59 @@ mod tests {
     }
 
     #[test]
+    fn trailing_bytes_after_snapshot_footer_are_rejected() {
+        let dir = tempdir("trailing-data");
+        let path = dir.join("snap-1.pdb");
+        write_snapshot(&path, 1, 1, 0, &sample()).unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"unexpected")
+            .unwrap();
+        let error = read_snapshot(&path).unwrap_err();
+        assert!(error.to_string().contains("after snapshot footer"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn bad_magic_detected() {
         let dir = tempdir("magic");
         let path = dir.join("snap-1.pdb");
         std::fs::write(&path, b"NOTASNAP!!!!!!").unwrap();
         assert!(read_snapshot(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_format_version_does_not_wrap_on_integer_conversion() {
+        let dir = tempdir("version-overflow");
+        let path = dir.join("snap-1.pdb");
+        write_snapshot(&path, 1, 1, 0, &[]).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let header_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let header_end = 13 + header_len;
+        let mut header =
+            preppydb_json::parse(std::str::from_utf8(&bytes[13..header_end]).unwrap()).unwrap();
+        header.set("format_version", Json::uint(u32::MAX as u64 + 2));
+        let header_bytes = header.to_string().into_bytes();
+
+        // The body hash covers frames, not the header. Rebuild the framing so the
+        // snapshot is otherwise internally valid and isolates the version conversion.
+        let mut forged = Vec::with_capacity(bytes.len() + header_bytes.len() - header_len);
+        forged.extend_from_slice(SNAPSHOT_MAGIC);
+        forged.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
+        forged.extend_from_slice(&header_bytes);
+        forged.extend_from_slice(&bytes[header_end..]);
+        std::fs::write(&path, forged).unwrap();
+
+        let error = read_snapshot(&path).unwrap_err();
+        assert!(
+            error.to_string().contains("version") || error.to_string().contains("format"),
+            "unexpected error: {error}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

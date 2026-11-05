@@ -1,44 +1,15 @@
 //! Small filesystem helpers shared by the storage engine, the backup code and the
 //! server's credential store.
 //!
-//! The only non-obvious one is [`replace_file`]: POSIX `rename(2)` atomically replaces an
-//! existing destination, while the Win32 rename used by `std::fs::rename` fails when the
-//! target exists. Every manifest, snapshot, backup and `auth.json` write goes through
-//! this helper so the "write temp, then swap" pattern behaves the same on Linux, macOS
-//! and Windows.
+//! Publication uses the standard library's replace-existing rename. If it fails, the
+//! error is returned without deleting the destination. Durability still depends on the
+//! caller's file sync, directory sync and platform/filesystem guarantees.
 
 use std::path::Path;
 
-/// Atomically move `from` over `to`, replacing an existing file.
+/// Move `from` over `to`, propagating any failure without deleting `to`.
 pub fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(from, to)
-    }
-    #[cfg(windows)]
-    {
-        match std::fs::rename(from, to) {
-            Ok(()) => Ok(()),
-            Err(err) if to.exists() => {
-                // Retry once after removing the destination (the caller holds the only
-                // writer lock for this directory, and the source is a fully written and
-                // flushed temp file).
-                std::fs::remove_file(to)?;
-                match std::fs::rename(from, to) {
-                    Ok(()) => Ok(()),
-                    Err(second) => Err(std::io::Error::new(
-                        second.kind(),
-                        format!(
-                            "replacing {} with {}: {second} (first attempt: {err})",
-                            to.display(),
-                            from.display()
-                        ),
-                    )),
-                }
-            }
-            Err(err) => Err(err),
-        }
-    }
+    std::fs::rename(from, to)
 }
 
 #[cfg(test)]
@@ -88,5 +59,15 @@ mod tests {
         replace_file(&temp, &target).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"payload");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_replacement_preserves_existing_target() {
+        let dir = tempdir("missing-source");
+        let target = dir.join("manifest");
+        std::fs::write(&target, b"committed").unwrap();
+        assert!(replace_file(&dir.join("missing"), &target).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"committed");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

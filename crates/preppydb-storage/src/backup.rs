@@ -9,13 +9,14 @@
 //! The header lists every member with its length and SHA-256. `restore` verifies the
 //! whole archive (member checksums + trailing digest) **before** writing anything, and
 //! it never deletes an existing database directory: a conflicting target is moved
-//! aside to `<name>.replaced-<timestamp>`.
+//! aside to `<name>.replaced-<timestamp>/previous`.
 
 use crate::clock::{format_rfc3339, now_ms};
 use crate::engine::Engine;
 use crate::error::{DbError, Result};
+use crate::lock::FileLock;
 use crate::snapshot::fsync_dir;
-use preppydb_crypto::sha256::{sha256, Sha256};
+use preppydb_crypto::sha256::Sha256;
 use preppydb_json::Json;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -28,7 +29,8 @@ pub const ARCHIVE_FORMAT_VERSION: u32 = 1;
 /// One member of an archive.
 #[derive(Clone, Debug)]
 pub struct BackupEntry {
-    /// Path relative to the database directory (`MANIFEST.json`, `wal/00..1.wal`).
+    /// Path relative to the database directory (legacy or generation manifest, WAL,
+    /// and snapshot members).
     pub path: String,
     pub len: u64,
     pub sha256: String,
@@ -48,9 +50,36 @@ impl BackupEntry {
                 .get_str("path")
                 .ok_or_else(|| DbError::corrupt("backup", "entry without path"))?
                 .to_string(),
-            len: value.get("len").and_then(|v| v.as_u64()).unwrap_or(0),
-            sha256: value.get_str("sha256").unwrap_or("").to_string(),
+            len: value
+                .get("len")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| DbError::corrupt("backup", "entry without a valid length"))?,
+            sha256: value
+                .get_str("sha256")
+                .ok_or_else(|| DbError::corrupt("backup", "entry without a checksum"))?
+                .to_string(),
         })
+    }
+}
+
+/// Archive paths use `/` on every platform. Validate that grammar before passing
+/// one to the host filesystem, including hosts where `\` is a separator.
+fn valid_member_path(path: &str) -> bool {
+    if crate::manifest::Manifest::is_manifest_name(path) {
+        return true;
+    }
+    if path.contains('\\') || path.contains(':') || path.starts_with('/') {
+        return false;
+    }
+    match path.split('/').collect::<Vec<_>>().as_slice() {
+        ["wal", name] => crate::wal::parse_segment_name(name).is_some(),
+        ["snap", name] => {
+            name.starts_with("snap-")
+                && name.ends_with(".pdb")
+                && name[5..name.len() - 4].chars().all(|c| c.is_ascii_digit())
+                && name.len() > 9
+        }
+        _ => false,
     }
 }
 
@@ -117,22 +146,58 @@ impl RestoreReport {
 /// Files that make up a database directory (excluding the lock file and reports).
 fn collect_members(root: &Path) -> Result<Vec<PathBuf>> {
     let mut members = Vec::new();
-    let manifest = root.join(crate::manifest::MANIFEST_FILE);
-    if manifest.exists() {
-        members.push(manifest);
+    for entry in std::fs::read_dir(root)
+        .map_err(|err| DbError::io("listing database root for backup", err))?
+    {
+        let entry = entry.map_err(|err| DbError::io("reading database root entry", err))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !crate::manifest::Manifest::is_manifest_name(&name) {
+            continue;
+        }
+        let metadata = entry
+            .file_type()
+            .map_err(|err| DbError::io("inspecting backup manifest", err))?;
+        if !metadata.is_file() {
+            return Err(DbError::corrupt(
+                entry.path().display().to_string(),
+                "manifest is not a regular file",
+            ));
+        }
+        members.push(entry.path());
     }
     for dir in ["snap", "wal"] {
         let path = root.join(dir);
-        if let Ok(entries) = std::fs::read_dir(&path) {
-            let mut files: Vec<PathBuf> = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|p| p.is_file())
-                .filter(|p| !p.extension().map(|ext| ext == "tmp").unwrap_or(false))
-                .collect();
-            files.sort();
-            members.extend(files);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|err| DbError::io(format!("inspecting backup {dir} directory"), err))?;
+        if !metadata.file_type().is_dir() {
+            return Err(DbError::corrupt(
+                path.display().to_string(),
+                "backup member directory is not a real directory",
+            ));
         }
+        let entries = std::fs::read_dir(&path)
+            .map_err(|err| DbError::io(format!("reading backup {dir} directory"), err))?;
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|err| DbError::io("reading backup directory entry", err))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|err| DbError::io("inspecting backup directory entry", err))?;
+            let member = entry.path();
+            if file_type.is_symlink() {
+                return Err(DbError::corrupt(
+                    member.display().to_string(),
+                    "symbolic links are not valid backup members",
+                ));
+            }
+            if file_type.is_file() && !member.extension().map(|ext| ext == "tmp").unwrap_or(false) {
+                files.push(member);
+            }
+        }
+        files.sort();
+        members.extend(files);
     }
     Ok(members)
 }
@@ -146,12 +211,20 @@ pub fn create_backup(
     archive: &Path,
     checkpoint_first: bool,
 ) -> Result<BackupReport> {
-    let root = engine.paths().root.clone();
     if checkpoint_first {
         engine.checkpoint()?;
-    } else {
-        engine.flush()?;
     }
+
+    engine.with_stable_files(|seq| create_backup_locked(engine, archive, checkpoint_first, seq))
+}
+
+fn create_backup_locked(
+    engine: &Engine,
+    archive: &Path,
+    checkpoint_first: bool,
+    seq: u64,
+) -> Result<BackupReport> {
+    let root = engine.paths().root.clone();
 
     let members = collect_members(&root)?;
     let mut entries = Vec::with_capacity(members.len());
@@ -179,7 +252,7 @@ pub fn create_backup(
             "source",
             Json::str(engine.paths().root.display().to_string()),
         )
-        .with("last_seq", Json::uint(engine.last_seq()))
+        .with("last_seq", Json::uint(seq))
         .with(
             "entries",
             Json::Array(entries.iter().map(|e| e.to_json()).collect()),
@@ -193,7 +266,10 @@ pub fn create_backup(
         }
     }
     let tmp = archive.with_extension("bak.tmp");
-    let file = File::create(&tmp)
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
         .map_err(|err| DbError::io(format!("creating {}", tmp.display()), err))?;
     let mut writer = BufWriter::new(file);
     let mut digest = Sha256::new();
@@ -240,6 +316,9 @@ pub fn create_backup(
     file.sync_all()
         .map_err(|err| DbError::io("syncing archive", err))?;
     drop(file);
+    let mut verifier = open_archive(&tmp)?;
+    verifier.verify()?;
+    drop(verifier);
     crate::fsutil::replace_file(&tmp, archive)
         .map_err(|err| DbError::io("renaming archive into place", err))?;
 
@@ -333,6 +412,7 @@ fn open_archive(archive: &Path) -> Result<ArchiveReader> {
             "archive is truncated",
         ));
     }
+    validate_archive_layout(&entries, data_start, total)?;
     reader
         .seek(SeekFrom::Start(total - 32))
         .map_err(|err| DbError::io("seeking archive digest", err))?;
@@ -352,6 +432,58 @@ fn open_archive(archive: &Path) -> Result<ArchiveReader> {
     })
 }
 
+fn validate_archive_layout(entries: &[BackupEntry], data_start: u64, total: u64) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    if !entries
+        .iter()
+        .any(|entry| entry.path.starts_with("wal/") || entry.path.starts_with("snap/"))
+    {
+        return Err(DbError::corrupt(
+            "backup",
+            "archive contains no WAL segment or snapshot",
+        ));
+    }
+    if entries.iter().any(|entry| entry.path.starts_with("snap/"))
+        && !entries
+            .iter()
+            .any(|entry| crate::manifest::Manifest::is_manifest_name(&entry.path))
+    {
+        return Err(DbError::corrupt(
+            "backup",
+            "snapshot archive is missing its manifest",
+        ));
+    }
+    let mut expected = data_start
+        .checked_add(40)
+        .ok_or_else(|| DbError::corrupt("backup", "archive size overflow"))?;
+    for entry in entries {
+        if !valid_member_path(&entry.path) || !names.insert(&entry.path) {
+            return Err(DbError::corrupt(
+                "backup",
+                "invalid or duplicate member path",
+            ));
+        }
+        if entry.sha256.len() != 64
+            || !entry
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(DbError::corrupt("backup", "invalid member checksum"));
+        }
+        expected = expected
+            .checked_add(entry.len)
+            .ok_or_else(|| DbError::corrupt("backup", "archive member length overflow"))?;
+    }
+    if expected != total {
+        return Err(DbError::corrupt(
+            "backup",
+            "archive length does not match members",
+        ));
+    }
+    Ok(())
+}
+
 impl ArchiveReader {
     /// Stream the whole archive, verifying member checksums, the end marker and the
     /// trailing digest. Nothing is written to disk here.
@@ -364,11 +496,7 @@ impl ArchiveReader {
         digest.update(&prefix);
         let entries = self.entries.clone();
         for entry in &entries {
-            if entry
-                .path
-                .split('/')
-                .any(|part| part == ".." || part.is_empty())
-            {
+            if !valid_member_path(&entry.path) {
                 return Err(DbError::corrupt(
                     "backup",
                     format!("unsafe member path '{}'", entry.path),
@@ -427,6 +555,18 @@ pub fn verify_backup(archive: &Path) -> Result<Json> {
     let entries = reader.entries.clone();
     let header = reader.header.clone();
     reader.verify()?;
+    let temp = std::env::temp_dir().join(format!(
+        "preppydb-verify-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    create_restore_directory(&temp)?;
+    let _temp_guard = RestoreTempDirectory(temp.clone());
+    extract_archive(&mut reader, &temp)?;
+    verify_restored_database(&temp)?;
     Ok(Json::obj()
         .with("ok", Json::Bool(true))
         .with("archive", Json::str(archive.display().to_string()))
@@ -455,17 +595,7 @@ pub fn restore_backup(archive: &Path, target: &Path, force: bool) -> Result<Rest
     let entry_count = reader.entry_count();
     let total_bytes = reader.total_bytes();
 
-    if target.exists() {
-        let non_empty = std::fs::read_dir(target)
-            .map(|mut entries| entries.next().is_some())
-            .unwrap_or(false);
-        if non_empty && !force {
-            return Err(DbError::validation(format!(
-                "target '{}' exists and is not empty; pass force=true to move it aside and restore",
-                target.display()
-            )));
-        }
-    }
+    validate_restore_target(target, force)?;
 
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
@@ -478,72 +608,40 @@ pub fn restore_backup(archive: &Path, target: &Path, force: bool) -> Result<Rest
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "db".into())
     ));
-    if temp.exists() {
-        std::fs::remove_dir_all(&temp)
-            .map_err(|err| DbError::io("cleaning previous restore temp dir", err))?;
-    }
-    std::fs::create_dir_all(&temp).map_err(|err| DbError::io("creating restore temp dir", err))?;
+    create_restore_directory(&temp)?;
+    let _temp_guard = RestoreTempDirectory(temp.clone());
 
-    // Rewind and copy the members out.
-    reader
-        .file
-        .seek(SeekFrom::Start(0))
-        .map_err(|err| DbError::io("rewinding archive", err))?;
-    let mut skip = vec![0u8; reader.data_start as usize];
-    reader
-        .file
-        .read_exact(&mut skip)
-        .map_err(|err| DbError::io("skipping archive prefix", err))?;
-    for entry in reader.entries.clone() {
-        let path = temp.join(&entry.path);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|err| DbError::io("creating restore subdirectory", err))?;
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut out = options
-            .open(&path)
-            .map_err(|err| DbError::io(format!("creating {}", path.display()), err))?;
-        let mut remaining = entry.len;
-        let mut buffer = vec![0u8; 64 * 1024];
-        while remaining > 0 {
-            let want = (buffer.len() as u64).min(remaining) as usize;
-            reader
-                .file
-                .read_exact(&mut buffer[..want])
-                .map_err(|err| DbError::io("reading archive member", err))?;
-            out.write_all(&buffer[..want])
-                .map_err(|err| DbError::io("writing restored file", err))?;
-            remaining -= want as u64;
-        }
-        out.sync_all()
-            .map_err(|err| DbError::io("syncing restored file", err))?;
-    }
-    fsync_dir(&temp)?;
+    extract_archive(&mut reader, &temp)?;
+    verify_restored_database(&temp)?;
+    sync_restore_tree(&temp)?;
 
-    let replaced_path = if target.exists() {
-        let aside = parent.join(format!(
-            "{}.replaced-{stamp}",
-            target
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "db".into())
-        ));
-        crate::fsutil::replace_file(target, &aside)
-            .map_err(|err| DbError::io("moving existing database aside", err))?;
-        Some(aside.display().to_string())
-    } else {
-        None
+    let aside = parent.join(format!(
+        "{}.replaced-{stamp}",
+        target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "db".into())
+    ));
+    // Hold the target's writer lock through publication. Engine::open checks the
+    // sibling intent both before creating the database directory and again after
+    // taking its directory lock, closing the open-vs-restore race for writers.
+    validate_restore_target(target, force)?;
+    let target_lock = match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Some(FileLock::acquire(target)?)
+        }
+        Ok(_) => None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(DbError::io("checking restore target", err)),
     };
-    crate::fsutil::replace_file(&temp, target)
-        .map_err(|err| DbError::io("moving restored database into place", err))?;
-    fsync_dir(parent)?;
+    validate_restore_target(target, force)?;
+    let intent = RestoreIntent::create(target, &temp, &aside)?;
+    let replaced_path = complete_restore_publication(
+        intent,
+        publish_restore(&temp, target, &aside, force),
+        target,
+    )?;
+    drop(target_lock);
 
     Ok(RestoreReport {
         archive: archive.display().to_string(),
@@ -555,20 +653,953 @@ pub fn restore_backup(archive: &Path, target: &Path, force: bool) -> Result<Rest
     })
 }
 
+/// Keep the restore intent only when publication may have changed the target.
+/// A definite pre-publication failure must not permanently prevent opening the
+/// unchanged database; failure to remove the intent itself is recovery-required.
+fn complete_restore_publication(
+    intent: RestoreIntent,
+    publication: Result<Option<String>>,
+    target: &Path,
+) -> Result<Option<String>> {
+    match publication {
+        Ok(replaced_path) => {
+            intent.complete().map_err(|error| {
+                DbError::RestoreOutcomeUnknown(format!(
+                    "target '{}' was published but restore intent cleanup failed: {error}",
+                    target.display()
+                ))
+            })?;
+            Ok(replaced_path)
+        }
+        Err(error)
+            if error.code() == crate::error::codes::RESTORE_OUTCOME_UNKNOWN
+                || error.code() == crate::error::codes::RECOVERY_REQUIRED =>
+        {
+            Err(error)
+        }
+        Err(error) => {
+            intent.complete().map_err(|cleanup_error| {
+                DbError::RecoveryRequired(format!(
+                    "restore failed before a known publication completed, and its intent could not be cleared: {cleanup_error}"
+                ))
+            })?;
+            Err(error)
+        }
+    }
+}
+
+fn extract_archive(reader: &mut ArchiveReader, root: &Path) -> Result<()> {
+    reader
+        .file
+        .seek(SeekFrom::Start(reader.data_start))
+        .map_err(|err| DbError::io("seeking archive members", err))?;
+    for entry in &reader.entries {
+        let path = root.join(&entry.path);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|err| DbError::io("creating restore subdirectory", err))?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut out = options
+            .open(&path)
+            .map_err(|err| DbError::io(format!("creating {}", path.display()), err))?;
+        copy_verified_member(&mut reader.file, &mut out, entry)?;
+        out.sync_all()
+            .map_err(|err| DbError::io("syncing restored file", err))?;
+    }
+    Ok(())
+}
+
+/// Persist restored directory entries bottom-up before the staged tree is published.
+/// Files are synced as they are extracted; syncing only the root would not make nested
+/// `wal/` and `snap/` directory entries durable on filesystems that require directory
+/// synchronization for that guarantee.
+fn sync_restore_tree(root: &Path) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut directories = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&directory)
+            .map_err(|err| DbError::io("inspecting restored directory", err))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(DbError::corrupt(
+                directory.display().to_string(),
+                "restored tree contains a non-directory directory entry",
+            ));
+        }
+        directories.push(directory.clone());
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|err| DbError::io("listing restored directory", err))?
+        {
+            let entry =
+                entry.map_err(|err| DbError::io("reading restored directory entry", err))?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|err| DbError::io("inspecting restored entry", err))?;
+            if metadata.file_type().is_symlink() {
+                return Err(DbError::corrupt(
+                    path.display().to_string(),
+                    "restored tree contains a symbolic link",
+                ));
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if !metadata.is_file() {
+                return Err(DbError::corrupt(
+                    path.display().to_string(),
+                    "restored tree contains an unsupported file type",
+                ));
+            }
+        }
+    }
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        fsync_dir(&directory)?;
+    }
+    Ok(())
+}
+
+fn verify_restored_database(path: &Path) -> Result<()> {
+    let mut config = crate::engine::EngineConfig::new(path);
+    config.read_only = true;
+    config.take_lock = false;
+    config.repair = crate::engine::RepairPolicy::Strict;
+    let engine = Engine::open(config)?;
+    let report = engine.verify()?;
+    if !report.ok {
+        return Err(DbError::corrupt(
+            "restored backup",
+            report.issues.join("; "),
+        ));
+    }
+    Ok(())
+}
+
+struct RestoreTempDirectory(PathBuf);
+
+impl Drop for RestoreTempDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn validate_restore_target(target: &Path, force: bool) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(DbError::io("checking restore target", err)),
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(DbError::validation(
+            "restore target must be a directory, not a symlink or file",
+        ));
+    }
+    let entries =
+        std::fs::read_dir(target).map_err(|err| DbError::io("reading restore target", err))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| DbError::io("reading restore target entry", err))?;
+        if entry.file_name() == crate::lock::LOCK_FILE {
+            continue;
+        }
+        if !force {
+            return Err(DbError::validation(format!(
+                "target '{}' exists and is not empty; pass force=true to move it aside and restore",
+                target.display()
+            )));
+        }
+        break;
+    }
+    Ok(true)
+}
+
+const RESTORE_INTENT_FORMAT_VERSION: u64 = 1;
+const MAX_RESTORE_INTENT_BYTES: usize = 64 * 1024;
+
+struct RestoreIntent {
+    path: PathBuf,
+    parent: PathBuf,
+}
+
+impl RestoreIntent {
+    fn create(target: &Path, staged: &Path, aside: &Path) -> Result<Self> {
+        let (path, parent) = restore_intent_path(target)?;
+        let target_name = target
+            .file_name()
+            .ok_or_else(|| DbError::validation("restore target must have a file name"))?;
+        let staged_name = staged
+            .file_name()
+            .ok_or_else(|| DbError::validation("restore staging path must have a file name"))?;
+        let aside_name = aside
+            .file_name()
+            .ok_or_else(|| DbError::validation("restore aside path must have a file name"))?;
+        let body = Json::obj()
+            .with("format_version", Json::uint(RESTORE_INTENT_FORMAT_VERSION))
+            .with(
+                "target",
+                Json::str(target_name.to_string_lossy().to_string()),
+            )
+            .with(
+                "staged",
+                Json::str(staged_name.to_string_lossy().to_string()),
+            )
+            .with("aside", Json::str(aside_name.to_string_lossy().to_string()))
+            .with("created_at", Json::int(now_ms()))
+            .to_string();
+        if body.len() > MAX_RESTORE_INTENT_BYTES {
+            return Err(DbError::LimitExceeded {
+                limit: "restore_intent_bytes",
+                max: MAX_RESTORE_INTENT_BYTES as u64,
+                actual: body.len() as u64,
+            });
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|err| DbError::io("creating restore intent", err))?;
+        use std::io::Write;
+        file.write_all(body.as_bytes())
+            .map_err(|err| DbError::io("writing restore intent", err))?;
+        file.sync_all()
+            .map_err(|err| DbError::io("syncing restore intent", err))?;
+        fsync_dir(&parent)?;
+        Ok(Self { path, parent })
+    }
+
+    fn complete(self) -> Result<()> {
+        std::fs::remove_file(&self.path)
+            .map_err(|err| DbError::io("removing completed restore intent", err))?;
+        fsync_dir(&self.parent)
+    }
+}
+
+fn restore_intent_path(target: &Path) -> Result<(PathBuf, PathBuf)> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let name = target
+        .file_name()
+        .ok_or_else(|| DbError::validation("restore target must have a file name"))?;
+    let path = parent.join(format!(".{}.restore-intent", name.to_string_lossy()));
+    Ok((path, parent))
+}
+
+/// Refuse to open a path while a previous restore publication still needs inspection.
+pub(crate) fn ensure_no_restore_intent(target: &Path) -> Result<()> {
+    let (path, _) = restore_intent_path(target)?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(DbError::io("inspecting restore intent", err)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(DbError::corrupt(
+            path.display().to_string(),
+            "restore intent is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .and_then(|file| {
+            file.take((MAX_RESTORE_INTENT_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|err| DbError::io("reading restore intent", err))?;
+    if bytes.len() > MAX_RESTORE_INTENT_BYTES {
+        return Err(DbError::corrupt(
+            path.display().to_string(),
+            "restore intent exceeds the maximum size",
+        ));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|err| DbError::corrupt("restore intent", format!("not UTF-8: {err}")))?;
+    let value = preppydb_json::parse(text)
+        .map_err(|err| DbError::corrupt("restore intent", err.to_string()))?;
+    let version = value.get("format_version").and_then(Json::as_u64);
+    let target_name = target.file_name().map(|name| name.to_string_lossy());
+    if version != Some(RESTORE_INTENT_FORMAT_VERSION)
+        || value.get_str("target") != target_name.as_deref()
+        || value.get_str("staged").is_none()
+        || value.get_str("aside").is_none()
+    {
+        return Err(DbError::corrupt(
+            path.display().to_string(),
+            "restore intent fields are invalid or refer to a different target",
+        ));
+    }
+    Err(DbError::RecoveryRequired(format!(
+        "unfinished restore intent at {}; inspect the target, staged directory, and retained previous directory before removing the intent",
+        path.display()
+    )))
+}
+
+fn publish_restore(
+    temp: &Path,
+    target: &Path,
+    aside: &Path,
+    force: bool,
+) -> Result<Option<String>> {
+    publish_restore_with(temp, target, aside, force, fsync_dir)
+}
+
+fn publish_restore_with<F>(
+    temp: &Path,
+    target: &Path,
+    aside: &Path,
+    force: bool,
+    mut sync_parent: F,
+) -> Result<Option<String>>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    let previous = if validate_restore_target(target, force)? {
+        // Exclusive reservation avoids replacing a prior restore's retained data.
+        create_restore_directory(aside)?;
+        let previous = aside.join("previous");
+        std::fs::rename(target, &previous)
+            .map_err(|err| DbError::io("moving existing database aside", err))?;
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        if let Err(sync_error) = sync_parent(parent) {
+            if let Err(rollback_error) = std::fs::rename(&previous, target)
+                .and_then(|()| sync_parent(parent).map_err(std::io::Error::other))
+            {
+                return Err(DbError::RecoveryRequired(format!(
+                    "syncing old restore target failed and rollback did not complete; prior database remains at {} (sync: {}; rollback: {})",
+                    previous.display(), sync_error, rollback_error
+                )));
+            }
+            return Err(DbError::Io {
+                context: "syncing old restore target before publication".into(),
+                detail: sync_error.to_string(),
+            });
+        }
+        Some(previous)
+    } else {
+        None
+    };
+    if let Err(err) = std::fs::rename(temp, target) {
+        if let Some(path) = &previous {
+            // Roll back only if no other actor has installed a target meanwhile.
+            match std::fs::symlink_metadata(target) {
+                Err(ref target_error) if target_error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Err(rollback) = std::fs::rename(path, target) {
+                        return Err(DbError::RecoveryRequired(format!(
+                            "restore publication and rollback failed; old database retained at {} (publish: {err}; rollback: {rollback})",
+                            path.display()
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(DbError::RecoveryRequired(format!(
+                        "restore publication failed and a target appeared before rollback; old database retained at {} (publish: {err})",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        return Err(DbError::io("moving restored database into place", err));
+    }
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    if let Err(error) = sync_parent(parent) {
+        let previous_description = previous
+            .as_ref()
+            .map(|path| format!(" prior database retained at {}", path.display()))
+            .unwrap_or_default();
+        return Err(DbError::RestoreOutcomeUnknown(format!(
+            "new target '{}' is visible, but syncing its parent failed: {error}.{previous_description}",
+            target.display()
+        )));
+    }
+    Ok(previous.map(|path| path.display().to_string()))
+}
+
+// The archive can change after the initial verification. Verify the exact bytes
+// copied before publishing the restored directory.
+fn copy_verified_member(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    entry: &BackupEntry,
+) -> Result<()> {
+    let mut remaining = entry.len;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut digest = Sha256::new();
+    while remaining > 0 {
+        let want = (buffer.len() as u64).min(remaining) as usize;
+        input
+            .read_exact(&mut buffer[..want])
+            .map_err(|err| DbError::io("reading archive member", err))?;
+        digest.update(&buffer[..want]);
+        output
+            .write_all(&buffer[..want])
+            .map_err(|err| DbError::io("writing restored file", err))?;
+        remaining -= want as u64;
+    }
+    if preppydb_crypto::hex_encode(&digest.finish()) != entry.sha256 {
+        return Err(DbError::corrupt(
+            "backup",
+            format!("member '{}' changed during restore", entry.path),
+        ));
+    }
+    Ok(())
+}
+
+// Never reuse or remove an existing path: it could belong to another restore or
+// be a symlink planted by a local user. Restrict access where the OS supports it.
+fn create_restore_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+
+    builder
+        .create(path)
+        .map_err(|err| DbError::io("creating exclusive restore temp dir", err))
+}
+
 /// Hash of an archive (helper for tests/tools).
 pub fn archive_sha256(path: &Path) -> Result<String> {
-    Ok(preppydb_crypto::hex_encode(&sha256(
-        &std::fs::read(path).map_err(|err| DbError::io("reading archive", err))?,
-    )))
+    let mut file =
+        File::open(path).map_err(|err| DbError::io(format!("opening {}", path.display()), err))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| DbError::io("reading archive", err))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(preppydb_crypto::hex_encode(&digest.finish()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use preppydb_crypto::sha256::sha256;
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "preppydb-backup-{tag}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn corrupt_snapshot_and_reseal_archive(archive: &Path) {
+        let mut bytes = std::fs::read(archive).unwrap();
+        assert_eq!(&bytes[..8], ARCHIVE_MAGIC);
+        let header_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let data_start = 12 + header_len;
+        let header_text = std::str::from_utf8(&bytes[12..data_start]).unwrap();
+        let mut header = preppydb_json::parse(header_text).unwrap();
+        let entries = header
+            .get("entries")
+            .and_then(Json::as_array)
+            .unwrap()
+            .to_vec();
+        let mut member_offset = data_start;
+        let mut changed = false;
+        for (index, entry) in entries.iter().enumerate() {
+            let len = usize::try_from(entry.get("len").and_then(Json::as_u64).unwrap()).unwrap();
+            if entry.get_str("path").unwrap().starts_with("snap/") {
+                assert!(len > 0);
+                bytes[member_offset] ^= 0xff;
+                let checksum = preppydb_crypto::hex_encode(&sha256(
+                    &bytes[member_offset..member_offset + len],
+                ));
+                header
+                    .get_mut("entries")
+                    .and_then(Json::as_array_mut)
+                    .unwrap()[index]
+                    .set("sha256", Json::str(checksum));
+                changed = true;
+                break;
+            }
+            member_offset += len;
+        }
+        assert!(changed, "backup fixture should include a snapshot");
+
+        let new_header = header.to_string().into_bytes();
+        assert_eq!(
+            new_header.len(),
+            header_len,
+            "checksum replacement is fixed width"
+        );
+        bytes[12..data_start].copy_from_slice(&new_header);
+        let trailer = bytes.len() - 32;
+        let archive_digest = sha256(&bytes[..trailer]);
+        bytes[trailer..].copy_from_slice(&archive_digest);
+        std::fs::write(archive, bytes).unwrap();
+    }
+
+    #[test]
+    fn restore_publication_preserves_existing_data_on_collision_and_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "preppydb-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("database");
+        let aside = root.join("aside");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("old"), b"old").unwrap();
+        std::fs::create_dir(&aside).unwrap();
+        std::fs::write(aside.join("keep"), b"keep").unwrap();
+        assert!(publish_restore(&root.join("missing"), &target, &aside, true).is_err());
+        assert_eq!(std::fs::read(aside.join("keep")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old");
+
+        let fresh_aside = root.join("fresh-aside");
+        assert!(publish_restore(&root.join("missing"), &target, &fresh_aside, true).is_err());
+        assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_publication_classifies_post_rename_sync_failure_as_unknown() {
+        let root = tempdir("publish-sync-failure");
+        let target = root.join("database");
+        let aside = root.join("aside");
+        let staged = root.join("staged");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("old"), b"old").unwrap();
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("new"), b"new").unwrap();
+        let intent = RestoreIntent::create(&target, &staged, &aside).unwrap();
+
+        let mut sync_calls = 0;
+        let error = publish_restore_with(&staged, &target, &aside, true, |_| {
+            sync_calls += 1;
+            if sync_calls == 2 {
+                return Err(DbError::io(
+                    "injected parent sync failure",
+                    std::io::Error::other("injected"),
+                ));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), crate::error::codes::RESTORE_OUTCOME_UNKNOWN);
+        assert_eq!(std::fs::read(target.join("new")).unwrap(), b"new");
+        let previous = aside.join("previous");
+        assert_eq!(std::fs::read(previous.join("old")).unwrap(), b"old");
+        let open_error = match Engine::open(crate::engine::EngineConfig::new(&target)) {
+            Ok(_) => panic!("an unfinished restore intent must block database open"),
+            Err(error) => error,
+        };
+        assert_eq!(open_error.code(), crate::error::codes::RECOVERY_REQUIRED);
+        assert!(intent.path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_publication_rolls_back_when_syncing_old_target_fails() {
+        let root = tempdir("publish-old-sync-failure");
+        let target = root.join("database");
+        let aside = root.join("aside");
+        let staged = root.join("staged");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("old"), b"old").unwrap();
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("new"), b"new").unwrap();
+
+        let mut sync_calls = 0;
+        let error = publish_restore_with(&staged, &target, &aside, true, |_| {
+            sync_calls += 1;
+            if sync_calls == 1 {
+                return Err(DbError::io(
+                    "injected parent sync failure",
+                    std::io::Error::other("injected"),
+                ));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_ne!(error.code(), crate::error::codes::RESTORE_OUTCOME_UNKNOWN);
+        assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old");
+        assert!(!target.join("new").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_intent_is_bounded_and_blocks_empty_database_initialization() {
+        let root = tempdir("restore-intent-blocks-open");
+        let target = root.join("database");
+        let staged = root.join("staged");
+        let aside = root.join("aside");
+        let intent = RestoreIntent::create(&target, &staged, &aside).unwrap();
+
+        let error = match Engine::open(crate::engine::EngineConfig::new(&target)) {
+            Ok(_) => panic!("an unfinished restore intent must block empty initialization"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), crate::error::codes::RECOVERY_REQUIRED);
+        assert!(!target.exists());
+        assert!(intent.path.exists());
+
+        intent.complete().unwrap();
+        let engine = Engine::open(crate::engine::EngineConfig::new(&target)).unwrap();
+        assert_eq!(engine.stats().total_documents, 0);
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn definite_restore_failure_clears_intent_but_uncertain_failure_keeps_it() {
+        let root = tempdir("restore-intent-failure-classification");
+        let target = root.join("database");
+        let staged = root.join("staged");
+        let aside = root.join("aside");
+        let first_intent = RestoreIntent::create(&target, &staged, &aside).unwrap();
+        let first_path = first_intent.path.clone();
+        let definite = DbError::io(
+            "injected pre-publication failure",
+            std::io::Error::other("injected"),
+        );
+        assert!(complete_restore_publication(first_intent, Err(definite), &target).is_err());
+        assert!(!first_path.exists());
+
+        let second_intent = RestoreIntent::create(&target, &staged, &aside).unwrap();
+        let second_path = second_intent.path.clone();
+        let uncertain = DbError::RestoreOutcomeUnknown("injected post-publication failure".into());
+        assert!(complete_restore_publication(second_intent, Err(uncertain), &target).is_err());
+        assert!(second_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_publication_process_crashes_fail_closed_at_rename_boundaries() {
+        for phase in [
+            "before_publish",
+            "after_old_target_move",
+            "after_new_target_move",
+        ] {
+            let root = tempdir(&format!("restore-process-crash-{phase}"));
+            let target = root.join("database");
+            let staged = root.join("staged");
+            let aside = root.join("aside");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("old"), b"old-state").unwrap();
+            std::fs::create_dir(&staged).unwrap();
+            std::fs::write(staged.join("new"), b"new-state").unwrap();
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backup::tests::restore_publication_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("PREPPYDB_RESTORE_CRASH_ROOT", &root)
+                .env("PREPPYDB_RESTORE_CRASH_PHASE", phase)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "child should abort at {phase}; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let intent_path = restore_intent_path(&target).unwrap().0;
+            assert!(intent_path.exists(), "missing recovery marker at {phase}");
+            let open_error = match Engine::open(crate::engine::EngineConfig::new(&target)) {
+                Ok(_) => panic!("open must refuse an interrupted restore at {phase}"),
+                Err(error) => error,
+            };
+            assert_eq!(open_error.code(), crate::error::codes::RECOVERY_REQUIRED);
+
+            match phase {
+                "before_publish" => {
+                    assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old-state");
+                    assert_eq!(std::fs::read(staged.join("new")).unwrap(), b"new-state");
+                    assert!(!aside.exists());
+                }
+                "after_old_target_move" => {
+                    assert!(!target.exists());
+                    assert_eq!(
+                        std::fs::read(aside.join("previous/old")).unwrap(),
+                        b"old-state"
+                    );
+                    assert_eq!(std::fs::read(staged.join("new")).unwrap(), b"new-state");
+                }
+                "after_new_target_move" => {
+                    assert_eq!(std::fs::read(target.join("new")).unwrap(), b"new-state");
+                    assert_eq!(
+                        std::fs::read(aside.join("previous/old")).unwrap(),
+                        b"old-state"
+                    );
+                    assert!(!staged.exists());
+                }
+                _ => unreachable!(),
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Child-process crash helper for `restore_publication_process_crashes_fail_closed_at_rename_boundaries`.
+    #[test]
+    #[ignore = "spawned by restore_publication_process_crashes_fail_closed_at_rename_boundaries"]
+    fn restore_publication_crash_child() {
+        let Ok(root) = std::env::var("PREPPYDB_RESTORE_CRASH_ROOT") else {
+            return;
+        };
+        let phase = std::env::var("PREPPYDB_RESTORE_CRASH_PHASE").unwrap();
+        let root = PathBuf::from(root);
+        let target = root.join("database");
+        let staged = root.join("staged");
+        let aside = root.join("aside");
+        let _intent = RestoreIntent::create(&target, &staged, &aside).unwrap();
+        if phase == "before_publish" {
+            std::process::abort();
+        }
+        let mut sync_calls = 0;
+        let _ = publish_restore_with(&staged, &target, &aside, true, |parent| {
+            sync_calls += 1;
+            if (phase == "after_old_target_move" && sync_calls == 1)
+                || (phase == "after_new_target_move" && sync_calls == 2)
+            {
+                std::process::abort();
+            }
+            fsync_dir(parent)
+        });
+        panic!("crash phase '{phase}' was not reached");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "preppydb-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let original = root.join("original");
+        std::fs::create_dir(&original).unwrap();
+        let target = root.join("link");
+        symlink(&original, &target).unwrap();
+        assert!(validate_restore_target(&target, true).is_err());
+        assert!(target.symlink_metadata().unwrap().file_type().is_symlink());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_member_collection_rejects_symlinks_and_directory_errors() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "preppydb-backup-members-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let outside = root.join("outside");
+        let data = root.join("data");
+        std::fs::create_dir_all(outside.join("snap")).unwrap();
+        std::fs::create_dir_all(outside.join("wal")).unwrap();
+        std::fs::write(outside.join("snap/secret.pdb"), b"sensitive").unwrap();
+        std::fs::create_dir(&data).unwrap();
+        symlink(outside.join("snap/secret.pdb"), data.join("manifest-link")).unwrap();
+        std::fs::create_dir(data.join("snap")).unwrap();
+        symlink(outside.join("wal"), data.join("wal")).unwrap();
+        assert!(collect_members(&data).is_err());
+
+        std::fs::remove_file(data.join("manifest-link")).unwrap();
+        std::fs::remove_file(data.join("wal")).unwrap();
+        symlink(
+            outside.join("snap/secret.pdb"),
+            data.join("snap/linked.pdb"),
+        )
+        .unwrap();
+        std::fs::create_dir(data.join("wal")).unwrap();
+        assert!(collect_members(&data).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_layout_rejects_bad_lengths_and_duplicates() {
+        let entry = BackupEntry {
+            path: "MANIFEST.json".into(),
+            len: 4,
+            sha256: "a".repeat(64),
+        };
+        let wal = BackupEntry {
+            path: "wal/000000000001.wal".into(),
+            len: 0,
+            sha256: "b".repeat(64),
+        };
+        assert!(validate_archive_layout(&[entry.clone(), wal.clone()], 12, 56).is_ok());
+        assert!(validate_archive_layout(&[entry.clone(), wal.clone()], 12, 57).is_err());
+        assert!(
+            validate_archive_layout(&[entry.clone(), entry.clone(), wal.clone()], 12, 60).is_err()
+        );
+        // Before its first checkpoint, a valid database may have no manifest, but
+        // it still has its initial WAL segment.
+        assert!(validate_archive_layout(&[], 12, 52).is_err());
+        let mut overflow = entry;
+        overflow.len = u64::MAX;
+        assert!(validate_archive_layout(&[wal, overflow], 12, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn archive_entry_requires_length_and_checksum() {
+        assert!(
+            BackupEntry::from_json(&Json::obj().with("path", Json::str("MANIFEST.json"))).is_err()
+        );
+    }
+
+    #[test]
+    fn restore_rechecks_bytes_copied_after_initial_verification() {
+        let entry = BackupEntry {
+            path: "MANIFEST.json".into(),
+            len: 4,
+            sha256: preppydb_crypto::hex_encode(&sha256(b"good")),
+        };
+        let mut output = Vec::new();
+        assert!(copy_verified_member(&mut &b"evil"[..], &mut output, &entry).is_err());
+        assert_eq!(output, b"evil");
+        let mut output = Vec::new();
+        copy_verified_member(&mut &b"good"[..], &mut output, &entry).unwrap();
+        assert_eq!(output, b"good");
+    }
+
+    #[test]
+    fn restore_rejects_semantically_corrupt_database_before_replacing_target() {
+        let root = tempdir("semantic-corruption");
+        let source = root.join("source");
+        let engine = Engine::open(crate::engine::EngineConfig::new(&source)).unwrap();
+        engine
+            .create_collection(crate::catalog::CollectionMeta::new("items", 0))
+            .unwrap();
+        engine
+            .put(
+                "items",
+                "one",
+                Json::str("value"),
+                crate::engine::PutOptions::default(),
+            )
+            .unwrap();
+        let archive = root.join("database.bak");
+        create_backup(&engine, &archive, true).unwrap();
+        drop(engine);
+
+        corrupt_snapshot_and_reseal_archive(&archive);
+        assert!(verify_backup(&archive).is_err());
+
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"original database marker").unwrap();
+        assert!(restore_backup(&archive, &target, true).is_err());
+        assert_eq!(
+            std::fs::read(target.join("keep")).unwrap(),
+            b"original database marker"
+        );
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".target.restore-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_temp_collision_preserves_existing_directory() {
+        let path = std::env::temp_dir().join(format!(
+            "preppydb-restore-collision-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let marker = path.join("keep");
+        std::fs::write(&marker, b"preserve").unwrap();
+        assert!(create_restore_directory(&path).is_err());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"preserve");
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_temp_symlink_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "preppydb-restore-symlink-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let link = root.join("restore");
+        symlink(&outside, &link).unwrap();
+        assert!(create_restore_directory(&link).is_err());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn magic_constants_are_stable() {
         assert_eq!(ARCHIVE_MAGIC.len(), 8);
         assert_eq!(ARCHIVE_END.len(), 8);
+    }
+
+    #[test]
+    fn backup_members_cannot_escape_restore_root_on_any_platform() {
+        for path in [
+            "../outside",
+            "wal/../outside",
+            "wal/..\\outside",
+            "..\\outside",
+            "C:\\outside",
+            "C:/outside",
+            "/etc/passwd",
+            "wal//file.wal",
+            "snap/snap-1.pdb/extra",
+            "wal/file.wal",
+            "MANIFEST-000000000001.json/extra",
+        ] {
+            assert!(!valid_member_path(path), "accepted {path}");
+        }
+        for path in [
+            "MANIFEST.json",
+            "MANIFEST-000000000001.json",
+            "wal/000000000001.wal",
+            "snap/snap-1.pdb",
+        ] {
+            assert!(valid_member_path(path), "rejected {path}");
+        }
     }
 }

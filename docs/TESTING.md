@@ -12,8 +12,9 @@ is marked as such.
 | Compiler | rustc 1.99.0, cargo 1.99.0 |
 | Formatting | rustfmt 1.10.0-stable |
 | Linting | clippy 0.1.99 |
-| Lua | Lua 5.5 embedded through `lupa` (no `luvit`, no system Lua) |
-| Dependencies | Direct runtime dependencies `getrandom` and `ctrlc` are pinned in `Cargo.lock`; first build needs crates.io or a Cargo cache |
+| Lua | Embedded Lua 5.5 through `lupa`; real Luvit 2.18.1 also used for live tests on 2026-11-05 |
+| Server-side Lua | bundled Lua 5.4 through `mlua` (`lua54`, `vendored`); exercised by the Rust server unit/API integration suites |
+| Dependencies | Direct runtime dependencies `getrandom`, `ctrlc`, and `mlua` are pinned in `Cargo.lock`; first build needs crates.io or a Cargo cache |
 
 ## Test inventory
 
@@ -21,13 +22,13 @@ is marked as such.
 | --- | --- | --- |
 | JSON (18) | `crates/preppydb-json` | parsing, escapes, numbers, canonical form, ordering, rejects invalid input |
 | Crypto (30) | `crates/preppydb-crypto` | SHA-256 vectors, HMAC, PBKDF2, CRC32C, base64 round-trips, hex, RNG |
-| Storage unit (46) | `crates/preppydb-storage/src/**` | records, catalog, schema validation, WAL framing, snapshot blocks, manifest, locks, clock, backup format |
-| Storage integration (21 + 1 helper) | `crates/preppydb-storage/tests/engine_integration.rs` | durability, checkpoint/replay, indexes across restart, transactions (commit/conflict/rollback), batch atomicity across restart, TTL, **crash recovery with a real `abort()` in a child process**, torn-tail truncation, mid-log corruption handling, backup/restore round-trip |
+| Storage unit (86) | `crates/preppydb-storage/src/**` | records, catalog, schema validation, WAL framing/CRC/truncation, snapshot blocks, manifest, locks, clock, backup format |
+| Storage integration (37 + 1 helper) | `crates/preppydb-storage/tests/engine_integration.rs` | durability, checkpoint/replay and publication crash windows, indexes across restart, transactions (commit/conflict/rollback), batch atomicity across restart, TTL, **crash recovery with a real `abort()` in a child process**, torn-tail truncation, terminal and mid-log corruption, post-checkpoint sequence gaps, repair suffix cleanup, manifest path/metadata/symlink validation, backup/restore round-trip |
 | Pricing (10) | `crates/preppydb-pricing` | bounds, clamping, discounts, seeded determinism, offer expiry/staleness/double-redeem, ledger immutability, audit tamper detection |
 | Model (5) | `crates/preppydb-model` | 14 collections declared, no name collisions with forbidden names, schemas validate, bootstrap idempotence |
 | Rust client (5 + 1 doc) | `crates/preppydb-client` | URL parsing, https rejection, error mapping (`is_retryable`, `code`), request building |
 | API integration (12) | `crates/preppydb-server/tests/api_integration.rs` | real HTTP server on an ephemeral port: public endpoints, authn/authz, CRUD + CAS, schema rejection, batch atomicity, body/rate limits, routing, login/session tokens, pricing flow end-to-end, simulation determinism, personality model + admin endpoints, index queries |
-| Lua client (30 + 66 + live) | `clients/luvit/tests/*.lua` | JSON codec, request construction, error mapping, retries, async transport contract, and a **live** end-to-end suite against a running server (40 checks) |
+| Lua client (30 + 70 + live) | `clients/luvit/tests/*.lua` | JSON codec, request construction, error mapping, retries, async transport contract, and a **live** end-to-end suite against a running server (40 checks) |
 
 Total in the Rust workspace: **170 passed, 0 failed, 1 ignored** (the ignored test is the
 child-process helper used by the crash test, spawned explicitly).
@@ -91,19 +92,20 @@ preppydb-cli:      0 tests (verified manually, see below)
 
 ## What was NOT executed
 
-The original build sandbox had no Docker daemon, Windows host, or ARM64 hardware, so those
-legs are covered in GitHub Actions. This workspace has no attached Raspberry Pi; the ARM64
-CI test is emulated. The current state, kept honest:
+The original 2026-11-04 build sandbox had no Docker daemon, Windows host, or ARM64 hardware.
+The following GitHub Actions statuses refer to the previously committed PR head, not the
+current uncommitted worktree. This workspace has no attached Raspberry Pi; ARM64 CI is
+emulated.
 
 | Item | State | How it is covered |
 | --- | --- | --- |
-| Linux x86-64 fmt/clippy/tests, crash recovery, release build | **green in CI** | `linux-x86_64` job |
-| Windows x86-64 build + full test suite + PowerShell smoke | **green in CI** | `windows-x86_64` job |
-| Docker image build (amd64 + arm64) | **green in CI** | `docker-images` job, build only — never pushed |
-| `scripts/docker-persistence-test.sh` (restart + recreation) | **green in CI** | `docker-persistence` job |
+| Linux x86-64 fmt/clippy/tests, crash recovery, release build | **green on previous PR head** | `linux-x86_64` job; current worktree has separate local results below |
+| Windows x86-64 build + full test suite + PowerShell smoke | **green on previous PR head** | `windows-x86_64` job; current worktree still needs GitHub qualification |
+| Docker image build (amd64 + arm64) | **green on previous PR head** | `docker-images` job, build only — never pushed |
+| `scripts/docker-persistence-test.sh` (restart + recreation) | **green on previous PR head** | `docker-persistence` job; current worktree has separate local results below |
 | Linux ARM64 build and emulated tests | CI only | `linux-arm64` job under `qemu-user`; this is emulation, **not** real ARM64 hardware. |
 | `docker-compose.yml` | not started | the persistence test drives `docker run` directly |
-| `luvit` as the Lua runtime | not run | luvit is not installed; the suite ran under embedded Lua with a substituted transport |
+| `luvit` runtime | not run in the baseline checks | The baseline suite used embedded Lua with substituted transport; current worktree results are listed below. |
 | Long-running soak / memory profiling | not run | out of scope for this phase |
 | Replication | not implemented | later module |
 
@@ -113,9 +115,26 @@ slower than native code. Tests that log in therefore use an explicit, generous c
 timeout (`with_timeout`) instead of the 10 s default.
 
 Workflow: <https://github.com/Reina-Kousaka1/PreppyDB/actions/workflows/ci.yml>.
-| `luvit` as the Lua runtime | not run | luvit is not installed; the suite ran under embedded Lua 5.5 with a Python-bridged transport, so the luvit `http` transport itself is unexercised |
-| Long-running soak / memory profiling | not run | out of scope for this phase |
-| Replication | not implemented | later module |
+
+## Additional local qualification of the uncommitted hardening work
+
+The checks below were run against the current local worktree on 2026-11-05. They do
+not describe the older committed PR head and do not substitute for GitHub Actions on the
+eventual pushed commit.
+
+| Check | Local result | Boundary |
+| --- | --- | --- |
+| Linux x86-64 formatting, workspace check, strict Clippy, tests, release build, crash recovery | **passed** | Latest Ruby-feature workspace run reported 252 passed, 0 failed, and 1 ignored helper; the helper was explicitly spawned and passed by the crash test. |
+| Linux ARM64 cross-build and QEMU tests | **passed** | Emulated environment; the child-process crash helper is skipped by the same setting used in CI. |
+| Windows GNU workspace check and strict Clippy | **passed** | Cross-target compile/lint only; no Windows runtime tests and no MSVC qualification. |
+| Docker AMD64 + ARM64 image build | **passed** | Local buildx OCI export; nothing was pushed. |
+| Docker persistence test with Ruby query planning enabled | **passed** | Authenticated HTTP query used the image's `/usr/bin/ruby`, Rust plan validation and indexed execution; restart, recreation, verify and cleanup also passed. |
+| Ruby → Rust → Lua → Rust composition test | **passed** | Read-authorized indexed query supplies a versioned document to a separate admin-authorized Lua request; its CAS write is committed by the same Rust storage engine. These are separate requests, not one cross-runtime transaction. |
+| Real Luvit transport and HTTP client | **passed** | CI-pinned Luvi plus official Lit/Luvit Git commits built locally; normal and oversized response tests passed, followed by 40 real-server checks. |
+
+The runtime image now includes Debian's Ruby runtime because the experimental query
+endpoint accepts an administrator-configured Ruby executable. The feature remains off
+by default. Its container smoke test is part of `scripts/docker-persistence-test.sh`.
 
 The Lua live suite substitutes only the transport: request construction, JSON codec,
 response handling and error mapping are the real Lua code. This is called out in
@@ -170,9 +189,25 @@ IMAGE=preppydb:ci bash scripts/docker-persistence-test.sh
   the Rust client; the server is stopped via a shutdown flag in `Drop`.
 * **Pricing audit**: mutate an entry of the audit log on disk and assert `verify` fails.
 
+## Commit scaling smoke benchmark
+
+Run `cargo run --release -p preppydb-storage --example commit_scaling --locked` to
+compare repeated updates of one existing document in stores containing 1,000, 10,000,
+and 50,000 documents. The example reports median and p95 latency over 101 writes per
+store. It uses `sync_mode = never` to isolate in-process commit work from fsync latency;
+it is not a durability benchmark and its results are not cross-machine performance
+claims.
+
+Two local runs on Ubuntu under WSL2 (Linux 6.18.33.2, x86_64, 12th Gen Intel Core
+i5-12450H, rustc 1.99.1, release profile) reported median times of 2,146/2,522/2,579 ns
+and 2,141/2,566/2,615 ns respectively for the three store sizes. The corresponding p95
+times were 2,339/3,624/2,764 ns and 2,282/2,805/2,876 ns. This is a smoke check that
+ordinary single-document commit cost does not grow with a full-store copy; use repeated
+runs on the target host for any deployment-specific capacity decision.
+
 ## Gaps worth closing next
 
-1. Run the Docker and Windows jobs at least once (CI), and do a real Raspberry Pi run.
+1. Qualify the current local diff on GitHub Actions, obtain Windows MSVC/runtime evidence, and run on a real Raspberry Pi before declaring those platforms qualified.
 2. Add a `luvit` job with the real `http` transport (the CI job tries and tolerates its
    absence today).
 3. Property-based tests for the JSON parser and the schema validator (fuzzing a parser by

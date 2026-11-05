@@ -23,6 +23,9 @@ pub const WAL_MAGIC: &[u8; 8] = b"PPDBWAL1";
 pub const WAL_HEADER_LEN: u64 = 12;
 /// Hard upper bound for a single frame (protects the reader from bogus lengths).
 pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
+/// Maximum segment size accepted by the collecting compatibility API.
+/// Use `scan_segment_visit` or `summarize_segment` for larger segments.
+pub const MAX_COLLECTED_SEGMENT_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Durability policy for commits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +116,16 @@ pub struct WalWriter {
     sync_mode: SyncMode,
     /// Total frames appended since the last sync (diagnostics only).
     unsynced_frames: u64,
+    #[cfg(test)]
+    fail_next_append: Option<AppendFault>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum AppendFault {
+    BeforeWrite,
+    PartialWrite,
+    BeforeSync,
 }
 
 impl WalWriter {
@@ -170,6 +183,8 @@ impl WalWriter {
             max_segment_bytes,
             sync_mode,
             unsynced_frames: 0,
+            #[cfg(test)]
+            fail_next_append: None,
         })
     }
 
@@ -191,6 +206,15 @@ impl WalWriter {
 
     /// Append one record frame, rotating to a new segment when the cap is reached.
     pub fn append(&mut self, record: &Record) -> Result<()> {
+        #[cfg(test)]
+        let fault = self.fail_next_append.take();
+        #[cfg(test)]
+        if matches!(fault, Some(AppendFault::BeforeWrite)) {
+            return Err(DbError::io(
+                "injected WAL append failure",
+                std::io::Error::other("injected"),
+            ));
+        }
         let payload = record.encode_payload();
         if payload.len() as u64 > MAX_FRAME_LEN as u64 {
             return Err(DbError::LimitExceeded {
@@ -201,24 +225,73 @@ impl WalWriter {
         }
         // Rotate *before* writing so a single record is never split across segments.
         let frame_len = payload.len() as u64 + 8;
-        if self.current_len > WAL_HEADER_LEN
-            && self.current_len + frame_len > self.max_segment_bytes
-        {
+        let projected_len =
+            self.current_len
+                .checked_add(frame_len)
+                .ok_or(DbError::LimitExceeded {
+                    limit: "wal_segment_bytes",
+                    max: u64::MAX,
+                    actual: u64::MAX,
+                })?;
+        if self.current_len > WAL_HEADER_LEN && projected_len > self.max_segment_bytes {
             self.rotate()?;
         }
+        let write_len = self
+            .current_len
+            .checked_add(frame_len)
+            .ok_or(DbError::LimitExceeded {
+                limit: "wal_segment_bytes",
+                max: u64::MAX,
+                actual: u64::MAX,
+            })?;
+        let next_unsynced_frames =
+            self.unsynced_frames
+                .checked_add(1)
+                .ok_or(DbError::LimitExceeded {
+                    limit: "wal_unsynced_frames",
+                    max: u64::MAX,
+                    actual: u64::MAX,
+                })?;
         let mut frame = Vec::with_capacity(frame_len as usize);
         frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         frame.extend_from_slice(&crc32c(&payload, 0).to_le_bytes());
         frame.extend_from_slice(&payload);
+        #[cfg(test)]
+        if matches!(fault, Some(AppendFault::PartialWrite)) {
+            self.file
+                .write_all(&frame[..frame.len() / 2])
+                .map_err(|err| DbError::io("injected partial WAL write", err))?;
+            return Err(DbError::io(
+                "injected partial WAL write",
+                std::io::Error::other("injected"),
+            ));
+        }
         self.file
             .write_all(&frame)
             .map_err(|err| DbError::io(format!("appending to {}", self.current.display()), err))?;
-        self.current_len += frame_len;
-        self.unsynced_frames += 1;
+        self.current_len = write_len;
+        self.unsynced_frames = next_unsynced_frames;
+        #[cfg(test)]
+        if matches!(fault, Some(AppendFault::BeforeSync)) {
+            return Err(DbError::io(
+                "injected sync failure",
+                std::io::Error::other("injected"),
+            ));
+        }
         if self.sync_mode.is_always() {
             self.sync()?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_append_failure(&mut self) {
+        self.fail_next_append = Some(AppendFault::BeforeWrite);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_fault(&mut self, fault: AppendFault) {
+        self.fail_next_append = Some(fault);
     }
 
     /// `fsync` the current segment.
@@ -233,7 +306,14 @@ impl WalWriter {
     /// Start a new segment (used by rotation and by checkpoints).
     pub fn rotate(&mut self) -> Result<()> {
         self.sync()?;
-        let next = self.current_index + 1;
+        let next = self
+            .current_index
+            .checked_add(1)
+            .ok_or(DbError::LimitExceeded {
+                limit: "wal_segment_index",
+                max: u64::MAX,
+                actual: u64::MAX,
+            })?;
         *self = WalWriter::open(&self.dir, next, self.max_segment_bytes, self.sync_mode)?;
         Ok(())
     }
@@ -275,96 +355,154 @@ pub struct SegmentScan {
     pub corruption: Option<String>,
 }
 
-/// Scan one segment file, validating every frame checksum.
+/// Bounded-memory summary for inspection tools that do not need the records themselves.
+#[derive(Debug, Default)]
+pub struct SegmentSummary {
+    pub record_count: u64,
+    pub first_seq: Option<u64>,
+    pub last_seq: Option<u64>,
+    pub valid_len: u64,
+    pub torn_tail: Option<String>,
+    pub corruption: Option<String>,
+}
+
+/// Scan a segment without retaining its records, collecting only summary metadata.
+pub fn summarize_segment(path: &Path) -> Result<SegmentSummary> {
+    let mut summary = SegmentSummary::default();
+    let scan = scan_segment_visit(path, |record| {
+        summary.record_count = summary
+            .record_count
+            .checked_add(1)
+            .ok_or_else(|| DbError::corrupt(path.display().to_string(), "record count overflow"))?;
+        summary.first_seq.get_or_insert(record.seq);
+        summary.last_seq = Some(record.seq);
+        Ok(())
+    })?;
+    summary.valid_len = scan.valid_len;
+    summary.torn_tail = scan.torn_tail;
+    summary.corruption = scan.corruption;
+    Ok(summary)
+}
+
+/// Scan one reasonably sized segment file, validating every frame checksum and
+/// retaining the records. Large or untrusted segments should use
+/// `scan_segment_visit` to avoid collecting every record in memory.
 pub fn scan_segment(path: &Path) -> Result<SegmentScan> {
+    let len = std::fs::metadata(path)
+        .map_err(|err| DbError::io(format!("stat {}", path.display()), err))?
+        .len();
+    if len > MAX_COLLECTED_SEGMENT_BYTES {
+        return Err(DbError::LimitExceeded {
+            limit: "collected_wal_segment_bytes",
+            max: MAX_COLLECTED_SEGMENT_BYTES,
+            actual: len,
+        });
+    }
+    let mut records = Vec::new();
+    let mut scan = scan_segment_visit(path, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    scan.records = records;
+    Ok(scan)
+}
+
+/// Scan and consume records one at a time without retaining the whole segment.
+pub fn scan_segment_visit<F>(path: &Path, mut visit: F) -> Result<SegmentScan>
+where
+    F: FnMut(Record) -> Result<()>,
+{
+    scan_segment_visit_with_offset(path, |record, _frame_offset| visit(record))
+}
+
+/// Scan a segment and pass each record's starting byte offset to the visitor.
+///
+/// Recovery uses the offset to truncate a semantically invalid suffix at the first
+/// record that cannot be safely replayed, without retaining the segment in memory.
+pub fn scan_segment_visit_with_offset<F>(path: &Path, mut visit: F) -> Result<SegmentScan>
+where
+    F: FnMut(Record, u64) -> Result<()>,
+{
     let mut file =
         File::open(path).map_err(|err| DbError::io(format!("opening {}", path.display()), err))?;
     let len = file
         .metadata()
         .map_err(|err| DbError::io("stat WAL segment", err))?
         .len();
-    let mut data = Vec::with_capacity(len.min(128 * 1024 * 1024) as usize);
-    file.read_to_end(&mut data)
-        .map_err(|err| DbError::io(format!("reading {}", path.display()), err))?;
-
     let mut scan = SegmentScan {
         valid_len: WAL_HEADER_LEN,
         ..Default::default()
     };
-    if data.len() < WAL_HEADER_LEN as usize {
-        scan.corruption = Some(format!(
-            "segment is {} bytes, shorter than the {} byte header",
-            data.len(),
-            WAL_HEADER_LEN
-        ));
+    if len < WAL_HEADER_LEN {
         scan.valid_len = 0;
+        scan.torn_tail = Some(format!(
+            "segment header is incomplete: {len} of {WAL_HEADER_LEN} bytes"
+        ));
         return Ok(scan);
     }
-    if &data[..8] != WAL_MAGIC {
+    let mut header = [0u8; WAL_HEADER_LEN as usize];
+    file.read_exact(&mut header)
+        .map_err(|err| DbError::io("reading WAL header", err))?;
+    if &header[..8] != WAL_MAGIC {
         scan.corruption = Some("bad WAL magic".to_string());
         scan.valid_len = 0;
         return Ok(scan);
     }
-    let version = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
     if version != 1 {
         scan.corruption = Some(format!("unsupported WAL version {version}"));
         scan.valid_len = 0;
         return Ok(scan);
     }
 
-    let mut pos = WAL_HEADER_LEN as usize;
-    while pos < data.len() {
-        let remaining = data.len() - pos;
+    let mut pos = WAL_HEADER_LEN;
+    while pos < len {
+        let remaining = len - pos;
         if remaining < 8 {
             scan.torn_tail = Some(format!(
                 "incomplete frame header at offset {pos} ({remaining} bytes left)"
             ));
             break;
         }
-        let payload_len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-        let expected_crc =
-            u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
+        let mut frame = [0u8; 8];
+        file.read_exact(&mut frame)
+            .map_err(|err| DbError::io("reading WAL frame header", err))?;
+        let payload_len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]);
+        let expected_crc = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
         if payload_len > MAX_FRAME_LEN {
             scan.corruption = Some(format!(
                 "implausible frame length {payload_len} at offset {pos}"
             ));
             break;
         }
-        let frame_end = pos + 8 + payload_len as usize;
-        if frame_end > data.len() {
+        if u64::from(payload_len) > remaining - 8 {
             scan.torn_tail = Some(format!(
                 "frame at offset {pos} truncated ({} of {} payload bytes present)",
-                data.len() - pos - 8,
+                len - pos - 8,
                 payload_len
             ));
             break;
         }
-        let payload = &data[pos + 8..frame_end];
-        let actual_crc = crc32c(payload, 0);
+        let frame_end = pos + 8 + u64::from(payload_len);
+        let mut payload = vec![0u8; payload_len as usize];
+        file.read_exact(&mut payload)
+            .map_err(|err| DbError::io("reading WAL frame payload", err))?;
+        let actual_crc = crc32c(&payload, 0);
         if actual_crc != expected_crc {
-            if frame_end == data.len() {
-                // Last frame with a bad checksum: the write was interrupted, but the
-                // length field was already flushed. Treat as torn tail.
-                scan.torn_tail = Some(format!(
-                    "checksum mismatch in final frame at offset {pos} (expected {expected_crc:08x}, found {actual_crc:08x})"
-                ));
-            } else {
-                scan.corruption = Some(format!(
-                    "checksum mismatch at offset {pos} (expected {expected_crc:08x}, found {actual_crc:08x})"
-                ));
-            }
+            scan.corruption = Some(format!(
+                "checksum mismatch at offset {pos} (expected {expected_crc:08x}, found {actual_crc:08x})"
+            ));
             break;
         }
-        match Record::decode_payload(payload) {
-            Ok(record) => scan.records.push(record),
+        match Record::decode_payload(&payload) {
+            Ok(record) => visit(record, pos)?,
             Err(err) => {
                 scan.corruption = Some(format!("undecodable frame at offset {pos}: {err}"));
                 break;
             }
         }
         pos = frame_end;
-        scan.valid_len = frame_end as u64;
+        scan.valid_len = frame_end;
     }
     Ok(scan)
 }
@@ -420,6 +558,24 @@ mod tests {
     }
 
     #[test]
+    fn wal_length_and_segment_index_overflow_return_limits() {
+        let dir = tempdir("overflow");
+        let mut wal = WalWriter::open(&dir, 1, u64::MAX, SyncMode::Always).unwrap();
+        let file_len = wal.file.metadata().unwrap().len();
+        wal.current_len = u64::MAX;
+        let error = wal.append(&record(1)).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::LIMIT_EXCEEDED);
+        assert_eq!(wal.file.metadata().unwrap().len(), file_len);
+
+        wal.current_len = file_len;
+        wal.current_index = u64::MAX;
+        let error = wal.rotate().unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::LIMIT_EXCEEDED);
+        assert_eq!(wal.file.metadata().unwrap().len(), file_len);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn torn_tail_is_detected_and_truncatable() {
         let dir = tempdir("torn");
         let mut wal = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always).unwrap();
@@ -447,6 +603,34 @@ mod tests {
     }
 
     #[test]
+    fn invalid_length_and_partial_payload_are_distinguished() {
+        let dir = tempdir("frame-length");
+        let wal = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always).unwrap();
+        let path = wal.current_path().to_path_buf();
+        drop(wal);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        drop(file);
+        let scan = scan_segment(&path).unwrap();
+        assert!(scan.corruption.is_some());
+        assert!(scan.torn_tail.is_none());
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(WAL_HEADER_LEN).unwrap();
+        drop(file);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&10u32.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&[1, 2]).unwrap();
+        drop(file);
+        let scan = scan_segment(&path).unwrap();
+        assert!(scan.torn_tail.is_some());
+        assert!(scan.corruption.is_none());
+        assert_eq!(scan.valid_len, WAL_HEADER_LEN);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn checksum_corruption_in_middle_is_reported() {
         let dir = tempdir("corrupt");
         let mut wal = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always).unwrap();
@@ -462,6 +646,22 @@ mod tests {
         let scan = scan_segment(&path).unwrap();
         assert!(scan.corruption.is_some());
         assert!(scan.records.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checksum_corruption_in_complete_final_frame_is_not_a_torn_tail() {
+        let dir = tempdir("corrupt-final");
+        let mut wal = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always).unwrap();
+        wal.append(&record(1)).unwrap();
+        let path = wal.current_path().to_path_buf();
+        drop(wal);
+        let mut data = std::fs::read(&path).unwrap();
+        data[WAL_HEADER_LEN as usize + 8 + 3] ^= 0xff;
+        std::fs::write(&path, &data).unwrap();
+        let scan = scan_segment(&path).unwrap();
+        assert!(scan.corruption.is_some());
+        assert!(scan.torn_tail.is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -482,6 +682,64 @@ mod tests {
         }
         assert_eq!(total, 20);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn visitor_processes_records_without_retaining_them() {
+        let dir = tempdir("visitor");
+        let mut wal = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always).unwrap();
+        for seq in 1..=1000 {
+            wal.append(&record(seq)).unwrap();
+        }
+        let mut count = 0;
+        let scan = scan_segment_visit(wal.current_path(), |record| {
+            count += 1;
+            assert_eq!(record.seq, count);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 1000);
+        assert!(scan.records.is_empty());
+        assert!(scan.corruption.is_none());
+        drop(wal);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn summary_matches_scan_without_retaining_records() {
+        let dir = tempdir("summary");
+        let mut wal = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always).unwrap();
+        for seq in 10..=30 {
+            wal.append(&record(seq)).unwrap();
+        }
+        wal.sync().unwrap();
+        let expected = scan_segment(wal.current_path()).unwrap();
+        let summary = summarize_segment(wal.current_path()).unwrap();
+        assert_eq!(summary.record_count, expected.records.len() as u64);
+        assert_eq!(summary.first_seq, Some(10));
+        assert_eq!(summary.last_seq, Some(30));
+        assert_eq!(summary.valid_len, expected.valid_len);
+        assert_eq!(summary.torn_tail, None);
+        assert_eq!(summary.corruption, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn collecting_scan_rejects_oversized_segment_before_reading_records() {
+        let dir = tempdir("collect-limit");
+        let path = dir.join(segment_name(1));
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_COLLECTED_SEGMENT_BYTES + 1).unwrap();
+        drop(file);
+        assert!(matches!(
+            scan_segment(&path),
+            Err(DbError::LimitExceeded {
+                limit: "collected_wal_segment_bytes",
+                max: MAX_COLLECTED_SEGMENT_BYTES,
+                actual,
+            }) if actual == MAX_COLLECTED_SEGMENT_BYTES + 1
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -11,6 +11,27 @@ use crate::schema;
 use preppydb_json::Json;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Maximum serialized old-document data retained for rollback by one batch.
+pub(crate) const MAX_BATCH_UNDO_BYTES: usize = 32 * 1024 * 1024;
+
+pub(crate) fn reserve_undo_bytes(current: usize, additional: usize) -> Result<usize> {
+    let next = current
+        .checked_add(additional)
+        .ok_or(DbError::LimitExceeded {
+            limit: "batch_undo_bytes",
+            max: MAX_BATCH_UNDO_BYTES as u64,
+            actual: u64::MAX,
+        })?;
+    if next > MAX_BATCH_UNDO_BYTES {
+        return Err(DbError::LimitExceeded {
+            limit: "batch_undo_bytes",
+            max: MAX_BATCH_UNDO_BYTES as u64,
+            actual: u64::try_from(next).unwrap_or(u64::MAX),
+        });
+    }
+    Ok(next)
+}
+
 /// A stored document together with its version metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Doc {
@@ -74,7 +95,7 @@ impl IndexState {
         }
     }
 
-    fn insert(&mut self, doc_key: &str, doc: &Doc) -> Result<()> {
+    fn validate_insert(&self, doc_key: &str, doc: &Doc) -> Result<()> {
         let value = match doc.value.get_path(&self.meta.field) {
             Some(value) => value,
             None => {
@@ -85,8 +106,11 @@ impl IndexState {
             }
         };
         let encoded = value.canonical_bytes();
-        let bucket = self.entries.entry(encoded).or_default();
-        if self.meta.unique && !bucket.is_empty() && !bucket.contains(doc_key) {
+        if let Some(bucket) = self
+            .entries
+            .get(&encoded)
+            .filter(|bucket| self.meta.unique && !bucket.is_empty() && !bucket.contains(doc_key))
+        {
             return Err(DbError::validation(format!(
                 "unique index '{}' already contains value {} for key '{}'",
                 self.meta.name,
@@ -94,12 +118,28 @@ impl IndexState {
                 bucket.iter().next().unwrap_or(&String::new())
             )));
         }
+        Ok(())
+    }
+
+    fn insert(&mut self, doc_key: &str, doc: &Doc) -> Result<()> {
+        self.validate_insert(doc_key, doc)?;
+        let value = match doc.value.get_path(&self.meta.field) {
+            Some(value) => value,
+            None if self.meta.sparse => return Ok(()),
+            None => &Json::Null,
+        };
+        let bucket = self.entries.entry(value.canonical_bytes()).or_default();
         bucket.insert(doc_key.to_string());
         Ok(())
     }
 
     fn remove(&mut self, doc_key: &str, doc: &Doc) {
-        if let Some(value) = doc.value.get_path(&self.meta.field) {
+        let value = match doc.value.get_path(&self.meta.field) {
+            Some(value) => value,
+            None if self.meta.sparse => return,
+            None => &Json::Null,
+        };
+        {
             let encoded = value.canonical_bytes();
             if let Some(bucket) = self.entries.get_mut(&encoded) {
                 bucket.remove(doc_key);
@@ -152,6 +192,11 @@ impl Collection {
     }
 
     fn index_document(&mut self, key: &str, doc: &Doc) -> Result<()> {
+        // Validate every index before modifying any, so a later unique conflict
+        // cannot leave entries in earlier indexes.
+        for index in self.indexes.values() {
+            index.validate_insert(key, doc)?;
+        }
         for index in self.indexes.values_mut() {
             index.insert(key, doc)?;
         }
@@ -212,6 +257,30 @@ pub struct ApplyStats {
     pub collections_dropped: usize,
 }
 
+/// Reversible state captured for one applied operation. Collections and indexes are
+/// moved into this journal when removed, so rollback does not duplicate their contents.
+pub(crate) enum StoreUndo {
+    None,
+    Document {
+        collection: String,
+        key: String,
+        previous: Option<Doc>,
+    },
+    RemoveCollection(String),
+    RestoreCollection(Box<Collection>),
+    RemoveIndex {
+        collection: String,
+        name: String,
+    },
+    RestoreIndex {
+        collection: String,
+        name: String,
+        meta: Option<IndexMeta>,
+        state: Option<IndexState>,
+    },
+    Sequence(Vec<StoreUndo>),
+}
+
 /// The complete in-memory database state.
 #[derive(Clone, Debug, Default)]
 pub struct Store {
@@ -237,6 +306,25 @@ impl Store {
         self.collections
             .get_mut(name)
             .ok_or_else(|| DbError::CollectionNotFound(name.to_string()))
+    }
+
+    /// Restore one document and its indexes after an unsuccessful WAL append.
+    /// The caller must hold the engine write lock throughout mutation and undo.
+    pub(crate) fn restore_document(
+        &mut self,
+        collection: &str,
+        key: &str,
+        previous: Option<Doc>,
+    ) -> Result<()> {
+        let coll = self.collection_mut(collection)?;
+        if let Some(current) = coll.docs.remove(key) {
+            coll.unindex_document(key, &current);
+        }
+        if let Some(doc) = previous {
+            coll.index_document(key, &doc)?;
+            coll.docs.insert(key.to_string(), doc);
+        }
+        Ok(())
     }
 
     pub fn has_collection(&self, name: &str) -> bool {
@@ -526,20 +614,231 @@ impl Store {
                         actual: ops.len() as u64,
                     });
                 }
-                // Batches are atomic: apply to a clone and swap on success so a failure
-                // half-way cannot leave partial state behind.
-                let mut staged = self.clone();
+                // Apply atomically using a reversible operation journal. In particular,
+                // schema changes must not clone entire collections just to support rollback.
+                let mut undo = Vec::with_capacity(ops.len());
+                let mut undo_bytes = 0;
+                let mut staged_stats = ApplyStats::default();
                 for op in ops {
-                    let sub = staged.apply(op, now_ms, revision, mode)?;
-                    stats.puts += sub.puts;
-                    stats.deletes += sub.deletes;
-                    stats.collections_created += sub.collections_created;
-                    stats.collections_dropped += sub.collections_dropped;
+                    match self.apply_with_undo(op, now_ms, revision, mode, &mut undo_bytes) {
+                        Ok((sub, inverse)) => {
+                            staged_stats.puts += sub.puts;
+                            staged_stats.deletes += sub.deletes;
+                            staged_stats.collections_created += sub.collections_created;
+                            staged_stats.collections_dropped += sub.collections_dropped;
+                            undo.push(inverse);
+                        }
+                        Err(err) => {
+                            Self::rollback(self, StoreUndo::Sequence(undo))?;
+                            return Err(err);
+                        }
+                    }
                 }
-                *self = staged;
+                stats = staged_stats;
             }
         }
         Ok(stats)
+    }
+
+    pub(crate) fn apply_with_undo(
+        &mut self,
+        op: &Op,
+        now_ms: i64,
+        revision: u64,
+        mode: ApplyMode,
+        undo_bytes: &mut usize,
+    ) -> Result<(ApplyStats, StoreUndo)> {
+        match op {
+            Op::Put {
+                collection, key, ..
+            }
+            | Op::Delete { collection, key } => {
+                let collection_exists = self.collections.contains_key(collection);
+                let previous_ref = self
+                    .collections
+                    .get(collection)
+                    .and_then(|coll| coll.docs.get(key));
+                if let Some(previous) = previous_ref {
+                    let additional = previous.to_json().to_string().len();
+                    *undo_bytes = if mode == ApplyMode::Live {
+                        reserve_undo_bytes(*undo_bytes, additional)?
+                    } else {
+                        undo_bytes
+                            .checked_add(additional)
+                            .ok_or(DbError::LimitExceeded {
+                                limit: "recovery_undo_bytes",
+                                max: u64::MAX,
+                                actual: u64::MAX,
+                            })?
+                    };
+                }
+                let previous = previous_ref.cloned();
+                let stats = self.apply(op, now_ms, revision, mode)?;
+                if mode == ApplyMode::Replay && !collection_exists {
+                    return Ok((stats, StoreUndo::None));
+                }
+                Ok((
+                    stats,
+                    StoreUndo::Document {
+                        collection: collection.clone(),
+                        key: key.clone(),
+                        previous,
+                    },
+                ))
+            }
+            Op::CreateCollection { meta } => {
+                let existed = self.collections.contains_key(&meta.name);
+                let stats = self.apply(op, now_ms, revision, mode)?;
+                Ok((
+                    stats,
+                    if existed {
+                        StoreUndo::None
+                    } else {
+                        StoreUndo::RemoveCollection(meta.name.clone())
+                    },
+                ))
+            }
+            Op::DropCollection { collection } => {
+                let removed = self.collections.remove(collection);
+                if removed.is_none() && mode == ApplyMode::Live {
+                    return Err(DbError::CollectionNotFound(collection.clone()));
+                }
+                let mut stats = ApplyStats::default();
+                if removed.is_some() {
+                    stats.collections_dropped += 1;
+                }
+                Ok((
+                    stats,
+                    removed
+                        .map(|coll| StoreUndo::RestoreCollection(Box::new(coll)))
+                        .unwrap_or(StoreUndo::None),
+                ))
+            }
+            Op::CreateIndex { collection, index } => {
+                let existed = self
+                    .collections
+                    .get(collection)
+                    .is_some_and(|coll| coll.meta.indexes.contains_key(&index.name));
+                let stats = self.apply(op, now_ms, revision, mode)?;
+                Ok((
+                    stats,
+                    if existed {
+                        StoreUndo::None
+                    } else {
+                        StoreUndo::RemoveIndex {
+                            collection: collection.clone(),
+                            name: index.name.clone(),
+                        }
+                    },
+                ))
+            }
+            Op::DropIndex { collection, name } => {
+                let coll = match self.collections.get_mut(collection) {
+                    Some(coll) => coll,
+                    None if mode == ApplyMode::Replay => {
+                        return Ok((ApplyStats::default(), StoreUndo::None));
+                    }
+                    None => {
+                        return Err(DbError::CollectionNotFound(collection.clone()));
+                    }
+                };
+                let had_meta = coll.meta.indexes.contains_key(name);
+                if !had_meta && mode == ApplyMode::Live {
+                    return Err(DbError::IndexNotFound {
+                        collection: collection.clone(),
+                        index: name.clone(),
+                    });
+                }
+                let meta = coll.meta.indexes.remove(name);
+                let state = coll.indexes.remove(name);
+                Ok((
+                    ApplyStats::default(),
+                    if meta.is_none() && state.is_none() {
+                        StoreUndo::None
+                    } else {
+                        StoreUndo::RestoreIndex {
+                            collection: collection.clone(),
+                            name: name.clone(),
+                            meta,
+                            state,
+                        }
+                    },
+                ))
+            }
+            Op::Batch { ops, .. } => {
+                let mut inverses = Vec::with_capacity(ops.len());
+                let mut stats = ApplyStats::default();
+                for item in ops {
+                    match self.apply_with_undo(item, now_ms, revision, mode, undo_bytes) {
+                        Ok((sub, inverse)) => {
+                            stats.puts += sub.puts;
+                            stats.deletes += sub.deletes;
+                            stats.collections_created += sub.collections_created;
+                            stats.collections_dropped += sub.collections_dropped;
+                            inverses.push(inverse);
+                        }
+                        Err(err) => {
+                            Self::rollback(self, StoreUndo::Sequence(inverses))?;
+                            return Err(err);
+                        }
+                    }
+                }
+                Ok((stats, StoreUndo::Sequence(inverses)))
+            }
+        }
+    }
+
+    pub(crate) fn rollback(&mut self, undo: StoreUndo) -> Result<()> {
+        match undo {
+            StoreUndo::None => Ok(()),
+            StoreUndo::Document {
+                collection,
+                key,
+                previous,
+            } => self.restore_document(&collection, &key, previous),
+            StoreUndo::RemoveCollection(name) => {
+                self.collections.remove(&name);
+                Ok(())
+            }
+            StoreUndo::RestoreCollection(collection) => {
+                let name = collection.meta.name.clone();
+                if self.collections.contains_key(&name) {
+                    return Err(DbError::Internal(format!(
+                        "cannot restore collection '{name}': name is already present"
+                    )));
+                }
+                self.collections.insert(name, *collection);
+                Ok(())
+            }
+            StoreUndo::RemoveIndex { collection, name } => {
+                self.drop_index(&collection, &name, ApplyMode::Replay)
+            }
+            StoreUndo::RestoreIndex {
+                collection,
+                name,
+                meta,
+                state,
+            } => {
+                let coll = self.collections.get_mut(&collection).ok_or_else(|| {
+                    DbError::Internal(format!(
+                        "cannot restore index '{name}': collection '{collection}' is missing"
+                    ))
+                })?;
+                if let Some(meta) = meta {
+                    coll.meta.indexes.insert(name.clone(), meta);
+                }
+                if let Some(state) = state {
+                    coll.indexes.insert(name, state);
+                }
+                Ok(())
+            }
+            StoreUndo::Sequence(inverses) => {
+                for inverse in inverses.into_iter().rev() {
+                    self.rollback(inverse)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Read a document, ignoring expired entries.
@@ -614,6 +913,25 @@ mod tests {
 
     fn put(store: &mut Store, key: &str, value: Json) -> Result<u64> {
         store.put("people", key, value, None, None, 1000, 1, ApplyMode::Live)
+    }
+
+    #[test]
+    fn batch_undo_budget_is_checked_without_overflow() {
+        assert_eq!(reserve_undo_bytes(10, 20).unwrap(), 30);
+        assert!(matches!(
+            reserve_undo_bytes(MAX_BATCH_UNDO_BYTES, 1),
+            Err(DbError::LimitExceeded {
+                limit: "batch_undo_bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            reserve_undo_bytes(usize::MAX, 1),
+            Err(DbError::LimitExceeded {
+                limit: "batch_undo_bytes",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -795,6 +1113,65 @@ mod tests {
     }
 
     #[test]
+    fn non_sparse_missing_value_is_removed_from_null_index() {
+        let mut s = store();
+        s.create_index(
+            "people",
+            IndexMeta {
+                name: "by_name".into(),
+                field: "name".into(),
+                unique: true,
+                sparse: false,
+                created_at: 0,
+            },
+            ApplyMode::Live,
+        )
+        .unwrap();
+        put(&mut s, "a", Json::obj()).unwrap();
+        s.delete("people", "a", None, ApplyMode::Live).unwrap();
+        put(&mut s, "b", Json::obj()).unwrap();
+        let index = &s.collection("people").unwrap().indexes["by_name"];
+        let bucket = &index.entries[&Json::Null.canonical_bytes()];
+        assert_eq!(
+            bucket.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["b"]
+        );
+    }
+
+    #[test]
+    fn unique_conflict_does_not_leave_earlier_index_entries() {
+        let mut s = store();
+        for (name, field, unique) in [("a_color", "color", false), ("z_name", "name", true)] {
+            s.create_index(
+                "people",
+                IndexMeta {
+                    name: name.into(),
+                    field: field.into(),
+                    unique,
+                    sparse: true,
+                    created_at: 0,
+                },
+                ApplyMode::Live,
+            )
+            .unwrap();
+        }
+        put(&mut s, "a", Json::obj().with("name", Json::str("same"))).unwrap();
+        assert!(put(
+            &mut s,
+            "b",
+            Json::obj()
+                .with("name", Json::str("same"))
+                .with("color", Json::str("pink"))
+        )
+        .is_err());
+        let index = &s.collection("people").unwrap().indexes["a_color"];
+        assert!(!index
+            .entries
+            .contains_key(&Json::str("pink").canonical_bytes()));
+        assert!(s.get("people", "b", 1000).unwrap().is_none());
+    }
+
+    #[test]
     fn schema_enforced_on_live_writes_only() {
         let mut s = Store::new(Limits::default());
         let mut meta = CollectionMeta::new("strict", 0);
@@ -848,6 +1225,60 @@ mod tests {
         let err = s.apply(&batch, 0, 1, ApplyMode::Live).unwrap_err();
         assert!(matches!(err, DbError::NotFound { .. }));
         assert_eq!(s.total_docs(), 0, "partial batch must not be visible");
+    }
+
+    #[test]
+    fn replay_batch_rollback_ignores_missing_collection_document_operations() {
+        let mut s = store();
+        put(
+            &mut s,
+            "a",
+            Json::obj().with("name", Json::str("duplicate")),
+        )
+        .unwrap();
+        put(
+            &mut s,
+            "b",
+            Json::obj().with("name", Json::str("duplicate")),
+        )
+        .unwrap();
+
+        let err = s
+            .apply(
+                &Op::Batch {
+                    ops: vec![
+                        Op::Put {
+                            collection: "missing".into(),
+                            key: "key".into(),
+                            value: Json::int(1),
+                            expires_at: None,
+                        },
+                        Op::CreateIndex {
+                            collection: "people".into(),
+                            index: IndexMeta {
+                                name: "unique_name".into(),
+                                field: "name".into(),
+                                unique: true,
+                                sparse: false,
+                                created_at: 0,
+                            },
+                        },
+                    ],
+                    label: "recovery".into(),
+                },
+                1000,
+                2,
+                ApplyMode::Replay,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unique index"), "{err}");
+        assert!(s.collection("missing").is_err());
+        assert!(!s
+            .collection("people")
+            .unwrap()
+            .meta
+            .indexes
+            .contains_key("unique_name"));
     }
 
     #[test]

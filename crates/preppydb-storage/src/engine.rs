@@ -21,7 +21,7 @@ use crate::lock::{create_private_dir, FileLock};
 use crate::manifest::{Manifest, SnapshotRef};
 use crate::record::{Op, Record};
 use crate::snapshot::{self, WrittenSnapshot};
-use crate::store::{ApplyMode, Collection, Doc, Limits, Store};
+use crate::store::{reserve_undo_bytes, ApplyMode, Collection, Doc, Limits, Store, StoreUndo};
 use crate::wal::{self, SyncMode, WalWriter};
 use preppydb_json::Json;
 use std::path::{Path, PathBuf};
@@ -119,6 +119,35 @@ impl Default for ScanOptions {
             reverse: false,
             include_expired: false,
         }
+    }
+}
+
+/// Document-native filter semantics for the experimental query boundary.
+#[derive(Clone, Debug)]
+pub struct DocumentFilter {
+    pub field: String,
+    pub operator: String,
+    pub value: Json,
+}
+
+#[derive(Clone, Debug)]
+pub enum DocumentAccess {
+    FullScan,
+    IndexEquality(String),
+}
+
+fn matches_document_filter(doc: &Doc, filter: Option<&DocumentFilter>) -> bool {
+    let Some(filter) = filter else { return true };
+    let Some(value) = doc.value.get_path(&filter.field) else {
+        return false;
+    };
+    match (&filter.operator[..], value, &filter.value) {
+        ("eq", left, right) if left.kind() == right.kind() => left == right,
+        ("gte", Json::Number(left), Json::Number(right)) => left >= right,
+        ("lte", Json::Number(left), Json::Number(right)) => left <= right,
+        ("gte", Json::String(left), Json::String(right)) => left >= right,
+        ("lte", Json::String(left), Json::String(right)) => left <= right,
+        _ => false,
     }
 }
 
@@ -329,9 +358,73 @@ pub struct Engine {
     started_at_ms: i64,
 }
 
+fn next_sequence(current: u64) -> Result<u64> {
+    current.checked_add(1).ok_or(DbError::LimitExceeded {
+        limit: "wal_sequence",
+        max: u64::MAX,
+        actual: u64::MAX,
+    })
+}
+
+fn validate_snapshot_reference(manifest: &Manifest, reference: &SnapshotRef) -> Result<()> {
+    let expected_file = format!("snap-{:012}.pdb", reference.generation);
+    if reference.generation == 0
+        || reference.file != expected_file
+        || manifest.generation != reference.generation
+        || manifest.last_seq < reference.seq
+    {
+        return Err(DbError::corrupt(
+            "manifest",
+            "snapshot filename, generation, or sequence metadata is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_contents(
+    reference: &SnapshotRef,
+    data: &snapshot::SnapshotData,
+    path: &Path,
+) -> Result<()> {
+    if data.header.generation != reference.generation
+        || data.header.seq != reference.seq
+        || data.header.doc_count != reference.doc_count
+    {
+        return Err(DbError::corrupt(
+            path.display().to_string(),
+            "snapshot header does not match the manifest reference",
+        ));
+    }
+    if reference.bytes != 0
+        && std::fs::metadata(path)
+            .map_err(|err| DbError::io("reading snapshot metadata", err))?
+            .len()
+            != reference.bytes
+    {
+        return Err(DbError::corrupt(
+            path.display().to_string(),
+            "snapshot length does not match the manifest reference",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_regular_snapshot_file(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| DbError::io(format!("reading snapshot metadata {}", path.display()), err))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(DbError::corrupt(
+            path.display().to_string(),
+            "snapshot reference is not a regular file",
+        ));
+    }
+    Ok(())
+}
+
 impl Engine {
     /// Open (or create) a database directory, replaying the log as needed.
     pub fn open(cfg: EngineConfig) -> Result<Engine> {
+        crate::backup::ensure_no_restore_intent(&cfg.path)?;
         let paths = DataPaths::new(cfg.path.clone());
         create_private_dir(&paths.root)?;
         create_private_dir(&paths.wal_dir)?;
@@ -342,43 +435,89 @@ impl Engine {
         } else {
             None
         };
+        // Restore may publish its durable intent after the first check while this open
+        // creates the directory. Recheck after taking the directory lock so a writer
+        // cannot race publication or initialize an empty replacement path.
+        crate::backup::ensure_no_restore_intent(&cfg.path)?;
 
-        let mut manifest = Manifest::load(&paths.root)?.unwrap_or_default();
+        let mut manifest = match Manifest::load(&paths.root)? {
+            Some(manifest) => manifest,
+            None => {
+                // A missing manifest is normal for a new database, but never evidence
+                // that previously retired snapshot/WAL history can be discarded.
+                let has_snapshots = std::fs::read_dir(&paths.snap_dir)
+                    .map_err(|err| DbError::io("listing snapshots", err))?
+                    .next()
+                    .transpose()
+                    .map_err(|err| DbError::io("reading snapshot entry", err))?
+                    .is_some();
+                if has_snapshots {
+                    return Err(DbError::corrupt(
+                        "manifest",
+                        "manifest missing while snapshot files exist; refusing to initialize an empty database",
+                    ));
+                }
+                let segments = wal::list_segments(&paths.wal_dir)?;
+                let first_segment = segments
+                    .first()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| wal::parse_segment_name(&name.to_string_lossy()));
+                if first_segment.is_some_and(|index| index > 1) {
+                    return Err(DbError::corrupt(
+                        "manifest",
+                        "manifest missing after WAL history was retired; refusing incomplete recovery",
+                    ));
+                }
+                Manifest::default()
+            }
+        };
         let mut notes: Vec<RecoveryNote> = Vec::new();
         let mut store = Store::new(cfg.limits.clone());
         let mut seq: u64 = 0;
 
         // ---- 1. load the newest snapshot referenced by the manifest --------------
         if let Some(snap_ref) = manifest.snapshot.clone() {
+            // Snapshot paths are untrusted manifest data. Check the complete
+            // generation-derived name before joining it to the snapshot directory.
+            // This also prevents an otherwise valid snapshot outside `snap/` from
+            // being substituted during recovery.
+            validate_snapshot_reference(&manifest, &snap_ref)?;
             let path = paths.snap_dir.join(&snap_ref.file);
-            if path.exists() {
-                let data = snapshot::read_snapshot(&path)?;
-                if !snap_ref.sha256.is_empty() && data.body_sha256 != snap_ref.sha256 {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    ensure_regular_snapshot_file(&path)?;
+                    let data = snapshot::read_snapshot(&path)?;
+                    validate_snapshot_contents(&snap_ref, &data, &path)?;
+                    if !snap_ref.sha256.is_empty() && data.body_sha256 != snap_ref.sha256 {
+                        return Err(DbError::corrupt(
+                            path.display().to_string(),
+                            "snapshot SHA-256 does not match the manifest",
+                        ));
+                    }
+                    for (meta, docs) in data.collections {
+                        let name = meta.name.clone();
+                        store.create_collection(meta, ApplyMode::Replay)?;
+                        if let Some(coll) = store.collections.get_mut(&name) {
+                            for (key, doc) in docs {
+                                coll.docs.insert(key, doc);
+                            }
+                            coll.rebuild_indexes()?;
+                        }
+                    }
+                    seq = data.header.seq;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     return Err(DbError::corrupt(
-                        path.display().to_string(),
-                        "snapshot SHA-256 does not match the manifest",
+                        "manifest",
+                        format!(
+                            "referenced snapshot '{}' is missing; WAL may not contain its history",
+                            snap_ref.file
+                        ),
                     ));
                 }
-                for (meta, docs) in data.collections {
-                    let name = meta.name.clone();
-                    store.create_collection(meta, ApplyMode::Replay)?;
-                    if let Some(coll) = store.collections.get_mut(&name) {
-                        for (key, doc) in docs {
-                            coll.docs.insert(key, doc);
-                        }
-                        coll.rebuild_indexes()?;
-                    }
+                Err(err) => {
+                    return Err(DbError::io("reading snapshot metadata", err));
                 }
-                seq = data.header.seq;
-            } else {
-                notes.push(RecoveryNote {
-                    at: now_ms(),
-                    kind: "snapshot_missing".into(),
-                    detail: format!(
-                        "manifest references '{}' which no longer exists; replaying the full log",
-                        snap_ref.file
-                    ),
-                });
             }
         }
 
@@ -386,13 +525,101 @@ impl Engine {
         let segments = wal::list_segments(&paths.wal_dir)?;
         let mut last_segment_index = 0u64;
         let mut replayed_records: u64 = 0;
-        'segments: for segment in &segments {
+        let snapshot_seq = seq;
+        let mut replay_started = false;
+        'segments: for (segment_position, segment) in segments.iter().enumerate() {
             let index = segment
                 .file_name()
                 .and_then(|name| wal::parse_segment_name(&name.to_string_lossy()))
                 .unwrap_or(0);
-            last_segment_index = last_segment_index.max(index);
-            let scan = wal::scan_segment(segment)?;
+            let mut sequence_corruption = None;
+            let mut scan = wal::scan_segment_visit_with_offset(segment, |record, frame_offset| {
+                if sequence_corruption.is_some() {
+                    return Ok(());
+                }
+                if record.seq <= snapshot_seq {
+                    if replay_started {
+                        sequence_corruption = Some((
+                            frame_offset,
+                            format!(
+                                "record sequence {} regresses after replay reached {}",
+                                record.seq, seq
+                            ),
+                        ));
+                    }
+                    return Ok(());
+                }
+                let expected_seq = seq.checked_add(1).ok_or_else(|| {
+                    DbError::corrupt("write-ahead log", "record sequence overflow")
+                })?;
+                if record.seq != expected_seq {
+                    sequence_corruption = Some((
+                        frame_offset,
+                        format!(
+                            "record sequence {} does not continue from {}; refusing incomplete recovery",
+                            record.seq, seq
+                        ),
+                    ));
+                    return Ok(());
+                }
+                store.apply(&record.op, record.ts, record.seq, ApplyMode::Replay)?;
+                seq = record.seq;
+                replay_started = true;
+                replayed_records += 1;
+                Ok(())
+            })?;
+            if let Some((offset, detail)) = sequence_corruption {
+                scan.valid_len = offset;
+                scan.corruption = Some(detail);
+                scan.torn_tail = None;
+            }
+            if scan.torn_tail.is_some() && segment_position + 1 < segments.len() {
+                scan.corruption = Some(
+                    "torn WAL tail is followed by another segment; refusing ambiguous recovery"
+                        .into(),
+                );
+                scan.torn_tail = None;
+            }
+            if scan.torn_tail.is_some() && scan.valid_len == 0 && scan.corruption.is_none() {
+                // A segment shorter than its header cannot contain a frame. If it is
+                // the final contiguous segment, it represents an interrupted segment
+                // creation, not a committed record. Do not try to append to that file.
+                let expected_index = if last_segment_index > 0 {
+                    last_segment_index.checked_add(1)
+                } else if manifest.snapshot.is_some() {
+                    Some(index)
+                } else {
+                    Some(1)
+                };
+                if expected_index != Some(index) {
+                    scan.corruption = Some(format!(
+                        "incomplete final segment index {index} does not continue the persisted WAL history"
+                    ));
+                    scan.torn_tail = None;
+                } else if cfg.read_only {
+                    return Err(DbError::corrupt(
+                        "write-ahead log",
+                        format!(
+                            "{} has an incomplete final segment header; read-only open will not remove it",
+                            segment.display()
+                        ),
+                    ));
+                } else {
+                    std::fs::remove_file(segment).map_err(|err| {
+                        DbError::io("removing incomplete WAL segment header", err)
+                    })?;
+                    crate::snapshot::fsync_dir(&paths.wal_dir)?;
+                    notes.push(RecoveryNote {
+                        at: now_ms(),
+                        kind: "torn_segment_header".into(),
+                        detail: format!(
+                            "{}: removed incomplete final segment header; it contained no record frames",
+                            segment.display()
+                        ),
+                    });
+                    break 'segments;
+                }
+            }
             if let Some(torn) = &scan.torn_tail {
                 notes.push(RecoveryNote {
                     at: now_ms(),
@@ -413,10 +640,12 @@ impl Engine {
                     file.sync_all()
                         .map_err(|err| DbError::io("syncing truncated WAL", err))?;
                 }
+                last_segment_index = index;
+                break 'segments;
             }
             if let Some(corruption) = &scan.corruption {
                 let detail = format!("{}: {corruption}", segment.display());
-                if cfg.repair == RepairPolicy::Strict {
+                if cfg.repair == RepairPolicy::Strict || cfg.read_only {
                     return Err(DbError::corrupt(
                         "write-ahead log",
                         format!(
@@ -429,24 +658,34 @@ impl Engine {
                     kind: "corruption_truncated".into(),
                     detail: detail.clone(),
                 });
-                // Records before the damage are still usable.
-                for record in &scan.records {
-                    if record.seq > seq {
-                        store.apply(&record.op, record.ts, record.seq, ApplyMode::Replay)?;
-                        seq = record.seq;
-                        replayed_records += 1;
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(segment)
+                    .map_err(|err| DbError::io("opening corrupt WAL segment for repair", err))?;
+                file.set_len(scan.valid_len)
+                    .map_err(|err| DbError::io("truncating corrupt WAL suffix", err))?;
+                file.sync_all()
+                    .map_err(|err| DbError::io("syncing repaired WAL segment", err))?;
+                for later_segment in segments.iter().skip(segment_position + 1) {
+                    match std::fs::remove_file(later_segment) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(DbError::io(
+                                format!(
+                                    "removing WAL segment {} after corruption",
+                                    later_segment.display()
+                                ),
+                                err,
+                            ));
+                        }
                     }
                 }
+                crate::snapshot::fsync_dir(&paths.wal_dir)?;
+                last_segment_index = index;
                 break 'segments;
             }
-            for record in &scan.records {
-                if record.seq <= seq {
-                    continue; // already contained in the snapshot
-                }
-                store.apply(&record.op, record.ts, record.seq, ApplyMode::Replay)?;
-                seq = record.seq;
-                replayed_records += 1;
-            }
+            last_segment_index = index;
         }
 
         if manifest.last_seq > seq {
@@ -551,9 +790,14 @@ impl Engine {
         if self.cfg.read_only {
             return Err(DbError::ReadOnly(context.to_string()));
         }
+        self.check_healthy()
+    }
+
+    fn check_healthy(&self) -> Result<()> {
         if self.poisoned.load(Ordering::SeqCst) {
-            return Err(DbError::Internal(
-                "engine is in a failed state after a WAL write error; restart required".to_string(),
+            return Err(DbError::CommitOutcomeUnknown(
+                "engine requires reopen after a WAL write error; the last commit outcome may be unknown"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -561,27 +805,58 @@ impl Engine {
 
     // ------------------------------------------------------------- write path
 
-    /// Serialise, log and apply one operation.
+    /// Atomically apply a batch that contains schema operations.
     ///
-    /// `mutate` must either apply its change to the store and return the equivalent log
-    /// operation, or return an error *without* leaving partial state behind.
-    fn commit<F>(&self, mutate: F) -> Result<u64>
-    where
-        F: FnOnce(&mut Store, u64, i64) -> Result<Op>,
-    {
-        self.check_writable("write")?;
+    /// Document-only batches use `commit_document_batch`. Schema batches retain only
+    /// per-document undo values; collections and indexes that are removed are moved
+    /// into the journal. Creating an index still costs O(collection size) by design.
+    fn commit_schema_batch(&self, ops: Vec<Op>, label: &str) -> Result<u64> {
+        self.check_writable("batch write")?;
         let mut state = self.write();
-        let seq = state.seq + 1;
+        self.check_writable("batch write")?;
+        let seq = next_sequence(state.seq)?;
         let now = now_ms();
-        let op = mutate(&mut state.store, seq, now)?;
+
+        let mut undo = Vec::with_capacity(ops.len());
+        let mut undo_bytes = 0;
+
+        let mut pending = ops.iter().rev().collect::<Vec<_>>();
+        while let Some(op) = pending.pop() {
+            if let Op::Batch { ops, .. } = op {
+                pending.extend(ops.iter().rev());
+                continue;
+            }
+            match state
+                .store
+                .apply_with_undo(op, now, seq, ApplyMode::Live, &mut undo_bytes)
+            {
+                Ok((_, inverse)) => undo.push(inverse),
+                Err(err) => {
+                    if let Err(rollback) = state.store.rollback(StoreUndo::Sequence(undo)) {
+                        self.poisoned.store(true, Ordering::SeqCst);
+                        return Err(DbError::Internal(format!(
+                            "schema batch rollback failed after apply error: {rollback}"
+                        )));
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        let op = Op::Batch {
+            ops,
+            label: label.to_string(),
+        };
         let record = Record::new(seq, now, op);
         let mut writer = self.lock_mutex(&self.writer);
         if let Err(err) = writer.append(&record) {
-            // The in-memory state is ahead of the log now; continuing could silently
-            // diverge. Poison the engine and let the operator restart (recovery will
-            // rebuild a consistent state from the log).
             self.poisoned.store(true, Ordering::SeqCst);
-            return Err(err);
+            if let Err(rollback) = state.store.rollback(StoreUndo::Sequence(undo)) {
+                return Err(DbError::Internal(format!(
+                    "schema batch rollback failed after WAL error: {rollback}"
+                )));
+            }
+            return Err(DbError::CommitOutcomeUnknown(err.to_string()));
         }
         self.metrics
             .wal_bytes
@@ -606,6 +881,72 @@ impl Engine {
         }
     }
 
+    /// Mutate one document under the write lock and restore it if WAL append fails.
+    fn commit_document<F>(&self, collection: &str, key: &str, mutate: F) -> Result<u64>
+    where
+        F: FnOnce(&mut Store, u64, i64) -> Result<Op>,
+    {
+        self.check_writable("write")?;
+        let mut state = self.write();
+        self.check_writable("write")?;
+        let seq = next_sequence(state.seq)?;
+        let now = now_ms();
+        let previous = state.store.collection(collection)?.docs.get(key).cloned();
+        let op = mutate(&mut state.store, seq, now)?;
+        let record = Record::new(seq, now, op);
+        let mut writer = self.lock_mutex(&self.writer);
+        if let Err(err) = writer.append(&record) {
+            self.poisoned.store(true, Ordering::SeqCst);
+            state.store.restore_document(collection, key, previous)?;
+            return Err(DbError::CommitOutcomeUnknown(err.to_string()));
+        }
+        self.metrics
+            .wal_bytes
+            .fetch_add(record.encode_payload().len() as u64, Ordering::Relaxed);
+        state.seq = seq;
+        drop(writer);
+        drop(state);
+        self.mutations_since_checkpoint
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_auto_checkpoint();
+        Ok(seq)
+    }
+
+    fn commit_schema<P, F, S, U>(&self, prepare_undo: P, mutate: F, undo: U) -> Result<u64>
+    where
+        P: FnOnce(&Store) -> Result<S>,
+        F: FnOnce(&mut Store, u64, i64) -> Result<Op>,
+        U: FnOnce(&mut Store, S) -> Result<()>,
+    {
+        self.check_writable("schema write")?;
+        let mut state = self.write();
+        self.check_writable("schema write")?;
+        let undo_state = prepare_undo(&state.store)?;
+        let seq = next_sequence(state.seq)?;
+        let now = now_ms();
+        let record = Record::new(seq, now, mutate(&mut state.store, seq, now)?);
+        let mut writer = self.lock_mutex(&self.writer);
+        if let Err(err) = writer.append(&record) {
+            self.poisoned.store(true, Ordering::SeqCst);
+            if let Err(rollback) = undo(&mut state.store, undo_state) {
+                return Err(DbError::Internal(format!(
+                    "schema rollback failed after WAL error: {rollback}"
+                )));
+            }
+            return Err(DbError::CommitOutcomeUnknown(err.to_string()));
+        }
+        self.metrics
+            .wal_bytes
+            .fetch_add(record.encode_payload().len() as u64, Ordering::Relaxed);
+        state.seq = seq;
+        drop(writer);
+        drop(state);
+        self.mutations_since_checkpoint
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_auto_checkpoint();
+        Ok(seq)
+    }
+
     /// Insert or replace a document.
     pub fn put(
         &self,
@@ -615,7 +956,7 @@ impl Engine {
         options: PutOptions,
     ) -> Result<u64> {
         let version = std::cell::Cell::new(0u64);
-        self.commit(|store, seq, now| {
+        self.commit_document(collection, key, |store, seq, now| {
             let written = store.put(
                 collection,
                 key,
@@ -640,7 +981,7 @@ impl Engine {
 
     /// Delete a document. `expected_version` implements compare-and-delete.
     pub fn delete(&self, collection: &str, key: &str, expected_version: Option<u64>) -> Result<()> {
-        self.commit(|store, _seq, _now| {
+        self.commit_document(collection, key, |store, _seq, _now| {
             store.delete(collection, key, expected_version, ApplyMode::Live)?;
             Ok(Op::Delete {
                 collection: collection.to_string(),
@@ -658,6 +999,11 @@ impl Engine {
                 "batch must contain at least one operation",
             ));
         }
+        if ops.iter().any(|op| matches!(op, Op::Batch { .. })) {
+            return Err(DbError::validation(
+                "nested batch operations are not supported",
+            ));
+        }
         if ops.len() > self.cfg.limits.max_batch_ops {
             return Err(DbError::LimitExceeded {
                 limit: "max_batch_ops",
@@ -666,15 +1012,15 @@ impl Engine {
             });
         }
         let count = ops.len();
-        let label = "batch".to_string();
-        self.commit(|store, seq, now| {
-            let op = Op::Batch {
-                ops: ops.clone(),
-                label: label.clone(),
-            };
-            store.apply(&op, now, seq, ApplyMode::Live)?;
-            Ok(op)
-        })?;
+        if ops
+            .iter()
+            .all(|op| matches!(op, Op::Put { .. } | Op::Delete { .. }))
+        {
+            self.commit_document_batch(&[], ops, "batch", None)?;
+            self.metrics.batches.fetch_add(1, Ordering::Relaxed);
+            return Ok(count);
+        }
+        self.commit_schema_batch(ops, "batch")?;
         self.metrics.batches.fetch_add(1, Ordering::Relaxed);
         Ok(count)
     }
@@ -690,8 +1036,24 @@ impl Engine {
         reads: &[(String, String, u64)],
         ops: Vec<Op>,
     ) -> Result<u64> {
+        let seq = self.commit_document_batch(reads, ops, "transaction", None)?;
+        self.metrics.transactions.fetch_add(1, Ordering::Relaxed);
+        Ok(seq)
+    }
+
+    fn commit_document_batch(
+        &self,
+        reads: &[(String, String, u64)],
+        ops: Vec<Op>,
+        label: &str,
+        expectations: Option<&[Option<u64>]>,
+    ) -> Result<u64> {
+        if expectations.is_some_and(|values| values.len() != ops.len()) {
+            return Err(DbError::Internal("batch expectation count mismatch".into()));
+        }
         self.check_writable("transaction commit")?;
         let mut state = self.write();
+        self.check_writable("transaction commit")?;
         let now = now_ms();
         let mut conflicts = Vec::new();
         for (collection, key, version) in reads {
@@ -706,22 +1068,92 @@ impl Engine {
             self.metrics.conflicts.fetch_add(1, Ordering::Relaxed);
             return Err(DbError::TransactionConflict { details: conflicts });
         }
-        let seq = state.seq + 1;
+        let seq = next_sequence(state.seq)?;
+        if ops.len() > state.store.limits.max_batch_ops {
+            return Err(DbError::LimitExceeded {
+                limit: "max_batch_ops",
+                max: state.store.limits.max_batch_ops as u64,
+                actual: ops.len() as u64,
+            });
+        }
+        let mut undo = Vec::with_capacity(ops.len());
+        let mut undo_bytes = 0;
+        for (index, op) in ops.iter().enumerate() {
+            let result = (|| {
+                let (collection, key) = match op {
+                    Op::Put {
+                        collection, key, ..
+                    }
+                    | Op::Delete { collection, key } => (collection, key),
+                    _ => {
+                        return Err(DbError::validation(
+                            "transaction supports document writes only",
+                        ))
+                    }
+                };
+                let previous_ref = state.store.collection(collection)?.docs.get(key);
+                if let Some(previous) = previous_ref {
+                    undo_bytes =
+                        reserve_undo_bytes(undo_bytes, previous.to_json().to_string().len())?;
+                }
+                let previous = previous_ref.cloned();
+                let expected = expectations
+                    .and_then(|values| values.get(index))
+                    .copied()
+                    .flatten();
+                match op {
+                    Op::Put {
+                        value, expires_at, ..
+                    } => {
+                        state.store.put(
+                            collection,
+                            key,
+                            value.clone(),
+                            *expires_at,
+                            expected,
+                            now,
+                            seq,
+                            ApplyMode::Live,
+                        )?;
+                    }
+                    Op::Delete { .. } => {
+                        state
+                            .store
+                            .delete(collection, key, expected, ApplyMode::Live)?;
+                    }
+                    _ => unreachable!("operation was checked above"),
+                }
+                undo.push((collection.clone(), key.clone(), previous));
+                Ok(())
+            })();
+            if let Err(err) = result {
+                for (collection, key, previous) in undo.into_iter().rev() {
+                    if let Err(rollback_err) =
+                        state.store.restore_document(&collection, &key, previous)
+                    {
+                        self.poisoned.store(true, Ordering::SeqCst);
+                        return Err(rollback_err);
+                    }
+                }
+                return Err(err);
+            }
+        }
         let op = Op::Batch {
             ops,
-            label: "transaction".to_string(),
+            label: label.to_string(),
         };
-        state.store.apply(&op, now, seq, ApplyMode::Live)?;
         let record = Record::new(seq, now, op);
         let mut writer = self.lock_mutex(&self.writer);
         if let Err(err) = writer.append(&record) {
             self.poisoned.store(true, Ordering::SeqCst);
-            return Err(err);
+            for (collection, key, previous) in undo.into_iter().rev() {
+                state.store.restore_document(&collection, &key, previous)?;
+            }
+            return Err(DbError::CommitOutcomeUnknown(err.to_string()));
         }
         state.seq = seq;
         drop(writer);
         drop(state);
-        self.metrics.transactions.fetch_add(1, Ordering::Relaxed);
         self.mutations_since_checkpoint
             .fetch_add(1, Ordering::Relaxed);
         self.maybe_auto_checkpoint();
@@ -747,62 +1179,36 @@ impl Engine {
             });
         }
         let count = ops.len();
-        let label = "batch";
-        self.commit(|store, seq, now| {
-            let mut staged = store.clone();
-            let mut log_ops = Vec::with_capacity(ops.len());
-            for checked in &ops {
-                match &checked.op {
-                    Op::Put {
-                        collection,
-                        key,
-                        value,
-                        expires_at,
-                    } => {
-                        staged.put(
-                            collection,
-                            key,
-                            value.clone(),
-                            *expires_at,
-                            checked.expected_version,
-                            now,
-                            seq,
-                            ApplyMode::Live,
-                        )?;
-                    }
-                    Op::Delete { collection, key } => {
-                        staged.delete(
-                            collection,
-                            key,
-                            checked.expected_version,
-                            ApplyMode::Live,
-                        )?;
-                    }
-                    other => {
-                        return Err(DbError::validation(format!(
-                            "batch_checked only supports put/delete, got {:?}",
-                            other.touched_collections()
-                        )))
-                    }
-                }
-                log_ops.push(checked.op.clone());
+        let mut log_ops = Vec::with_capacity(count);
+        let mut expectations = Vec::with_capacity(count);
+        for checked in ops {
+            if !matches!(&checked.op, Op::Put { .. } | Op::Delete { .. }) {
+                return Err(DbError::validation(
+                    "batch_checked only supports put/delete",
+                ));
             }
-            *store = staged;
-            Ok(Op::Batch {
-                ops: log_ops,
-                label: label.to_string(),
-            })
-        })?;
+            log_ops.push(checked.op);
+            expectations.push(checked.expected_version);
+        }
+        self.commit_document_batch(&[], log_ops, "batch", Some(&expectations))?;
         self.metrics.batches.fetch_add(1, Ordering::Relaxed);
         Ok(count)
     }
 
     /// Create a collection.
     pub fn create_collection(&self, meta: CollectionMeta) -> Result<()> {
-        self.commit(|store, _seq, _now| {
-            store.create_collection(meta.clone(), ApplyMode::Live)?;
-            Ok(Op::CreateCollection { meta: meta.clone() })
-        })?;
+        let name = meta.name.clone();
+        self.commit_schema(
+            |_| Ok(name.clone()),
+            |store, _seq, _now| {
+                store.create_collection(meta.clone(), ApplyMode::Live)?;
+                Ok(Op::CreateCollection { meta: meta.clone() })
+            },
+            |store, name| {
+                store.collections.remove(&name);
+                Ok(())
+            },
+        )?;
         Ok(())
     }
 
@@ -814,36 +1220,90 @@ impl Engine {
                 "dropping a collection requires explicit confirmation (confirm=true)",
             ));
         }
-        self.commit(|store, _seq, _now| {
-            store.drop_collection(collection, ApplyMode::Live)?;
-            Ok(Op::DropCollection {
+        self.check_writable("schema write")?;
+        let mut state = self.write();
+        self.check_writable("schema write")?;
+        let previous = state
+            .store
+            .collections
+            .remove(collection)
+            .ok_or_else(|| DbError::CollectionNotFound(collection.to_string()))?;
+        let seq = next_sequence(state.seq)?;
+        let record = Record::new(
+            seq,
+            now_ms(),
+            Op::DropCollection {
                 collection: collection.to_string(),
-            })
-        })?;
+            },
+        );
+        let mut writer = self.lock_mutex(&self.writer);
+        if let Err(err) = writer.append(&record) {
+            self.poisoned.store(true, Ordering::SeqCst);
+            state
+                .store
+                .collections
+                .insert(collection.to_string(), previous);
+            return Err(DbError::CommitOutcomeUnknown(err.to_string()));
+        }
+        self.metrics
+            .wal_bytes
+            .fetch_add(record.encode_payload().len() as u64, Ordering::Relaxed);
+        state.seq = seq;
+        drop(writer);
+        drop(state);
+        self.mutations_since_checkpoint
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_auto_checkpoint();
         Ok(())
     }
 
     /// Create a secondary index (builds it from the existing documents).
     pub fn create_index(&self, collection: &str, index: IndexMeta) -> Result<()> {
-        self.commit(|store, _seq, _now| {
-            store.create_index(collection, index.clone(), ApplyMode::Live)?;
-            Ok(Op::CreateIndex {
-                collection: collection.to_string(),
-                index: index.clone(),
-            })
-        })?;
+        let index_name = index.name.clone();
+        let collection_name = collection.to_string();
+        self.commit_schema(
+            |_| Ok((collection_name.clone(), index_name.clone())),
+            |store, _seq, _now| {
+                store.create_index(collection, index.clone(), ApplyMode::Live)?;
+                Ok(Op::CreateIndex {
+                    collection: collection.to_string(),
+                    index: index.clone(),
+                })
+            },
+            move |store, (collection_name, index_name)| {
+                store.drop_index(&collection_name, &index_name, ApplyMode::Replay)
+            },
+        )?;
         Ok(())
     }
 
     /// Drop a secondary index.
     pub fn drop_index(&self, collection: &str, name: &str) -> Result<()> {
-        self.commit(|store, _seq, _now| {
-            store.drop_index(collection, name, ApplyMode::Live)?;
-            Ok(Op::DropIndex {
-                collection: collection.to_string(),
-                name: name.to_string(),
-            })
-        })?;
+        let collection_name = collection.to_string();
+        self.commit_schema(
+            |store| {
+                store
+                    .collection(collection)?
+                    .meta
+                    .indexes
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| DbError::IndexNotFound {
+                        collection: collection.to_string(),
+                        index: name.to_string(),
+                    })
+            },
+            |store, _seq, _now| {
+                store.drop_index(collection, name, ApplyMode::Live)?;
+                Ok(Op::DropIndex {
+                    collection: collection.to_string(),
+                    name: name.to_string(),
+                })
+            },
+            move |store, previous| {
+                store.create_index(&collection_name, previous, ApplyMode::Replay)
+            },
+        )?;
         Ok(())
     }
 
@@ -851,6 +1311,7 @@ impl Engine {
 
     pub fn get(&self, collection: &str, key: &str) -> Result<Doc> {
         let state = self.read();
+        self.check_healthy()?;
         self.metrics.gets.fetch_add(1, Ordering::Relaxed);
         match state.store.get(collection, key, now_ms())? {
             Some(doc) => Ok(doc.clone()),
@@ -863,6 +1324,7 @@ impl Engine {
 
     pub fn get_opt(&self, collection: &str, key: &str) -> Result<Option<Doc>> {
         let state = self.read();
+        self.check_healthy()?;
         self.metrics.gets.fetch_add(1, Ordering::Relaxed);
         Ok(state.store.get(collection, key, now_ms())?.cloned())
     }
@@ -876,13 +1338,105 @@ impl Engine {
             .collect()
     }
 
+    /// List collections only while the engine's transaction outcome is known.
+    /// Prefer this checked form in request handlers and administrative tooling.
+    pub fn try_list_collections(&self) -> Result<Vec<CollectionMeta>> {
+        let state = self.read();
+        self.check_healthy()?;
+        Ok(state
+            .store
+            .collections
+            .values()
+            .map(|coll| coll.meta.clone())
+            .collect())
+    }
+
     pub fn collection_meta(&self, name: &str) -> Result<CollectionMeta> {
-        Ok(self.read().store.collection(name)?.meta.clone())
+        let state = self.read();
+        self.check_healthy()?;
+        Ok(state.store.collection(name)?.meta.clone())
+    }
+
+    /// Execute a bounded query while validating the access path against current metadata.
+    pub fn query_documents(
+        &self,
+        collection: &str,
+        filter: Option<&DocumentFilter>,
+        access: &DocumentAccess,
+        limit: usize,
+    ) -> Result<Vec<(String, Doc)>> {
+        if !(1..=1000).contains(&limit) {
+            return Err(DbError::validation(
+                "query limit must be between 1 and 1000",
+            ));
+        }
+        if let Some(filter) = filter {
+            if filter.field.len() > 128
+                || Json::parse_path(&filter.field).is_err()
+                || !matches!(filter.operator.as_str(), "eq" | "gte" | "lte")
+                || !matches!(
+                    filter.value,
+                    Json::Null | Json::Bool(_) | Json::Number(_) | Json::String(_)
+                )
+            {
+                return Err(DbError::validation("invalid query filter"));
+            }
+        }
+        let state = self.read();
+        self.check_healthy()?;
+        let coll = state.store.collection(collection)?;
+        let now = now_ms();
+        let mut output = Vec::new();
+        match access {
+            DocumentAccess::FullScan => {
+                for (key, doc) in &coll.docs {
+                    if !doc.is_expired(now) && matches_document_filter(doc, filter) {
+                        output.push((key.clone(), doc.clone()));
+                        if output.len() == limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            DocumentAccess::IndexEquality(name) => {
+                let filter =
+                    filter.ok_or_else(|| DbError::validation("index query requires a filter"))?;
+                if filter.operator != "eq"
+                    || !matches!(filter.value, Json::String(_) | Json::Bool(_))
+                {
+                    return Err(DbError::validation("unsupported index comparison"));
+                }
+                let index = coll
+                    .indexes
+                    .get(name)
+                    .ok_or_else(|| DbError::IndexNotFound {
+                        collection: collection.into(),
+                        index: name.clone(),
+                    })?;
+                if index.meta.field != filter.field {
+                    return Err(DbError::validation("index field mismatch"));
+                }
+                if let Some(keys) = index.entries.get(&filter.value.canonical_bytes()) {
+                    for key in keys {
+                        if let Some(doc) = coll.docs.get(key) {
+                            if !doc.is_expired(now) && matches_document_filter(doc, Some(filter)) {
+                                output.push((key.clone(), doc.clone()));
+                                if output.len() == limit {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(output)
     }
 
     /// Scan documents in key order.
     pub fn scan(&self, collection: &str, options: &ScanOptions) -> Result<Vec<(String, Doc)>> {
         let state = self.read();
+        self.check_healthy()?;
         let now = now_ms();
         let coll = state.store.collection(collection)?;
         let mut items: Vec<(String, Doc)> = match &options.prefix {
@@ -920,6 +1474,7 @@ impl Engine {
         limit: usize,
     ) -> Result<Vec<(String, Doc)>> {
         let state = self.read();
+        self.check_healthy()?;
         let now = now_ms();
         let coll = state.store.collection(collection)?;
         let index_state = coll
@@ -955,6 +1510,7 @@ impl Engine {
         limit: usize,
     ) -> Result<Vec<(String, Json, Doc)>> {
         let state = self.read();
+        self.check_healthy()?;
         let now = now_ms();
         let coll = state.store.collection(collection)?;
         let index_state = coll
@@ -998,6 +1554,7 @@ impl Engine {
     /// Number of live documents in a collection.
     pub fn count(&self, collection: &str) -> Result<usize> {
         let state = self.read();
+        self.check_healthy()?;
         let now = now_ms();
         Ok(state.store.collection(collection)?.live_len(now))
     }
@@ -1007,6 +1564,7 @@ impl Engine {
     /// Remove expired documents, returning how many were removed. Each removal is
     /// logged as an explicit `ttl_expiry` batch, so it is auditable and never silent.
     pub fn sweep_expired(&self) -> Result<usize> {
+        self.check_healthy()?;
         let expired = {
             let state = self.read();
             state.store.expired_keys(now_ms())
@@ -1023,14 +1581,7 @@ impl Engine {
             .take(self.cfg.limits.max_batch_ops)
             .collect();
         let removed = ops.len();
-        self.commit(|store, seq, now| {
-            let op = Op::Batch {
-                ops: ops.clone(),
-                label: "ttl_expiry".to_string(),
-            };
-            store.apply(&op, now, seq, ApplyMode::Live)?;
-            Ok(op)
-        })?;
+        self.commit_document_batch(&[], ops, "ttl_expiry", None)?;
         self.metrics.sweeps.fetch_add(1, Ordering::Relaxed);
         Ok(removed)
     }
@@ -1039,17 +1590,23 @@ impl Engine {
 
     /// Write a snapshot of the current state and retire the log segments it covers.
     pub fn checkpoint(&self) -> Result<WrittenSnapshot> {
-        if self.cfg.read_only {
-            return Err(DbError::ReadOnly("checkpoint".to_string()));
-        }
+        self.check_writable("checkpoint")?;
         let mut state = self.write();
+        self.check_writable("checkpoint")?;
         let mut writer = self.lock_mutex(&self.writer);
         let mut manifest = self.lock_mutex(&self.manifest);
 
         // 1. Rotate so the snapshot can never overlap the segment we keep writing to.
         writer.rotate()?;
         let keep_index = writer.current_index();
-        let generation = state.generation + 1;
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| DbError::LimitExceeded {
+                limit: "manifest_generation",
+                max: 999_999_999_999,
+                actual: state.generation,
+            })?;
         let seq = state.seq;
 
         // 2. Serialise the state.
@@ -1068,14 +1625,24 @@ impl Engine {
             })
             .collect();
         let snapshot_path = self.paths.snapshot_file(generation);
+        // A crash after snapshot publication but before manifest publication leaves
+        // an unreferenced candidate. The active manifest still points elsewhere, so
+        // removing that candidate is safe before retrying the checkpoint.
+        match std::fs::symlink_metadata(&snapshot_path) {
+            Ok(_) => std::fs::remove_file(&snapshot_path)
+                .map_err(|err| DbError::io("removing orphan snapshot generation", err))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(DbError::io("inspecting snapshot destination", err)),
+        }
         let written =
             snapshot::write_snapshot(&snapshot_path, generation, seq, now_ms(), &payload)?;
 
         // 3. Make the new snapshot authoritative.
         let previous_snapshot = manifest.snapshot.clone();
-        manifest.generation = generation;
-        manifest.last_seq = seq;
-        manifest.snapshot = Some(SnapshotRef {
+        let mut candidate = manifest.clone();
+        candidate.generation = generation;
+        candidate.last_seq = seq;
+        candidate.snapshot = Some(SnapshotRef {
             file: snapshot_path
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
@@ -1087,9 +1654,15 @@ impl Engine {
             created_at: written.header.created_at,
             bytes: written.bytes,
         });
-        manifest.wal = vec![wal::segment_name(keep_index)];
-        manifest.save(&self.paths.root)?;
+        candidate.wal = vec![wal::segment_name(keep_index)];
+        if let Err(err) = candidate.publish_generation(&self.paths.root) {
+            // A failure after rename can leave publication outcome uncertain.
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(err);
+        }
+        *manifest = candidate;
         state.generation = generation;
+        Manifest::remove_superseded_generations(&self.paths.root, generation);
 
         // 4. Only now may the retired segments disappear.
         let retired = wal::list_segments(&self.paths.wal_dir)?;
@@ -1157,6 +1730,21 @@ impl Engine {
 
     pub fn stats(&self) -> EngineStats {
         let state = self.read();
+        self.stats_for_state(&state)
+    }
+
+    /// Return statistics only when the transaction outcome is known.
+    ///
+    /// `stats` remains available for source compatibility; request handlers and
+    /// administrative tools should use this checked form so a poisoned engine cannot
+    /// report stale counts as if they described the current committed state.
+    pub fn try_stats(&self) -> Result<EngineStats> {
+        let state = self.read();
+        self.check_healthy()?;
+        Ok(self.stats_for_state(&state))
+    }
+
+    fn stats_for_state(&self, state: &State) -> EngineStats {
         let now = now_ms();
         let collections = state
             .store
@@ -1249,74 +1837,146 @@ impl Engine {
         let manifest = self.lock_mutex(&self.manifest).clone();
         let mut snapshot_json = None;
         if let Some(snap_ref) = &manifest.snapshot {
-            let path = self.paths.snap_dir.join(&snap_ref.file);
-            match snapshot::read_snapshot(&path) {
-                Ok(data) => {
-                    let mut ok = true;
-                    if !snap_ref.sha256.is_empty() && data.body_sha256 != snap_ref.sha256 {
-                        ok = false;
-                        issues.push(format!(
-                            "snapshot {} SHA-256 mismatch with manifest",
-                            snap_ref.file
-                        ));
-                    }
-                    if data.header.seq != snap_ref.seq {
-                        ok = false;
-                        issues.push(format!(
-                            "snapshot {} records seq {} but manifest says {}",
-                            snap_ref.file, data.header.seq, snap_ref.seq
-                        ));
-                    }
-                    snapshot_json = Some(
-                        Json::obj()
-                            .with("file", Json::str(snap_ref.file.clone()))
-                            .with("ok", Json::Bool(ok))
-                            .with("seq", Json::uint(data.header.seq))
-                            .with("documents", Json::uint(data.header.doc_count))
-                            .with("sha256", Json::str(data.body_sha256)),
-                    );
-                }
+            let path = match validate_snapshot_reference(&manifest, snap_ref) {
+                Ok(()) => Some(self.paths.snap_dir.join(&snap_ref.file)),
                 Err(err) => {
-                    issues.push(format!("snapshot {} is unreadable: {err}", snap_ref.file));
+                    issues.push(err.to_string());
                     snapshot_json = Some(
                         Json::obj()
                             .with("file", Json::str(snap_ref.file.clone()))
                             .with("ok", Json::Bool(false))
                             .with("error", Json::str(err.to_string())),
                     );
+                    None
+                }
+            };
+            if let Some(path) = path {
+                if let Err(err) = ensure_regular_snapshot_file(&path) {
+                    issues.push(err.to_string());
+                    snapshot_json = Some(
+                        Json::obj()
+                            .with("file", Json::str(snap_ref.file.clone()))
+                            .with("ok", Json::Bool(false))
+                            .with("error", Json::str(err.to_string())),
+                    );
+                } else {
+                    match snapshot::read_snapshot(&path) {
+                        Ok(data) => {
+                            let mut ok = true;
+                            if let Err(err) = validate_snapshot_contents(snap_ref, &data, &path) {
+                                ok = false;
+                                issues.push(err.to_string());
+                            }
+                            if !snap_ref.sha256.is_empty() && data.body_sha256 != snap_ref.sha256 {
+                                ok = false;
+                                issues.push(format!(
+                                    "snapshot {} SHA-256 mismatch with manifest",
+                                    snap_ref.file
+                                ));
+                            }
+                            if data.header.seq != snap_ref.seq {
+                                ok = false;
+                                issues.push(format!(
+                                    "snapshot {} records seq {} but manifest says {}",
+                                    snap_ref.file, data.header.seq, snap_ref.seq
+                                ));
+                            }
+                            snapshot_json = Some(
+                                Json::obj()
+                                    .with("file", Json::str(snap_ref.file.clone()))
+                                    .with("ok", Json::Bool(ok))
+                                    .with("seq", Json::uint(data.header.seq))
+                                    .with("documents", Json::uint(data.header.doc_count))
+                                    .with("sha256", Json::str(data.body_sha256)),
+                            );
+                        }
+                        Err(err) => {
+                            issues.push(format!("snapshot {} is unreadable: {err}", snap_ref.file));
+                            snapshot_json = Some(
+                                Json::obj()
+                                    .with("file", Json::str(snap_ref.file.clone()))
+                                    .with("ok", Json::Bool(false))
+                                    .with("error", Json::str(err.to_string())),
+                            );
+                        }
+                    }
                 }
             }
         }
 
         let mut segments = Vec::new();
-        let mut previous_seq = 0u64;
-        for segment in wal::list_segments(&self.paths.wal_dir)? {
-            let scan = wal::scan_segment(&segment)?;
+        let snapshot_seq = manifest
+            .snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.seq);
+        let mut previous_seq = snapshot_seq;
+        let mut replay_started = false;
+        let wal_segments = wal::list_segments(&self.paths.wal_dir)?;
+        for (position, segment) in wal_segments.iter().enumerate() {
             let name = segment
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let ok = scan.corruption.is_none() && scan.torn_tail.is_none();
+            let mut record_count = 0u64;
+            let mut sequence_corruption = None;
+            let scan = wal::scan_segment_visit(segment, |record| {
+                if record.seq <= snapshot_seq {
+                    if replay_started {
+                        sequence_corruption = Some(format!(
+                            "record sequence {} regresses after replay reached {}",
+                            record.seq, previous_seq
+                        ));
+                    }
+                    record_count = record_count
+                        .checked_add(1)
+                        .ok_or_else(|| DbError::corrupt(&name, "WAL record count overflow"))?;
+                    return Ok(());
+                }
+                let expected = previous_seq
+                    .checked_add(1)
+                    .ok_or_else(|| DbError::corrupt(&name, "WAL record sequence overflow"))?;
+                if record.seq != expected {
+                    sequence_corruption = Some(format!(
+                        "record sequence {} does not continue from {}",
+                        record.seq, previous_seq
+                    ));
+                    record_count = record_count
+                        .checked_add(1)
+                        .ok_or_else(|| DbError::corrupt(&name, "WAL record count overflow"))?;
+                    return Ok(());
+                }
+                previous_seq = record.seq;
+                replay_started = true;
+                record_count = record_count
+                    .checked_add(1)
+                    .ok_or_else(|| DbError::corrupt(&name, "WAL record count overflow"))?;
+                Ok(())
+            })?;
+            if let Some(corruption) = sequence_corruption.as_ref() {
+                issues.push(format!("{name}: {corruption}"));
+            }
             if let Some(corruption) = &scan.corruption {
                 issues.push(format!("{name}: {corruption}"));
             }
             if let Some(torn) = &scan.torn_tail {
                 issues.push(format!("{name}: torn tail ({torn})"));
             }
-            for record in &scan.records {
-                if record.seq <= previous_seq {
-                    issues.push(format!(
-                        "{name}: record sequence {} is not larger than the previous record ({})",
-                        record.seq, previous_seq
-                    ));
-                }
-                previous_seq = record.seq;
+            let torn_followed_by_segment =
+                scan.torn_tail.is_some() && position + 1 < wal_segments.len();
+            if torn_followed_by_segment {
+                issues.push(format!(
+                    "{name}: torn WAL tail is followed by another segment"
+                ));
             }
+            let ok = scan.corruption.is_none()
+                && scan.torn_tail.is_none()
+                && sequence_corruption.is_none()
+                && !torn_followed_by_segment;
             segments.push(
                 Json::obj()
                     .with("file", Json::str(name))
                     .with("ok", Json::Bool(ok))
-                    .with("records", Json::uint(scan.records.len() as u64))
+                    .with("records", Json::uint(record_count))
                     .with("valid_bytes", Json::uint(scan.valid_len))
                     .with(
                         "torn_tail",
@@ -1365,6 +2025,20 @@ impl Engine {
     /// Current log sequence number.
     pub fn last_seq(&self) -> u64 {
         self.read().seq
+    }
+
+    /// Hold a stable view of on-disk files while a backup reads them.
+    pub(crate) fn with_stable_files<T>(&self, action: impl FnOnce(u64) -> Result<T>) -> Result<T> {
+        let state = self.read();
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(DbError::Internal(
+                "engine is in a failed state after a WAL write error; restart required".into(),
+            ));
+        }
+        if !self.cfg.read_only {
+            self.lock_mutex(&self.writer).sync()?;
+        }
+        action(state.seq)
     }
 
     /// Flush the WAL to disk.
@@ -1432,4 +2106,519 @@ pub fn load_snapshot_store(path: &Path, limits: Limits) -> Result<Store> {
 /// Helper for tests and tooling: the collection view without cloning the whole store.
 pub fn collection_ref<'a>(store: &'a Store, name: &str) -> Result<&'a Collection> {
     store.collection(name)
+}
+
+#[cfg(test)]
+mod document_undo_tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_wal_sequence_returns_a_limit_error_without_mutating() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-sequence-overflow-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine.write().seq = u64::MAX;
+
+        let error = engine
+            .put("c", "key", Json::str("value"), PutOptions::default())
+            .unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::LIMIT_EXCEEDED);
+        assert_eq!(engine.read().seq, u64::MAX);
+        assert!(!engine
+            .read()
+            .store
+            .collection("c")
+            .unwrap()
+            .docs
+            .contains_key("key"));
+
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn nested_batch_is_rejected_before_persistence() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-nested-batch-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        assert!(engine
+            .batch(vec![Op::Batch {
+                ops: vec![Op::CreateCollection {
+                    meta: CollectionMeta::new("nested", 0),
+                }],
+                label: "nested".into(),
+            }])
+            .is_err());
+        drop(engine);
+
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        assert!(reopened.collection_meta("nested").is_err());
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn schema_append_failures_restore_collection_and_index_state() {
+        for operation in [
+            "create_collection",
+            "drop_collection",
+            "create_index",
+            "drop_index",
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "preppydb-schema-undo-{operation}-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+            engine
+                .create_collection(CollectionMeta::new("c", 0))
+                .unwrap();
+            engine
+                .put(
+                    "c",
+                    "a",
+                    Json::obj().with("v", Json::int(1)),
+                    PutOptions::default(),
+                )
+                .unwrap();
+            let index = IndexMeta {
+                name: "idx_v".into(),
+                field: "v".into(),
+                unique: false,
+                sparse: false,
+                created_at: now_ms(),
+            };
+            if operation == "drop_index" {
+                engine.create_index("c", index.clone()).unwrap();
+            }
+            engine.lock_mutex(&engine.writer).inject_append_failure();
+            match operation {
+                "create_collection" => {
+                    assert!(engine
+                        .create_collection(CollectionMeta::new("new", 0))
+                        .is_err());
+                }
+                "drop_collection" => {
+                    assert!(engine.drop_collection("c", true).is_err());
+                }
+                "create_index" => {
+                    assert!(engine.create_index("c", index).is_err());
+                }
+                "drop_index" => {
+                    assert!(engine.drop_index("c", "idx_v").is_err());
+                }
+                _ => unreachable!(),
+            }
+            drop(engine);
+            let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+            assert_eq!(reopened.count("c").unwrap(), 1);
+            assert_eq!(
+                reopened
+                    .collection_meta("c")
+                    .unwrap()
+                    .indexes
+                    .contains_key("idx_v"),
+                operation == "drop_index"
+            );
+            assert!(reopened.collection_meta("new").is_err());
+            drop(reopened);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn mixed_schema_batch_preserves_order_and_rolls_back_only_touched_collections() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-schema-batch-undo-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("existing", 0))
+            .unwrap();
+        engine
+            .create_collection(CollectionMeta::new("untouched", 0))
+            .unwrap();
+        engine
+            .put(
+                "existing",
+                "old",
+                Json::obj().with("value", Json::int(1)),
+                PutOptions::default(),
+            )
+            .unwrap();
+        engine
+            .put(
+                "untouched",
+                "kept",
+                Json::obj().with("value", Json::int(2)),
+                PutOptions::default(),
+            )
+            .unwrap();
+
+        // An ordered mixed batch can create a collection and then write into it.
+        engine
+            .batch(vec![
+                Op::CreateCollection {
+                    meta: CollectionMeta::new("created", 0),
+                },
+                Op::Put {
+                    collection: "created".into(),
+                    key: "new".into(),
+                    value: Json::obj().with("value", Json::int(3)),
+                    expires_at: None,
+                },
+            ])
+            .unwrap();
+        assert_eq!(engine.count("created").unwrap(), 1);
+
+        let index = IndexMeta {
+            name: "idx_value".into(),
+            field: "value".into(),
+            unique: false,
+            sparse: false,
+            created_at: now_ms(),
+        };
+        engine.lock_mutex(&engine.writer).inject_append_failure();
+        assert!(engine
+            .batch(vec![
+                Op::CreateIndex {
+                    collection: "existing".into(),
+                    index,
+                },
+                Op::DropCollection {
+                    collection: "untouched".into(),
+                },
+                Op::CreateCollection {
+                    meta: CollectionMeta::new("created_then_failed", 0),
+                },
+            ])
+            .is_err());
+        assert!(engine.count("untouched").is_err());
+        {
+            let state = engine.read();
+            assert!(!state
+                .store
+                .collection("existing")
+                .unwrap()
+                .indexes
+                .contains_key("idx_value"));
+            assert!(state.store.collections.contains_key("untouched"));
+            assert!(!state.store.collections.contains_key("created_then_failed"));
+        }
+
+        drop(engine);
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        assert_eq!(reopened.count("existing").unwrap(), 1);
+        assert_eq!(reopened.count("untouched").unwrap(), 1);
+        assert_eq!(reopened.count("created").unwrap(), 1);
+        assert!(!reopened
+            .collection_meta("existing")
+            .unwrap()
+            .indexes
+            .contains_key("idx_value"));
+        assert!(reopened.collection_meta("created_then_failed").is_err());
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checked_batch_conflict_restores_prior_mutations() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-checked-undo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "a", Json::int(1), PutOptions::default())
+            .unwrap();
+        let put = |value| Op::Put {
+            collection: "c".into(),
+            key: "a".into(),
+            value: Json::int(value),
+            expires_at: None,
+        };
+        let ops = vec![
+            CheckedOp {
+                op: put(2),
+                expected_version: Some(1),
+            },
+            CheckedOp {
+                op: put(3),
+                expected_version: Some(1),
+            },
+        ];
+        assert!(matches!(
+            engine.batch_checked(ops),
+            Err(DbError::Conflict { .. })
+        ));
+        assert_eq!(engine.get("c", "a").unwrap().value.as_i64(), Some(1));
+        assert_eq!(engine.get("c", "a").unwrap().version, 1);
+        drop(engine);
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        assert_eq!(reopened.get("c", "a").unwrap().value.as_i64(), Some(1));
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_document_batch_restores_repeated_key_and_other_documents() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-batch-undo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "a", Json::int(1), PutOptions::default())
+            .unwrap();
+        let ops = vec![
+            Op::Put {
+                collection: "c".into(),
+                key: "a".into(),
+                value: Json::int(2),
+                expires_at: None,
+            },
+            Op::Put {
+                collection: "c".into(),
+                key: "a".into(),
+                value: Json::int(3),
+                expires_at: None,
+            },
+            Op::Put {
+                collection: "c".into(),
+                key: "b".into(),
+                value: Json::int(4),
+                expires_at: None,
+            },
+        ];
+        engine.lock_mutex(&engine.writer).inject_append_failure();
+        assert!(engine.batch(ops).is_err());
+        assert!(engine.get("c", "a").is_err());
+        {
+            let state = engine.read();
+            assert_eq!(
+                state.store.collection("c").unwrap().docs["a"]
+                    .value
+                    .as_i64(),
+                Some(1)
+            );
+            assert!(!state.store.collection("c").unwrap().docs.contains_key("b"));
+        }
+        drop(engine);
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        assert_eq!(reopened.get("c", "a").unwrap().value.as_i64(), Some(1));
+        assert!(reopened.get_opt("c", "b").unwrap().is_none());
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transaction_append_failure_restores_all_documents() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-txn-undo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "a", Json::int(1), PutOptions::default())
+            .unwrap();
+        engine
+            .put("c", "b", Json::int(2), PutOptions::default())
+            .unwrap();
+        let mut txn = engine.begin();
+        txn.put("c", "a", Json::int(3), None).unwrap();
+        txn.delete("c", "b").unwrap();
+        txn.put("c", "new", Json::int(4), None).unwrap();
+        engine.lock_mutex(&engine.writer).inject_append_failure();
+        assert!(txn.commit().is_err());
+        assert!(engine.get("c", "a").is_err());
+        {
+            let state = engine.read();
+            assert_eq!(
+                state.store.collection("c").unwrap().docs["a"]
+                    .value
+                    .as_i64(),
+                Some(1)
+            );
+            assert_eq!(
+                state.store.collection("c").unwrap().docs["b"]
+                    .value
+                    .as_i64(),
+                Some(2)
+            );
+            assert!(!state
+                .store
+                .collection("c")
+                .unwrap()
+                .docs
+                .contains_key("new"));
+        }
+        drop(engine);
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        assert_eq!(reopened.get("c", "a").unwrap().value.as_i64(), Some(1));
+        assert_eq!(reopened.get("c", "b").unwrap().value.as_i64(), Some(2));
+        assert!(reopened.get_opt("c", "new").unwrap().is_none());
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn partial_write_and_pre_sync_failure_have_distinct_recovery_outcomes() {
+        for (tag, fault, expected_after_reopen) in [
+            ("partial", crate::wal::AppendFault::PartialWrite, "old"),
+            ("pre-sync", crate::wal::AppendFault::BeforeSync, "new"),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "preppydb-wal-fault-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+            engine
+                .create_collection(CollectionMeta::new("c", 0))
+                .unwrap();
+            engine
+                .put("c", "key", Json::str("old"), PutOptions::default())
+                .unwrap();
+            engine.lock_mutex(&engine.writer).inject_fault(fault);
+            let commit_error = engine
+                .put("c", "key", Json::str("new"), PutOptions::default())
+                .unwrap_err();
+            assert_eq!(
+                commit_error.code(),
+                crate::error::codes::COMMIT_OUTCOME_UNKNOWN,
+                "unexpected append error classification: {commit_error}"
+            );
+            assert!(engine.get("c", "key").is_err());
+            assert_eq!(
+                engine.try_list_collections().unwrap_err().code(),
+                crate::error::codes::COMMIT_OUTCOME_UNKNOWN
+            );
+            assert_eq!(
+                engine.try_stats().unwrap_err().code(),
+                crate::error::codes::COMMIT_OUTCOME_UNKNOWN
+            );
+            assert!(engine
+                .put("c", "another", Json::Null, PutOptions::default())
+                .is_err());
+            drop(engine);
+            let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+            assert_eq!(
+                reopened.get("c", "key").unwrap().value.as_str(),
+                Some(expected_after_reopen)
+            );
+            drop(reopened);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_append_restores_insert_update_delete_and_index() {
+        for operation in ["insert", "update", "delete"] {
+            let dir = std::env::temp_dir().join(format!(
+                "preppydb-undo-{operation}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+            engine
+                .create_collection(CollectionMeta::new("c", 0))
+                .unwrap();
+            engine
+                .create_index(
+                    "c",
+                    IndexMeta {
+                        name: "by_value".into(),
+                        field: "value".into(),
+                        unique: true,
+                        sparse: false,
+                        created_at: 0,
+                    },
+                )
+                .unwrap();
+            let old = Json::obj().with("value", Json::str("old"));
+            engine
+                .put("c", "existing", old.clone(), PutOptions::default())
+                .unwrap();
+            engine.lock_mutex(&engine.writer).inject_append_failure();
+            let result = match operation {
+                "insert" => engine
+                    .put(
+                        "c",
+                        "new",
+                        Json::obj().with("value", Json::str("new")),
+                        PutOptions::default(),
+                    )
+                    .map(|_| ()),
+                "update" => engine
+                    .put(
+                        "c",
+                        "existing",
+                        Json::obj().with("value", Json::str("new")),
+                        PutOptions::default(),
+                    )
+                    .map(|_| ()),
+                _ => engine.delete("c", "existing", None),
+            };
+            assert!(result.is_err());
+            assert!(engine.get("c", "existing").is_err());
+            {
+                let state = engine.read();
+                let collection = state.store.collection("c").unwrap();
+                assert_eq!(collection.docs["existing"].value, old);
+                assert!(!collection.docs.contains_key("new"));
+                assert_eq!(
+                    collection.indexes["by_value"]
+                        .entries
+                        .get(&Json::str("old").canonical_bytes())
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+            drop(engine);
+            let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+            assert_eq!(reopened.get("c", "existing").unwrap().value, old);
+            drop(reopened);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 }

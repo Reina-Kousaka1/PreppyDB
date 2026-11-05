@@ -11,6 +11,8 @@
 //!
 //! This is a guard against accidental double starts on one filesystem, not a security
 //! boundary: an advisory lock is not enforced against a process that ignores it.
+//! The file is retained after unlock; removing it while the database is in use can
+//! split contenders across different inodes and defeat mutual exclusion.
 
 use crate::error::{DbError, Result};
 use preppydb_json::Json;
@@ -86,9 +88,9 @@ impl FileLock {
         if let Some(file) = self.file.take() {
             let _ = file.unlock();
             drop(file);
-            // Best effort: a leftover LOCK file is harmless because the OS lock is gone
-            // and the next opener will simply take the lock again.
-            let _ = std::fs::remove_file(&self.path);
+            // Never unlink the lock file: another process can acquire this inode
+            // immediately after unlock, and deleting it would let a third process
+            // create and lock a different inode for the same database directory.
         }
     }
 
@@ -190,7 +192,10 @@ mod tests {
         assert_eq!(lock.pid(), std::process::id());
         lock.release();
         assert!(!lock.is_held());
-        assert!(!lock.path().exists());
+        assert!(
+            lock.path().exists(),
+            "the stable lock inode must be retained"
+        );
 
         // After release the directory can be locked again.
         let again = FileLock::acquire(&dir).unwrap();
@@ -211,6 +216,21 @@ mod tests {
         let second = FileLock::acquire(&dir).unwrap();
         drop(second);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_keeps_same_inode_and_excludes_third_holder() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir("handoff");
+        let mut first = FileLock::acquire(&dir).unwrap();
+        let inode = std::fs::metadata(first.path()).unwrap().ino();
+        first.release();
+        let second = FileLock::acquire(&dir).unwrap();
+        assert_eq!(std::fs::metadata(second.path()).unwrap().ino(), inode);
+        assert!(matches!(FileLock::acquire(&dir), Err(DbError::Locked(_))));
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

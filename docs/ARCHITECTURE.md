@@ -31,13 +31,14 @@ the HTTP client (it needs both local maintenance commands and `preppydb health`)
 
 ## Minimal dependencies
 
-The workspace directly uses two focused third-party runtime crates: `getrandom` supplies
-OS-backed entropy for secrets, and `ctrlc` connects Unix SIGINT/SIGTERM/SIGHUP and Windows console
-interrupts to the server's safe shutdown path. The database's JSON, cryptographic
-primitives, HTTP server and storage remain implemented in-tree. `Cargo.lock` pins the
-dependency graph; a first build needs these crates cached or reachable from crates.io.
-This avoids custom platform RNG and signal handling code while keeping the runtime
-dependency set small. See [TESTING.md](TESTING.md) and [../SECURITY.md](../SECURITY.md)
+The workspace directly uses `getrandom` for OS-backed entropy, `ctrlc` for portable
+shutdown signals, and `mlua` to embed a vendored Lua 5.4 VM for the opt-in server-side
+script endpoint. `mlua` and its bundled Lua source are MIT-licensed; the dependency graph
+is pinned in `Cargo.lock`. Lua runs without filesystem, networking, package, or debug
+libraries and is bounded by memory and instruction budgets. The database's JSON,
+cryptographic primitives, HTTP server and storage remain implemented in-tree. The first
+build needs these crates cached or reachable from crates.io. See [TESTING.md](TESTING.md),
+[API.md](API.md#controlled-lua-mutation-scripts), and [../SECURITY.md](../SECURITY.md)
 for scope and verification.
 
 ## On-disk layout
@@ -84,8 +85,20 @@ truncated during recovery; a torn frame in the middle of the log is treated as
 corruption and aborts recovery unless `RepairPolicy::TruncateCorruptTail` is set
 explicitly (`preppydb --repair`).
 
-Sequence numbers are monotonic and gap-free per directory; the WAL segment name encodes
-the first sequence number it may contain.
+An incomplete final segment header (shorter than the fixed 12-byte header and with no
+possible record frame) is also treated as interrupted segment creation: writable open
+removes that final segment after validating the preceding WAL history and syncs the WAL
+directory. A non-final incomplete header is corruption; read-only open refuses to remove
+an incomplete header. A complete but invalid header remains corruption.
+
+Sequence numbers are monotonic and gap-free after the published snapshot. Recovery
+rejects gaps, duplicates, and regressions in the replayable suffix. WAL segment names
+encode rotation order, not record sequence numbers.
+
+Recovery and verification consume frames incrementally. The CLI summary path keeps only
+per-segment counters. The low-level `scan_segment` convenience API retains decoded
+records and therefore rejects segment files larger than 128 MiB; callers that need to
+inspect larger segments must use `scan_segment_visit` or `summarize_segment`.
 
 ### Checkpointing
 
@@ -93,23 +106,33 @@ the first sequence number it may contain.
 2. Rotate to a new WAL segment.
 3. Serialise the in-memory store into a new snapshot generation, framed in blocks with
    CRC32C per block plus a SHA-256 of the whole file.
-4. Write `MANIFEST` atomically (temp file + rename) pointing at the snapshot and the
-   sequence number it covers.
+4. Sync a temporary generation manifest and rename it to a new, unused generation
+   filename. The previous published manifest is never replaced; on failure, stop writes
+   until restart. `MANIFEST.json` remains readable for databases created by older builds.
 5. Delete segments that only contain sequences already in the snapshot.
 
-If the process dies between 3 and 4, the old manifest still points at the previous
-snapshot and the new WAL segments are replayed; if it dies after 4, the snapshot is
-authoritative and older segments are ignored or removed. There is never a window where
-the manifest points at a snapshot that is not fully written and flushed.
+The snapshot is synced before publication. Replacement and directory durability depend
+on the operating system and filesystem. Process-crash and power-loss behavior across
+all platforms has not yet been qualified; in particular Windows fault-injection coverage
+is still required. The manifest reference is treated as untrusted input: its filename
+must exactly match its generation, and snapshot header/length metadata is checked before
+the snapshot is applied. The parser validates the footer digest and rejects trailing bytes.
+Snapshot symlinks are rejected.
 
 ### Recovery
 
-1. Read `MANIFEST`; if it is missing or unreadable, fall back to the newest snapshot and
-   record the fact in a recovery report.
+1. Read `MANIFEST`. An unreadable manifest, a missing manifest with snapshot files or
+   retired WAL history, a sequence gap or regression in the replayable suffix, or a
+   missing referenced snapshot causes an error; automatic snapshot discovery is not
+   implemented.
 2. Load the snapshot (verify block CRCs and the file hash).
-3. Replay every WAL segment sequentially, skipping records with `seq <= snapshot.seq`.
-4. Truncate a torn tail, write `<data-dir>/recovery-report-<ms>.json` describing what
-   happened, and expose it through `GET /v1/admin/recovery` and `preppydb wal`.
+3. Replay WAL records in sequence order, skipping records already covered by the
+   snapshot. Complete bad-CRC frames fail closed by default.
+4. A partial final frame is truncated automatically. Explicit writable
+   `RepairPolicy::TruncateCorruptTail` truncates at the first corrupt or discontinuous
+   frame and removes later WAL segments; this deliberately discards the untrusted suffix.
+   Recovery writes `<data-dir>/recovery-report-<ms>.json` and exposes it through
+   `GET /v1/admin/recovery` and `preppydb wal`.
 
 ## Concurrency model
 
@@ -136,9 +159,24 @@ txn.commit()?;                              // validates read versions, one WAL 
 * Reads inside a transaction see the committed store plus the transaction's own writes.
 * At commit the engine re-checks the version of every key the transaction read or wrote;
   any change since the read produces `TransactionConflict` with the offending keys.
-* A committed transaction is a single `Op::Batch { label: "transaction" }` WAL record, so
-  it is all-or-nothing across a crash.
+* A transaction is represented by one `Op::Batch { label: "transaction" }` WAL record.
+  Recovery therefore replays a complete frame as a whole and ignores only an incomplete
+  torn tail. If an I/O error occurs after append begins, the caller's outcome is
+  indeterminate: a complete frame may be recovered even though `commit` returned an
+  error. The engine poisons itself after append errors to prevent further writes until
+  reopen; callers must inspect state after recovery instead of assuming the operation
+  aborted.
 * There is no automatic retry. Callers get `409 conflict`, `retryable: true`, and decide.
+* Read sets are bounded by the configured `max_batch_ops` limit (1,000 by default).
+  Staged write data is bounded to 32 MiB per transaction before commit; re-writing the
+  same key replaces its buffered-byte accounting. Serialized size is counted through a
+  bounded formatter that stops at the remaining transaction budget rather than building
+  an unbounded temporary JSON string. Commit moves staged JSON values into the WAL
+  operation list instead of cloning those values.
+* Atomic batches retain at most 32 MiB of serialized prior-document values as rollback
+  state. Schema rollback moves removed collections and indexes into an operation journal
+  rather than cloning their contents; creating a new index still requires scanning and
+  building that index for the collection.
 
 ## Indexes
 

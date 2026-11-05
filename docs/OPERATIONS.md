@@ -155,6 +155,8 @@ Precedence: CLI flag > config file > default.
   "repair": "strict",
   "auth_path": null,
   "pricing_audit_path": null,
+  "ruby_planner_path": null,
+  "lua_execution_enabled": false,
   "workers": 4
 }
 ```
@@ -166,9 +168,11 @@ exits; unknown keys in the file are rejected so typos cannot silently change beh
 | --- | --- |
 | `listen` | `host:port`; a non-loopback address additionally requires `allow_public_bind: true` |
 | `max_body_bytes` | request body cap, 1 KiB … 256 MiB (default 4 MiB) |
-| `rate_limit_per_second` / `_burst` | per-credential limit; `0` disables it; burst must be ≥ rate |
+| `rate_limit_per_second` / `_burst` | per-credential limit; anonymous requests and login attempts are keyed by client IP (port-independent); `0` disables it; burst must be ≥ rate |
 | `sync_mode` | `always` (fsync every write, default), `interval` (fsync at most every 200 ms), `never` (tests only) |
 | `read_only` | refuse all writes; the TTL sweeper must then be disabled |
+| `ruby_planner_path` | `null` by default; an absolute, trusted Ruby executable path enables experimental document queries. The Docker image includes Debian's Ruby runtime; set this to `/usr/bin/ruby` only when enabling the feature intentionally. The Docker persistence test exercises the authenticated Ruby-plan → Rust-validation/execution path. |
+| `lua_execution_enabled` | `false` by default; enables the bounded, admin-only Lua mutation endpoint |
 | `cors_origins` | extra allowed origins for browser clients (same origin is always allowed) |
 | `pricing_seed` | fixed seed for reproducible pricing; `null` = OS entropy |
 | `ttl_sweep_interval_ms` | background expiry sweep; `null` disables it |
@@ -177,13 +181,27 @@ exits; unknown keys in the file are rejected so typos cannot silently change beh
 | `auth_path` / `pricing_audit_path` | override the default locations inside the data dir |
 | `workers` | HTTP worker threads (1–512) |
 
+When enabled, `POST /v1/lua/execute` runs one caller-supplied Lua chunk without a
+database handle, then validates and atomically submits its `put`/`delete` result through
+the normal storage batch path. It is not a trigger/function catalog and provides no
+Lua-side database reads. See [API.md](API.md#controlled-lua-mutation-scripts) for
+runtime limits and the exact return schema. Keep it disabled unless this execution
+capability is intentionally granted to administrators.
+
 ### Sync modes
 
 | Mode | Guarantee |
 | --- | --- |
-| `always` | a completed write is on stable storage; survives a power cut |
-| `interval` | `fsync` at most every 200 ms; a crash can lose the last few writes |
-| `never` | no explicit `fsync`: relies on the OS page cache — tests and benchmarks only |
+| `always` | a write is acknowledged only after `sync_data` succeeds. This depends on the OS, filesystem, device, and controller honoring flush requests; it is not a universal power-loss guarantee. |
+| `interval` | `sync_data` is attempted at most every 200 ms; writes since the last successful sync can be lost after a process/OS failure. |
+| `never` | no explicit WAL sync; tests and benchmarks only. |
+
+If a WAL append or sync fails after a write may have reached the log, the operation
+returns `commit_outcome_unknown`. The engine rolls back its in-memory mutation, enters a
+failed state, and rejects subsequent document reads and writes until it is closed and
+reopened. Recovery then determines whether the complete record was present. Callers
+must inspect the reopened state before retrying; a returned I/O error in this window is
+not proof that the write was absent.
 
 ## 3. Routine operations
 
@@ -203,6 +221,16 @@ wire into a load balancer.
 
 ### Credentials
 
+The credential file is limited to 16 MiB. Files exceeding that limit, invalid UTF-8,
+and read errors prevent authentication rather than retaining cached credentials.
+Existing installations with larger credential files must reduce their size before
+upgrading. Changes invalidate existing in-memory sessions.
+
+The Rust client accepts at most 16 MiB per response body by default and at most
+16 KiB for the status line and headers together. Applications expecting larger
+responses can set a body limit with `Client::with_max_response_bytes`; responses
+without a valid single `Content-Length` or with `Transfer-Encoding` are rejected.
+
 ```bash
 preppydb token create --data-dir ./data --name ci --role write --expires-days 30
 preppydb token list   --data-dir ./data
@@ -216,6 +244,12 @@ mode 0600). Sessions are memory-only and end on restart.
 
 ### Backups
 
+Backup holds an engine read lock while it copies and verifies the archive, so writes
+and checkpoints wait until it finishes. The temporary archive must not already exist;
+an interrupted operation may require an operator to inspect and remove that temporary
+file before retrying. This does not protect against external modification of database
+files outside the engine.
+
 ```bash
 # Archive (takes a checkpoint first unless --no-checkpoint)
 preppydb backup --data-dir ./data --out /backups/preppy-$(date +%F).bak
@@ -228,9 +262,25 @@ preppydb restore --archive /backups/preppy-2026-11-04.bak --target /srv/preppydb
 ```
 
 The archive contains a header, every file with a SHA-256, and a trailing whole-file
-SHA-256. `restore` verifies every checksum **before** writing anything; a corrupt archive
-leaves the target untouched. Restoring over a live directory requires `--force`, which
-moves the old data to `<target>.replaced-<timestamp>` instead of deleting it.
+SHA-256. `backup-verify` validates both the archive checksums and the embedded database
+by extracting it to an exclusive temporary directory and opening/verifying it with strict
+read-only recovery. `restore` performs that validation, copies and rechecks each member,
+then strictly opens/verifies the staged database before publishing it; an invalid archive
+or database leaves the target untouched. Verification requires temporary disk space
+approximately equal to the database copy. Files and staged directories are synced before
+publication, and the parent directory is synced after each publication rename where the
+platform supports it. Restoring over an existing target requires `--force`, which moves
+the old data to `<target>.replaced-<timestamp>/previous` instead of deleting it. The
+reserved directory must not already exist. Replacing an existing target uses two renames,
+so a process crash between them can leave the original under that `previous` path and the
+target temporarily absent. A final parent-directory sync failure returns
+`restore_outcome_unknown`; inspect both the target and retained `previous` directory
+before retrying. Keep the parent directory protected from untrusted local changes.
+An interrupted publication leaves a sibling restore-intent file; database open fails
+with `recovery_required` rather than creating an empty replacement. Inspect the intent,
+target, staged directory and retained `previous` directory before removing the intent.
+Windows directory-sync support is limited, and this is not a universal atomic exchange
+or power-loss guarantee.
 
 Backing up over HTTP (admin token required):
 
@@ -257,16 +307,23 @@ The server does this automatically according to `checkpoint_every_mutations` and
 
 ### Recovery
 
-Power loss or a kill -9 leaves the directory recoverable:
+After a process crash such as `kill -9`, startup validates and replays the persisted WAL:
 
 1. On start the engine replays WAL segments after the last snapshot.
 2. A torn final record is truncated and reported in
    `<data-dir>/recovery-report-<ms>.json` and via `GET /v1/admin/recovery`.
-3. Corruption in the *middle* of a WAL aborts startup (`strict`). Restoring a backup is
-   the right answer. If the tail is known to be junk and the operator accepts the loss,
-   run any engine-opening command with `--repair`, e.g.
+3. A short final WAL segment header with no record frames is treated as interrupted
+   segment creation and removed on writable open after the preceding WAL history is
+   validated. A non-final short header or a complete invalid header fails closed;
+   read-only open does not repair it.
+4. A complete frame with a bad checksum, a sequence gap, or a sequence regression
+   aborts startup (`strict`). If the damaged suffix is understood and its loss accepted,
+   a writable open with `--repair` truncates at the first bad/discontinuous record and
+   removes every later WAL segment. This is destructive repair, not a substitute for
+   restoring a verified backup. For example:
    `preppydb checkpoint --data-dir ./data --repair` (or start the server with
-   `"repair": "truncate"`). `preppydb wal` only *reports* what it finds.
+   `"repair": "truncate"`). Read-only opens never perform corruption repair;
+   `preppydb wal` only *reports* what it finds.
 
 ### Upgrades
 

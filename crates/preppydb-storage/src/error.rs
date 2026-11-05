@@ -22,6 +22,9 @@ pub mod codes {
     pub const UNSUPPORTED: &str = "unsupported";
     pub const INTERNAL: &str = "internal";
     pub const READ_ONLY: &str = "read_only";
+    pub const COMMIT_OUTCOME_UNKNOWN: &str = "commit_outcome_unknown";
+    pub const RESTORE_OUTCOME_UNKNOWN: &str = "restore_outcome_unknown";
+    pub const RECOVERY_REQUIRED: &str = "recovery_required";
 }
 
 /// Storage engine error.
@@ -69,6 +72,13 @@ pub enum DbError {
     Config(String),
     Locked(String),
     ReadOnly(String),
+    /// WAL append/sync failed after a write may have reached the log. The caller
+    /// must reopen and inspect state before deciding whether to retry.
+    CommitOutcomeUnknown(String),
+    /// Restore publication completed but its directory durability barrier failed.
+    RestoreOutcomeUnknown(String),
+    /// A durable restore intent needs operator inspection before opening the database.
+    RecoveryRequired(String),
     Unsupported(String),
     Internal(String),
 }
@@ -89,6 +99,9 @@ impl DbError {
             DbError::Config(_) => codes::CONFIG_ERROR,
             DbError::Locked(_) => codes::LOCKED,
             DbError::ReadOnly(_) => codes::READ_ONLY,
+            DbError::CommitOutcomeUnknown(_) => codes::COMMIT_OUTCOME_UNKNOWN,
+            DbError::RestoreOutcomeUnknown(_) => codes::RESTORE_OUTCOME_UNKNOWN,
+            DbError::RecoveryRequired(_) => codes::RECOVERY_REQUIRED,
             DbError::Unsupported(_) => codes::UNSUPPORTED,
             DbError::Internal(_) => codes::INTERNAL,
         }
@@ -167,6 +180,13 @@ impl fmt::Display for DbError {
             DbError::Config(message) => write!(f, "configuration error: {message}"),
             DbError::Locked(message) => write!(f, "database is locked: {message}"),
             DbError::ReadOnly(message) => write!(f, "database is read-only: {message}"),
+            DbError::CommitOutcomeUnknown(message) => {
+                write!(f, "commit outcome is unknown: {message}")
+            }
+            DbError::RestoreOutcomeUnknown(message) => {
+                write!(f, "restore outcome is unknown: {message}")
+            }
+            DbError::RecoveryRequired(message) => write!(f, "recovery required: {message}"),
             DbError::Unsupported(message) => write!(f, "unsupported operation: {message}"),
             DbError::Internal(message) => write!(f, "internal error: {message}"),
         }
