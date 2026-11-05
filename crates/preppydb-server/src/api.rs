@@ -1701,6 +1701,9 @@ fn db_error(error: DbError) -> Response {
         DbError::Io { .. } => 500,
         DbError::Config(_) => 500,
         DbError::Locked(_) => 503,
+        DbError::CommitOutcomeUnknown(_)
+        | DbError::RestoreOutcomeUnknown(_)
+        | DbError::RecoveryRequired(_) => 503,
         DbError::ReadOnly(_) => 403,
         DbError::Unsupported(_) => 501,
         DbError::Internal(_) => 500,
@@ -1825,6 +1828,12 @@ mod tests {
         });
         assert_eq!(response.status, 409);
         let response = db_error(DbError::Locked("held".into()));
+        assert_eq!(response.status, 503);
+        let response = db_error(DbError::CommitOutcomeUnknown("reopen required".into()));
+        assert_eq!(response.status, 503);
+        let response = db_error(DbError::RestoreOutcomeUnknown("inspect target".into()));
+        assert_eq!(response.status, 503);
+        let response = db_error(DbError::RecoveryRequired("inspect restore intent".into()));
         assert_eq!(response.status, 503);
         let response = db_error(DbError::ReadOnly("x".into()));
         assert_eq!(response.status, 403);
