@@ -74,18 +74,30 @@ impl SnapshotHeader {
             .ok_or_else(|| DbError::corrupt("snapshot header", "invalid format version"))?;
         Ok(SnapshotHeader {
             format_version,
-            generation: value
-                .get("generation")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            seq: value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
-            created_at: value.get_i64("created_at").unwrap_or(0),
-            doc_count: value.get("doc_count").and_then(|v| v.as_u64()).unwrap_or(0),
-            collections: value
-                .get("collections")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            generation: snapshot_header_u64(value, "generation")?,
+            seq: snapshot_header_u64(value, "seq")?,
+            created_at: snapshot_header_i64(value, "created_at")?,
+            doc_count: snapshot_header_u64(value, "doc_count")?,
+            collections: snapshot_header_u64(value, "collections")?,
         })
+    }
+}
+
+fn snapshot_header_u64(value: &Json, field: &str) -> Result<u64> {
+    match value.get(field) {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| DbError::corrupt("snapshot header", format!("invalid '{field}'"))),
+    }
+}
+
+fn snapshot_header_i64(value: &Json, field: &str) -> Result<i64> {
+    match value.get(field) {
+        None => Ok(0),
+        Some(value) => value
+            .as_i64()
+            .ok_or_else(|| DbError::corrupt("snapshot header", format!("invalid '{field}'"))),
     }
 }
 
@@ -527,6 +539,65 @@ mod tests {
         assert_eq!(loaded.collections[0].1[0].0, "molly");
         assert_eq!(loaded.collections[0].1[0].1.version, 3);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_header_rejects_present_invalid_metadata() {
+        let valid = SnapshotHeader {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            generation: 1,
+            seq: 1,
+            created_at: 1,
+            doc_count: 1,
+            collections: 1,
+        }
+        .to_json();
+        for (field, invalid) in [
+            ("generation", Json::str("bad")),
+            ("seq", Json::str("bad")),
+            ("created_at", Json::str("bad")),
+            ("doc_count", Json::str("bad")),
+            ("collections", Json::str("bad")),
+        ] {
+            let malformed = valid.clone().with(field, invalid);
+            assert!(
+                SnapshotHeader::from_json(&malformed).is_err(),
+                "accepted {field}"
+            );
+        }
+
+        let legacy = Json::obj().with("format_version", Json::uint(SNAPSHOT_FORMAT_VERSION as u64));
+        assert_eq!(SnapshotHeader::from_json(&legacy).unwrap().seq, 0);
+    }
+
+    #[test]
+    fn snapshot_reader_rejects_invalid_header_with_intact_body_digest() {
+        let dir = tempdir("invalid-header-metadata");
+        let path = dir.join("snap-1.pdb");
+        write_snapshot(&path, 1, 42, 1234, &sample()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let header_start = SNAPSHOT_MAGIC.len() + 4;
+        let header_len = u32::from_le_bytes(
+            bytes[SNAPSHOT_MAGIC.len()..header_start]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let header_end = header_start + header_len;
+        let malformed =
+            preppydb_json::parse(std::str::from_utf8(&bytes[header_start..header_end]).unwrap())
+                .unwrap()
+                .with("created_at", Json::str("bad"))
+                .to_string();
+        let mut forged = Vec::new();
+        forged.extend_from_slice(SNAPSHOT_MAGIC);
+        forged.extend_from_slice(&(malformed.len() as u32).to_le_bytes());
+        forged.extend_from_slice(malformed.as_bytes());
+        forged.extend_from_slice(&bytes[header_end..]);
+        std::fs::write(&path, forged).unwrap();
+
+        let error = read_snapshot(&path).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

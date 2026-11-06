@@ -208,8 +208,18 @@ impl Manifest {
             last_seq,
             snapshot,
             wal,
-            created_at: value.get_i64("created_at").unwrap_or(0),
-            updated_at: value.get_i64("updated_at").unwrap_or(0),
+            created_at: match value.get("created_at") {
+                None => 0,
+                Some(value) => value
+                    .as_i64()
+                    .ok_or_else(|| DbError::corrupt("manifest", "invalid 'created_at'"))?,
+            },
+            updated_at: match value.get("updated_at") {
+                None => 0,
+                Some(value) => value
+                    .as_i64()
+                    .ok_or_else(|| DbError::corrupt("manifest", "invalid 'updated_at'"))?,
+            },
         })
     }
 
@@ -813,6 +823,21 @@ mod tests {
                     .with("bytes", Json::uint(100)),
             );
         assert!(Manifest::from_json(&inconsistent_snapshot).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_present_invalid_timestamps() {
+        let valid = Manifest::default().to_json();
+        for field in ["created_at", "updated_at"] {
+            let malformed = valid.clone().with(field, Json::str("bad"));
+            assert!(Manifest::from_json(&malformed).is_err(), "accepted {field}");
+        }
+        let mut legacy = valid;
+        legacy.remove_key("created_at");
+        legacy.remove_key("updated_at");
+        let loaded = Manifest::from_json(&legacy).unwrap();
+        assert_eq!(loaded.created_at, 0);
+        assert_eq!(loaded.updated_at, 0);
     }
 
     #[test]
