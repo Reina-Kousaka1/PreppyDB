@@ -195,9 +195,29 @@ fn collect_members(root: &Path) -> Result<Vec<PathBuf>> {
                     "symbolic links are not valid backup members",
                 ));
             }
-            if file_type.is_file() && !member.extension().map(|ext| ext == "tmp").unwrap_or(false) {
-                files.push(member);
+            if !file_type.is_file() {
+                return Err(DbError::corrupt(
+                    member.display().to_string(),
+                    "backup member is not a regular file",
+                ));
             }
+            if member.extension().is_some_and(|ext| ext == "tmp") {
+                // Interrupted snapshot/manifest publication may leave temporary files;
+                // they are intentionally not part of a consistent backup.
+                continue;
+            }
+            let relative = member
+                .strip_prefix(root)
+                .map_err(|_| DbError::Internal("member outside the data directory".into()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !valid_member_path(&relative) {
+                return Err(DbError::corrupt(
+                    member.display().to_string(),
+                    "unexpected file in database storage directory",
+                ));
+            }
+            files.push(member);
         }
         files.sort();
         members.extend(files);
@@ -1550,6 +1570,19 @@ mod tests {
         .unwrap();
         std::fs::create_dir(data.join("wal")).unwrap();
         assert!(collect_members(&data).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_member_collection_rejects_storage_directories_that_could_hide_data() {
+        let root = tempdir("backup-hidden-storage-entry");
+        let data = root.join("data");
+        std::fs::create_dir_all(data.join("snap")).unwrap();
+        std::fs::create_dir_all(data.join("wal/000000000001.wal")).unwrap();
+
+        let error = collect_members(&data).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
