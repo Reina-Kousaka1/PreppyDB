@@ -296,6 +296,17 @@ do
 end
 
 do
+  local transport = recorder({
+    json_response(200, { data = { token = "session\r\nX-Injected: yes" } }),
+  })
+  local client = assert(preppydb.new({ url = "http://127.0.0.1:7077", transport = transport }))
+  local outcome, err = client:login("admin", "correct horse battery")
+  t:equal(outcome, nil, "login rejects an injected session token")
+  t:equal(err and err.code, "invalid_response", "invalid session token is a protocol error")
+  t:equal(client.token, nil, "invalid login token is never stored")
+end
+
+do
   -- Verify maps the 409-with-findings case to ok=false instead of an error.
   local client = new_client({
     { status = 409, body = '{"error":{"code":"conflict","message":"3 issues"}}' },
