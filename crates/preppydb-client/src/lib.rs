@@ -120,7 +120,7 @@ fn valid_header_name(value: &str) -> bool {
 }
 
 /// A blocking HTTP client for one PreppyDB server.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     host: String,
     port: u16,
@@ -129,6 +129,19 @@ pub struct Client {
     token: Option<String>,
     timeout: Duration,
     max_response_bytes: usize,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("prefix", &self.prefix)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("timeout", &self.timeout)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .finish()
+    }
 }
 
 impl Client {
@@ -745,6 +758,14 @@ mod tests {
         let client = Client::new("http://example.org/api/", "t").unwrap();
         assert_eq!(client.port, 80);
         assert_eq!(client.prefix, "/api");
+    }
+
+    #[test]
+    fn client_debug_redacts_bearer_token() {
+        let client = Client::new("http://127.0.0.1:7070", "top-secret-bearer").unwrap();
+        let debug = format!("{client:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("top-secret-bearer"));
     }
 
     #[test]

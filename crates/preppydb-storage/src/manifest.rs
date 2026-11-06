@@ -397,6 +397,13 @@ impl Manifest {
     /// The destination must not exist, so a crash cannot expose a missing or
     /// partially replaced previous manifest.
     pub fn publish_generation(&mut self, dir: &Path) -> Result<()> {
+        self.publish_generation_with_directory_sync(dir, fsync_dir)
+    }
+
+    fn publish_generation_with_directory_sync<F>(&mut self, dir: &Path, sync_dir: F) -> Result<()>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
         if self.generation > MAX_MANIFEST_GENERATION {
             return Err(DbError::LimitExceeded {
                 limit: "manifest_generation",
@@ -450,7 +457,7 @@ impl Manifest {
                 err,
             )
         })?;
-        fsync_dir(dir)
+        sync_dir(dir)
     }
 
     /// Atomically persist the manifest.
@@ -606,6 +613,58 @@ mod tests {
             "generation file must supersede the legacy manifest"
         );
         assert!(Manifest::generation_path(&dir, 2).is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn generation_directory_sync_failure_keeps_prior_and_new_manifests() {
+        let dir = tempdir("generation-directory-sync-failure");
+        let mut prior = Manifest {
+            generation: 1,
+            last_seq: 10,
+            snapshot: Some(SnapshotRef {
+                file: "snap-000000000001.pdb".into(),
+                seq: 10,
+                generation: 1,
+                sha256: "a".repeat(64),
+                doc_count: 0,
+                created_at: 1,
+                bytes: 1,
+            }),
+            ..Default::default()
+        };
+        prior.publish_generation(&dir).unwrap();
+
+        let mut next = Manifest {
+            generation: 2,
+            last_seq: 20,
+            snapshot: Some(SnapshotRef {
+                file: "snap-000000000002.pdb".into(),
+                seq: 20,
+                generation: 2,
+                sha256: "b".repeat(64),
+                doc_count: 0,
+                created_at: 2,
+                bytes: 1,
+            }),
+            ..Default::default()
+        };
+        let error = next
+            .publish_generation_with_directory_sync(&dir, |_| {
+                Err(DbError::io(
+                    "injected manifest directory sync failure",
+                    std::io::Error::other("injected"),
+                ))
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code(), crate::error::codes::IO_ERROR);
+        assert!(Manifest::generation_path(&dir, 1).is_file());
+        assert!(Manifest::generation_path(&dir, 2).is_file());
+        assert!(!dir.join(".MANIFEST-000000000002.json.tmp").exists());
+        let loaded = Manifest::load(&dir).unwrap().unwrap();
+        assert_eq!(loaded.generation, 2);
+        assert_eq!(loaded.last_seq, 20);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
