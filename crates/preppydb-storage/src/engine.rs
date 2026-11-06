@@ -2413,6 +2413,48 @@ mod document_undo_tests {
     }
 
     #[test]
+    fn synchronous_commit_sync_failure_is_unknown_and_requires_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-sync-commit-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "key", Json::str("old"), PutOptions::default())
+            .unwrap();
+
+        engine.lock_mutex(&engine.writer).inject_sync_failure();
+        let error = engine
+            .put("c", "key", Json::str("new"), PutOptions::default())
+            .unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::COMMIT_OUTCOME_UNKNOWN);
+        assert!(matches!(
+            engine.get("c", "key"),
+            Err(DbError::CommitOutcomeUnknown(_))
+        ));
+        assert!(matches!(
+            engine.put("c", "other", Json::Null, PutOptions::default()),
+            Err(DbError::CommitOutcomeUnknown(_))
+        ));
+        drop(engine);
+
+        // The failed barrier leaves the outcome uncertain. Drop may subsequently sync
+        // the complete WAL frame; after reopen recovery is the source of truth.
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        assert_eq!(
+            reopened.get("c", "key").unwrap().value.as_str(),
+            Some("new")
+        );
+        assert!(reopened.get_opt("c", "other").unwrap().is_none());
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn exhausted_wal_sequence_returns_a_limit_error_without_mutating() {
         let dir = std::env::temp_dir().join(format!(
             "preppydb-sequence-overflow-{}-{}",
