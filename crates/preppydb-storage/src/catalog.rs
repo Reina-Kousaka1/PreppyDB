@@ -41,15 +41,9 @@ impl IndexMeta {
         Ok(IndexMeta {
             name: name.to_string(),
             field: field.to_string(),
-            unique: value
-                .get("unique")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            sparse: value
-                .get("sparse")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-            created_at: value.get_i64("created_at").unwrap_or(0),
+            unique: optional_bool(value, "unique", false)?,
+            sparse: optional_bool(value, "sparse", true)?,
+            created_at: optional_i64(value, "created_at")?.unwrap_or(0),
         })
     }
 }
@@ -112,22 +106,56 @@ impl CollectionMeta {
             .get_str("name")
             .ok_or_else(|| DbError::validation("collection is missing 'name'"))?;
         validate_name("collection", name)?;
-        let mut meta = CollectionMeta::new(name, value.get_i64("created_at").unwrap_or(0));
-        meta.updated_at = value.get_i64("updated_at").unwrap_or(meta.created_at);
+        let mut meta = CollectionMeta::new(name, optional_i64(value, "created_at")?.unwrap_or(0));
+        meta.updated_at = optional_i64(value, "updated_at")?.unwrap_or(meta.created_at);
         meta.schema = match value.get("schema") {
             None | Some(Json::Null) => None,
             Some(schema) => Some(schema.clone()),
         };
-        meta.max_docs = value.get("max_docs").and_then(|v| v.as_u64());
-        meta.max_doc_bytes = value.get("max_doc_bytes").and_then(|v| v.as_u64());
-        meta.default_ttl_ms = value.get("default_ttl_ms").and_then(|v| v.as_i64());
-        if let Some(indexes) = value.get("indexes").and_then(|v| v.as_array()) {
+        meta.max_docs = optional_u64(value, "max_docs")?;
+        meta.max_doc_bytes = optional_u64(value, "max_doc_bytes")?;
+        meta.default_ttl_ms = optional_i64(value, "default_ttl_ms")?;
+        if let Some(indexes) = value.get("indexes") {
+            let indexes = indexes
+                .as_array()
+                .ok_or_else(|| DbError::corrupt("catalog", "indexes must be an array"))?;
             for entry in indexes {
                 let index = IndexMeta::from_json(entry)?;
-                meta.indexes.insert(index.name.clone(), index);
+                if meta.indexes.insert(index.name.clone(), index).is_some() {
+                    return Err(DbError::corrupt("catalog", "duplicate index name"));
+                }
             }
         }
         Ok(meta)
+    }
+}
+
+fn optional_u64(value: &Json, field: &str) -> Result<Option<u64>> {
+    match value.get(field) {
+        None | Some(Json::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| DbError::corrupt("catalog", format!("invalid {field}"))),
+    }
+}
+
+fn optional_i64(value: &Json, field: &str) -> Result<Option<i64>> {
+    match value.get(field) {
+        None | Some(Json::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| DbError::corrupt("catalog", format!("invalid {field}"))),
+    }
+}
+
+fn optional_bool(value: &Json, field: &str, default: bool) -> Result<bool> {
+    match value.get(field) {
+        None => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| DbError::corrupt("catalog", format!("invalid {field}"))),
     }
 }
 
@@ -192,5 +220,67 @@ mod tests {
         let encoded = meta.to_json();
         let decoded = CollectionMeta::from_json(&encoded).unwrap();
         assert_eq!(meta, decoded);
+    }
+
+    #[test]
+    fn persisted_catalog_rejects_malformed_limits_and_index_flags() {
+        let meta = CollectionMeta::new("profiles", 1000).to_json();
+        for (field, value) in [
+            ("max_docs", Json::str("unbounded")),
+            ("max_doc_bytes", Json::str("unbounded")),
+            ("default_ttl_ms", Json::str("never")),
+            ("indexes", Json::str("none")),
+        ] {
+            let mut forged = meta.clone();
+            forged.set(field, value);
+            assert!(CollectionMeta::from_json(&forged).is_err(), "{field}");
+        }
+
+        let index = IndexMeta {
+            name: "by_name".into(),
+            field: "name".into(),
+            unique: true,
+            sparse: false,
+            created_at: 1000,
+        }
+        .to_json();
+        for field in ["unique", "sparse"] {
+            let mut forged = index.clone();
+            forged.set(field, Json::str("invalid"));
+            assert!(IndexMeta::from_json(&forged).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn persisted_catalog_rejects_duplicate_index_names() {
+        let index = IndexMeta {
+            name: "by_name".into(),
+            field: "name".into(),
+            unique: true,
+            sparse: false,
+            created_at: 1000,
+        }
+        .to_json();
+        let mut meta = CollectionMeta::new("profiles", 1000).to_json();
+        meta.set("indexes", Json::Array(vec![index.clone(), index]));
+        assert!(CollectionMeta::from_json(&meta).is_err());
+    }
+
+    #[test]
+    fn persisted_catalog_preserves_defaults_for_absent_optional_fields() {
+        let meta =
+            CollectionMeta::from_json(&Json::obj().with("name", Json::str("profiles"))).unwrap();
+        assert_eq!(meta.max_docs, None);
+        assert_eq!(meta.max_doc_bytes, None);
+        assert_eq!(meta.default_ttl_ms, None);
+        assert!(meta.indexes.is_empty());
+        let index = IndexMeta::from_json(
+            &Json::obj()
+                .with("name", Json::str("by_name"))
+                .with("field", Json::str("name")),
+        )
+        .unwrap();
+        assert!(!index.unique);
+        assert!(index.sparse);
     }
 }
