@@ -1802,6 +1802,102 @@ fn second_writer_is_locked_out() {
 }
 
 #[test]
+fn read_only_open_does_not_create_a_missing_database() {
+    let dir = tempdir("readonly-missing-database");
+    std::fs::remove_dir(&dir).unwrap();
+    let mut cfg = EngineConfig::new(&dir);
+    cfg.read_only = true;
+
+    assert!(Engine::open(cfg).is_err());
+    assert!(
+        !dir.exists(),
+        "read-only open must not initialize missing database paths"
+    );
+}
+
+#[test]
+fn read_only_open_does_not_recreate_a_missing_wal_segment() {
+    let dir = tempdir("readonly-missing-wal");
+    {
+        let engine = open(&dir);
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "k", Json::str("v"), PutOptions::default())
+            .unwrap();
+    }
+    for segment in wal::list_segments(&dir.join("wal")).unwrap() {
+        std::fs::remove_file(segment).unwrap();
+    }
+    let mut cfg = EngineConfig::new(&dir);
+    cfg.read_only = true;
+
+    assert!(Engine::open(cfg).is_err());
+    assert!(wal::list_segments(&dir.join("wal")).unwrap().is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn read_only_open_does_not_recreate_an_unused_snapshot_directory() {
+    let dir = tempdir("readonly-missing-snapshot-dir");
+    {
+        let engine = open(&dir);
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "k", Json::str("v"), PutOptions::default())
+            .unwrap();
+    }
+    std::fs::remove_dir(dir.join("snap")).unwrap();
+    let mut cfg = EngineConfig::new(&dir);
+    cfg.read_only = true;
+
+    let engine = Engine::open(cfg).unwrap();
+    assert_eq!(engine.get("c", "k").unwrap().value.as_str(), Some("v"));
+    drop(engine);
+    assert!(!dir.join("snap").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn read_only_open_never_rotates_an_oversized_existing_segment() {
+    let dir = tempdir("readonly-no-rotate");
+    {
+        let engine = open(&dir);
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "k", Json::str("value"), PutOptions::default())
+            .unwrap();
+    }
+    let wal_dir = dir.join("wal");
+    let before = wal::list_segments(&wal_dir).unwrap();
+    let lengths: Vec<_> = before
+        .iter()
+        .map(|path| std::fs::metadata(path).unwrap().len())
+        .collect();
+    let mut cfg = EngineConfig::new(&dir);
+    cfg.read_only = true;
+    cfg.max_segment_bytes = 1;
+
+    let engine = Engine::open(cfg).unwrap();
+    assert_eq!(engine.get("c", "k").unwrap().value.as_str(), Some("value"));
+    drop(engine);
+    assert_eq!(wal::list_segments(&wal_dir).unwrap(), before);
+    assert_eq!(
+        before
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .collect::<Vec<_>>(),
+        lengths
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn verify_reports_healthy_database() {
     let dir = tempdir("verify");
     let engine = open(&dir);

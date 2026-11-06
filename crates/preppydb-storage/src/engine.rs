@@ -345,6 +345,21 @@ impl DataPaths {
     }
 }
 
+fn require_existing_directory(path: &Path, optional: bool) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => Err(DbError::corrupt(
+            path.display().to_string(),
+            "database storage path is not a real directory",
+        )),
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(DbError::io(
+            format!("opening existing database directory {}", path.display()),
+            error,
+        )),
+    }
+}
+
 /// The PreppyDB storage engine.
 pub struct Engine {
     cfg: EngineConfig,
@@ -485,9 +500,15 @@ impl Engine {
         }
         crate::backup::ensure_no_restore_intent(&cfg.path)?;
         let paths = DataPaths::new(cfg.path.clone());
-        create_private_dir(&paths.root)?;
-        create_private_dir(&paths.wal_dir)?;
-        create_private_dir(&paths.snap_dir)?;
+        if cfg.read_only {
+            require_existing_directory(&paths.root, false)?;
+            require_existing_directory(&paths.wal_dir, false)?;
+            require_existing_directory(&paths.snap_dir, true)?;
+        } else {
+            create_private_dir(&paths.root)?;
+            create_private_dir(&paths.wal_dir)?;
+            create_private_dir(&paths.snap_dir)?;
+        }
 
         let lock = if cfg.take_lock && !cfg.read_only {
             Some(FileLock::acquire(&paths.root)?)
@@ -504,12 +525,17 @@ impl Engine {
             None => {
                 // A missing manifest is normal for a new database, but never evidence
                 // that previously retired snapshot/WAL history can be discarded.
-                let has_snapshots = std::fs::read_dir(&paths.snap_dir)
-                    .map_err(|err| DbError::io("listing snapshots", err))?
-                    .next()
-                    .transpose()
-                    .map_err(|err| DbError::io("reading snapshot entry", err))?
-                    .is_some();
+                let has_snapshots = match std::fs::read_dir(&paths.snap_dir) {
+                    Ok(mut entries) => entries
+                        .next()
+                        .transpose()
+                        .map_err(|err| DbError::io("reading snapshot entry", err))?
+                        .is_some(),
+                    Err(error) if cfg.read_only && error.kind() == std::io::ErrorKind::NotFound => {
+                        false
+                    }
+                    Err(error) => return Err(DbError::io("listing snapshots", error)),
+                };
                 if has_snapshots {
                     return Err(DbError::corrupt(
                         "manifest",
@@ -765,13 +791,28 @@ impl Engine {
         } else {
             last_segment_index
         };
-        let mut writer = WalWriter::open(
-            &paths.wal_dir,
-            start_index,
-            cfg.max_segment_bytes,
-            cfg.sync_mode,
-        )?;
-        if writer.current_len() > cfg.max_segment_bytes {
+        if cfg.read_only && last_segment_index == 0 {
+            return Err(DbError::corrupt(
+                "write-ahead log",
+                "read-only open requires an existing WAL segment",
+            ));
+        }
+        let mut writer = if cfg.read_only {
+            WalWriter::open_read_only(
+                &paths.wal_dir,
+                start_index,
+                cfg.max_segment_bytes,
+                cfg.sync_mode,
+            )?
+        } else {
+            WalWriter::open(
+                &paths.wal_dir,
+                start_index,
+                cfg.max_segment_bytes,
+                cfg.sync_mode,
+            )?
+        };
+        if !cfg.read_only && writer.current_len() > cfg.max_segment_bytes {
             writer.rotate()?;
         }
 

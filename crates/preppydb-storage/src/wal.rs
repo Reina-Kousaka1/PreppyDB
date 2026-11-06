@@ -217,6 +217,57 @@ impl WalWriter {
         })
     }
 
+    /// Open an existing WAL segment without write access or initialization.
+    ///
+    /// Read-only database handles still keep the writer slot for shared engine
+    /// structure, but must never create a segment or write its header as a side effect.
+    pub fn open_read_only(
+        dir: &Path,
+        index: u64,
+        max_segment_bytes: u64,
+        sync_mode: SyncMode,
+    ) -> Result<WalWriter> {
+        let path = dir.join(segment_name(index));
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|err| DbError::io(format!("inspecting {}", path.display()), err))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(DbError::corrupt(
+                path.display().to_string(),
+                "WAL segment is not a regular file",
+            ));
+        }
+        let mut file = File::open(&path)
+            .map_err(|err| DbError::io(format!("opening {} read-only", path.display()), err))?;
+        let current_len = file
+            .metadata()
+            .map_err(|err| DbError::io("stat WAL segment", err))?
+            .len();
+        if current_len < WAL_HEADER_LEN {
+            return Err(DbError::corrupt(
+                path.display().to_string(),
+                "WAL segment is shorter than its header",
+            ));
+        }
+        file.seek(SeekFrom::End(0))
+            .map_err(|err| DbError::io("seeking WAL segment", err))?;
+        Ok(WalWriter {
+            dir: dir.to_path_buf(),
+            file,
+            current: path,
+            current_index: index,
+            current_len,
+            max_segment_bytes,
+            sync_mode,
+            unsynced_frames: 0,
+            #[cfg(test)]
+            fail_next_append: None,
+            #[cfg(test)]
+            fail_next_sync: false,
+            #[cfg(test)]
+            successful_syncs: 0,
+        })
+    }
+
     pub fn current_index(&self) -> u64 {
         self.current_index
     }
