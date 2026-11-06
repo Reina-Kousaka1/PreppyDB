@@ -255,6 +255,38 @@ impl Manifest {
 
     /// Load, returning `None` when the file does not exist yet.
     pub fn load(dir: &Path) -> Result<Option<Manifest>> {
+        Self::load_with_selection_hook(dir, |_| {})
+    }
+
+    fn load_with_selection_hook<F>(dir: &Path, mut after_select: F) -> Result<Option<Manifest>>
+    where
+        F: FnMut(&Path),
+    {
+        // Read-only engines do not take the writer lock. A concurrent checkpoint can
+        // therefore retire the generation selected below before we open it. Retry a
+        // bounded number of times so that this benign publication race cannot be
+        // mistaken for a database with no manifest (or an empty database).
+        const MAX_GENERATION_RETRIES: usize = 8;
+
+        for attempt in 0..MAX_GENERATION_RETRIES {
+            match Self::load_selected_generation(dir, &mut after_select)? {
+                SelectedManifest::Loaded(manifest) => return Ok(manifest),
+                SelectedManifest::Retry if attempt + 1 < MAX_GENERATION_RETRIES => continue,
+                SelectedManifest::Retry => {
+                    return Err(DbError::RecoveryRequired(
+                        "manifest generations changed repeatedly while opening; retry the open"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        unreachable!("bounded manifest retry loop always returns")
+    }
+
+    fn load_selected_generation<F>(dir: &Path, after_select: &mut F) -> Result<SelectedManifest>
+    where
+        F: FnMut(&Path),
+    {
         let mut newest: Option<(u64, PathBuf)> = None;
         for entry in std::fs::read_dir(dir)
             .map_err(|err| DbError::io(format!("listing {}", dir.display()), err))?
@@ -278,6 +310,7 @@ impl Manifest {
             Some((generation, path)) => (Some(generation), path),
             None => (None, Manifest::path(dir)),
         };
+        after_select(&path);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {
@@ -286,7 +319,13 @@ impl Manifest {
                     "manifest is not a regular file",
                 ));
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return if expected_generation.is_some() {
+                    Ok(SelectedManifest::Retry)
+                } else {
+                    Ok(SelectedManifest::Loaded(None))
+                };
+            }
             Err(err) => return Err(DbError::io("inspecting manifest file", err)),
         }
         let text = match std::fs::File::open(&path) {
@@ -308,7 +347,13 @@ impl Manifest {
                     )
                 })?
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return if expected_generation.is_some() {
+                    Ok(SelectedManifest::Retry)
+                } else {
+                    Ok(SelectedManifest::Loaded(None))
+                };
+            }
             Err(err) => return Err(DbError::io(format!("reading {}", path.display()), err)),
         };
         let value = preppydb_json::parse(&text).map_err(|err| {
@@ -321,7 +366,7 @@ impl Manifest {
                 "manifest filename generation does not match its contents",
             ));
         }
-        Ok(Some(manifest))
+        Ok(SelectedManifest::Loaded(Some(manifest)))
     }
 
     /// Publish an immutable checkpoint manifest at a generation-specific path.
@@ -415,6 +460,11 @@ impl Manifest {
     }
 }
 
+enum SelectedManifest {
+    Loaded(Option<Manifest>),
+    Retry,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +553,59 @@ mod tests {
             "generation file must supersede the legacy manifest"
         );
         assert!(Manifest::generation_path(&dir, 2).is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_retries_when_checkpoint_retires_selected_generation() {
+        let dir = tempdir("generation-retired-during-open");
+        for generation in [1, 2] {
+            let mut manifest = Manifest {
+                generation,
+                last_seq: generation * 10,
+                snapshot: Some(SnapshotRef {
+                    file: format!("snap-{:012}.pdb", generation),
+                    seq: generation * 10,
+                    generation,
+                    sha256: "a".repeat(64),
+                    doc_count: 0,
+                    created_at: 1,
+                    bytes: 1,
+                }),
+                ..Default::default()
+            };
+            manifest.publish_generation(&dir).unwrap();
+        }
+
+        let mut checkpoint_published = false;
+        let loaded = Manifest::load_with_selection_hook(&dir, |selected| {
+            if !checkpoint_published {
+                assert_eq!(selected, Manifest::generation_path(&dir, 2));
+                std::fs::remove_file(selected).unwrap();
+                let mut next = Manifest {
+                    generation: 3,
+                    last_seq: 30,
+                    snapshot: Some(SnapshotRef {
+                        file: "snap-000000000003.pdb".into(),
+                        seq: 30,
+                        generation: 3,
+                        sha256: "b".repeat(64),
+                        doc_count: 0,
+                        created_at: 2,
+                        bytes: 1,
+                    }),
+                    ..Default::default()
+                };
+                next.publish_generation(&dir).unwrap();
+                checkpoint_published = true;
+            }
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(checkpoint_published);
+        assert_eq!(loaded.generation, 3);
+        assert_eq!(loaded.last_seq, 30);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
