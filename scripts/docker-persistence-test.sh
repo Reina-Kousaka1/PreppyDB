@@ -14,18 +14,19 @@ IMAGE="${IMAGE:-preppydb:ci}"
 DATA_DIR="${DATA_DIR:-/var/lib/preppydb}"
 APP_UID="${APP_UID:-10001}"
 APP_GID="${APP_GID:-10001}"
-VOLUME="${VOLUME:-preppydb-persistence-test}"
-C1="preppydb-persist-1"
-C2="preppydb-persist-2"
+RUN_SUFFIX="${GITHUB_RUN_ID:-${CI_JOB_ID:-$(date +%s)-$$}}"
+VOLUME="${VOLUME:-preppydb-persistence-${RUN_SUFFIX}}"
+CONFIG_VOLUME="${VOLUME}-config"
+C1="${C1:-preppydb-persist-${RUN_SUFFIX}-1}"
+C2="${C2:-preppydb-persist-${RUN_SUFFIX}-2}"
 PORT="${PORT:-7077}"
 BASE="http://127.0.0.1:${PORT}"
 PASSWORD="persistence-test-password"
 
 cleanup() {
   docker rm -f "$C1" "$C2" > /dev/null 2>&1 || true
-  docker volume rm "$VOLUME" > /dev/null 2>&1 || true
+  docker volume rm "$VOLUME" "$CONFIG_VOLUME" > /dev/null 2>&1 || true
 }
-trap cleanup EXIT
 
 fail() {
   echo "FAIL: $*" >&2
@@ -55,8 +56,23 @@ wait_healthy() {
   fail "container $container never became healthy"
 }
 
-echo "==> cleaning up leftovers"
-cleanup
+for container in "$C1" "$C2"; do
+  if docker inspect "$container" > /dev/null 2>&1; then
+    fail "refusing to remove pre-existing container $container"
+  fi
+done
+for volume in "$VOLUME" "$CONFIG_VOLUME"; do
+  if docker volume inspect "$volume" > /dev/null 2>&1; then
+    fail "refusing to remove pre-existing volume $volume"
+  fi
+done
+trap cleanup EXIT
+
+echo "==> creating isolated test volumes"
+docker volume create "$CONFIG_VOLUME" > /dev/null
+printf '%s\n' '{"allow_public_bind":true,"ruby_planner_path":"/usr/bin/ruby"}' \
+  | docker run --rm -i --mount "source=${CONFIG_VOLUME},target=/config" \
+      --entrypoint /bin/sh "$IMAGE" -c 'cat > /config/config.json'
 
 echo "==> first start on a fresh volume"
 # The token is printed once; the container exits before serving (--init-only).
@@ -74,7 +90,10 @@ echo "    token length: ${#TOKEN}"
 
 # The entrypoint refuses to start when auth.json is missing and no password is given,
 # so subsequent runs only need the volume.
-docker run -d --name "$C1" -p "127.0.0.1:${PORT}:7077" -v "${VOLUME}:/var/lib/preppydb" "$IMAGE" > /dev/null
+docker run -d --name "$C1" -p "127.0.0.1:${PORT}:7077" \
+  -v "${VOLUME}:/var/lib/preppydb" \
+  --mount "source=${CONFIG_VOLUME},target=/run/preppydb-config,readonly" \
+  "$IMAGE" --config /run/preppydb-config/config.json > /dev/null
 wait_healthy "$C1"
 
 AUTH=(-H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json")
@@ -87,6 +106,16 @@ curl -fsS -X POST "${BASE}/v1/collections/persistence/documents" "${AUTH[@]}" \
 BEFORE=$(curl -fsS "${BASE}/v1/collections/persistence/documents/survivor" "${AUTH[@]}")
 echo "$BEFORE" | grep -q "still here" || fail "document was not stored: $BEFORE"
 
+echo "==> execute an indexed query through the bundled Ruby planner"
+curl -fsS -X POST "${BASE}/v1/collections/persistence/indexes" "${AUTH[@]}" \
+  -d '{"name":"by_message","field":"message","unique":false}' > /dev/null
+QUERY=$(curl -sS -X POST "${BASE}/v1/collections/persistence/query" "${AUTH[@]}" \
+  -d '{"version":1,"filter":{"field":"message","op":"eq","value":"still here"},"limit":10}')
+echo "$QUERY" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' \
+  && echo "$QUERY" | grep -q '"survivor"' \
+  || fail "Ruby planned query did not return the indexed document: $QUERY"
+echo "    Ruby planner and Rust indexed execution: passed"
+
 echo "==> checkpoint and restart the same container"
 curl -fsS -X POST "${BASE}/v1/admin/checkpoint" "${AUTH[@]}" > /dev/null
 docker restart "$C1" > /dev/null
@@ -97,7 +126,10 @@ echo "    restart: document survived"
 
 echo "==> remove the container, start a new one on the same volume"
 docker rm -f "$C1" > /dev/null
-docker run -d --name "$C2" -p "127.0.0.1:${PORT}:7077" -v "${VOLUME}:/var/lib/preppydb" "$IMAGE" > /dev/null
+docker run -d --name "$C2" -p "127.0.0.1:${PORT}:7077" \
+  -v "${VOLUME}:/var/lib/preppydb" \
+  --mount "source=${CONFIG_VOLUME},target=/run/preppydb-config,readonly" \
+  "$IMAGE" --config /run/preppydb-config/config.json > /dev/null
 wait_healthy "$C2"
 AFTER_RECREATE=$(curl -fsS "${BASE}/v1/collections/persistence/documents/survivor" "${AUTH[@]}")
 echo "$AFTER_RECREATE" | grep -q "still here" || fail "document lost after recreation: $AFTER_RECREATE"

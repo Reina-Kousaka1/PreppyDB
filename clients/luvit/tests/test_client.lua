@@ -293,4 +293,45 @@ do
   t:equal(calls[1].url, "http://db.local:8080/api/healthz", "prefix is kept")
 end
 
+do
+  local client = new_client({ { status = 200, body = '{"large":true}' } }, { max_response_bytes = 4 })
+  local _, err = client:health()
+  t:equal(err.code, "invalid_response", "custom transport response is checked before decoding")
+  local async_client = new_client({ { status = 200, body = '{"large":true}' } }, { max_response_bytes = 4 })
+  async_client:call_async("GET", "/healthz", nil, function(_, async_err)
+    t:equal(async_err.code, "invalid_response", "async response limit")
+  end)
+end
+
+do
+  local old_http = package.loaded.http
+  local destroyed = 0
+  package.loaded.http = {
+    parseUrl = function() return {} end,
+    request = function(_, on_response)
+      local handlers = {}
+      local response = {
+        statusCode = 200, headers = {},
+        on = function(_, event, callback) handlers[event] = callback end,
+        destroy = function() destroyed = destroyed + 1 end,
+      }
+      return {
+        on = function(self) return self end,
+        setTimeout = function() end,
+        done = function()
+          on_response(response)
+          handlers.data("123")
+          handlers.data("456")
+          handlers["end"]()
+        end,
+      }
+    end,
+  }
+  local client = assert(preppydb.new({ url = "http://localhost:7077", max_response_bytes = 4 }))
+  local _, err = client:health()
+  t:equal(err.code, "transport_error", "default transport stops oversized stream")
+  t:equal(destroyed, 1, "oversized stream destroyed once")
+  package.loaded.http = old_http
+end
+
 os.exit(t:report())

@@ -31,6 +31,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-x86_64
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
 
       - name: Formatting
         run: |
@@ -58,6 +61,12 @@ jobs:
               while IFS= read -r line; do echo "::error::$line"; done
             exit 1
           }
+
+      - name: Ruby planner and Rust bridge
+        run: |
+          ruby engines/ruby/test_planner.rb
+          cargo test -p preppydb-server --features ruby-integration-tests --test ruby_planner_integration --locked
+          cargo test -p preppydb-server --features ruby-integration-tests --test api_integration ruby_query_endpoint --locked
 
       - name: Build the binaries used by the end-to-end scripts
         run: cargo build --locked --bin preppydb-server --bin preppydb
@@ -88,6 +97,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-x86_64
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
 
       - name: Tests
         shell: pwsh
@@ -105,6 +117,13 @@ jobs:
             $hits | Select-Object -First 12 | ForEach-Object { Write-Host "::error::$_" }
             exit 1
           }
+
+      - name: Ruby planner and Rust bridge
+        shell: pwsh
+        run: |
+          ruby engines/ruby/test_planner.rb
+          cargo test -p preppydb-server --features ruby-integration-tests --test ruby_planner_integration --locked
+          cargo test -p preppydb-server --features ruby-integration-tests --test api_integration ruby_query_endpoint --locked
 
       - name: Upload test log on failure
         if: failure()
@@ -198,6 +217,7 @@ jobs:
       - name: Build for aarch64
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo build --workspace --locked --target aarch64-unknown-linux-gnu
 
       # These tests run under qemu-user, i.e. emulated ARM64 — not on a Raspberry Pi.
@@ -205,6 +225,7 @@ jobs:
       - name: Tests under qemu
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
           # The crash test re-executes the test binary; qemu-user cannot do that without
           # binfmt_misc. It runs on the native x86-64 and Windows jobs instead.
@@ -241,11 +262,27 @@ jobs:
 
       - name: Install lupa and luvit
         run: |
+          set -o pipefail
           python3 -m pip install --user lupa
-          # Luvit is optional: the runner falls back to the Python-bridged transport.
-          curl -sSL https://github.com/luvit/luvit/releases/download/2.18.1/luvit-2.18.1-linux-x86_64.tar.gz -o /tmp/luvit.tgz \
-            && tar xzf /tmp/luvit.tgz -C /tmp \
-            && sudo cp /tmp/luvit /usr/local/bin/luvit || echo "luvit download skipped"
+          RUNTIME=$(mktemp -d "$RUNNER_TEMP/preppydb-lua.XXXXXXXX")
+          curl -fLsS https://github.com/luvit/luvi/releases/download/v2.14.0/luvi-regular-Linux_x86_64 -o "$RUNTIME/luvi"
+          echo "f79614b208f7999030a13fca22ffeb91c3d880487be2b5b7e2425ab42ec7a1d0  $RUNTIME/luvi" | sha256sum -c -
+          chmod +x "$RUNTIME/luvi"
+          git clone --no-checkout https://github.com/luvit/lit.git "$RUNTIME/lit-src"
+          git -C "$RUNTIME/lit-src" checkout --detach 84fc5d729f1088b3b93bc9a55d1f7a245bca861d
+          git -C "$RUNTIME/lit-src" submodule update --init --recursive
+          test "$(git -C "$RUNTIME/lit-src" rev-parse HEAD)" = 84fc5d729f1088b3b93bc9a55d1f7a245bca861d
+          (cd "$RUNTIME/lit-src" && "$RUNTIME/luvi" . -- make . "$RUNTIME/lit" "$RUNTIME/luvi")
+          git clone --no-checkout https://github.com/luvit/luvit.git "$RUNTIME/luvit-src"
+          git -C "$RUNTIME/luvit-src" checkout --detach 8e5a6aca15b1e5bec2398a4dadc622aea4ead7ec
+          git -C "$RUNTIME/luvit-src" submodule update --init --recursive
+          test "$(git -C "$RUNTIME/luvit-src" rev-parse HEAD)" = 8e5a6aca15b1e5bec2398a4dadc622aea4ead7ec
+          (cd "$RUNTIME/luvit-src" && "$RUNTIME/lit" make . "$RUNTIME/luvit" "$RUNTIME/luvi")
+          "$RUNTIME/luvit" --version
+          echo "$RUNTIME" >> "$GITHUB_PATH"
+
+      - name: Real Luvit transport against local test server
+        run: luvit clients/luvit/tests/test_transport_live.lua
 
       - name: Build server
         run: cargo build --locked -p preppydb-server
@@ -263,23 +300,8 @@ jobs:
           PREPPYDB_URL=http://127.0.0.1:7077 PREPPYDB_TOKEN="$TOKEN" \
             python3 clients/luvit/tests/run_with_lupa.py --live
 
-      - name: Luvit transport (when luvit is available)
-        continue-on-error: true
-        run: |
-          if command -v luvit > /dev/null; then
-            DATA=$(mktemp -d)
-            ./target/debug/preppydb-server --data-dir "$DATA" --bootstrap-token ci --init-only > /tmp/init2.txt
-            TOKEN=$(sed -n '2p' /tmp/init2.txt)
-            ./target/debug/preppydb-server --data-dir "$DATA" --listen 127.0.0.1:7079 &
-            for i in $(seq 1 60); do
-              if curl -fsS http://127.0.0.1:7079/healthz > /dev/null; then break; fi
-              sleep 0.5
-            done
-            PREPPYDB_URL=http://127.0.0.1:7079 PREPPYDB_TOKEN="$TOKEN" \
-              luvit clients/luvit/tests/test_live.lua
-          else
-            echo "luvit not installed — skipping the native transport run"
-          fi
+      - name: Luvit transport against PreppyDB
+        run: bash clients/luvit/tests/run_live_server.sh
 
   # --------------------------------------------------------------------- Docker
   docker-images:

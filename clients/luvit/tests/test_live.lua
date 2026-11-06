@@ -10,7 +10,8 @@
 
 package.path = "./clients/luvit/?.lua;./clients/luvit/?/init.lua;" .. package.path
 
-local preppydb = require("preppydb")
+local loaded, preppydb = pcall(require, "../preppydb")
+if not loaded then preppydb = require("preppydb") end
 local harness = require("tests.harness")
 
 local url = os.getenv("PREPPYDB_URL")
