@@ -512,6 +512,9 @@ pub struct AuditLog {
     retained_bytes: usize,
     entry_count: u64,
     head_hash: String,
+    /// Persistence may have succeeded partially or fully even when append returned
+    /// an error. Require reopening and rescanning before this handle can be reused.
+    poisoned: bool,
 }
 
 /// Maximum serialized size of one audit record, including its line terminator.
@@ -687,6 +690,7 @@ impl AuditLog {
             retained_bytes: 0,
             entry_count: 0,
             head_hash: ZERO_AUDIT_HASH.to_string(),
+            poisoned: false,
         };
         let path = log.path.clone();
         let (entry_count, head_hash) = scan_audit_log(&path, |entry, size| {
@@ -712,6 +716,25 @@ impl AuditLog {
 
     /// Append an entry, chaining it to the previous one and flushing to disk.
     pub fn append(&mut self, kind: &str, at: i64, detail: Json) -> Result<AuditEntry> {
+        self.append_with_persist(kind, at, detail, persist_audit_line)
+    }
+
+    fn append_with_persist<F>(
+        &mut self,
+        kind: &str,
+        at: i64,
+        detail: Json,
+        persist: F,
+    ) -> Result<AuditEntry>
+    where
+        F: FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+    {
+        if self.poisoned {
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                "audit log handle is unusable after an uncertain append; reopen it",
+            ));
+        }
         let seq = self
             .entry_count
             .checked_add(1)
@@ -740,23 +763,13 @@ impl AuditLog {
                 })?;
             }
         }
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+        if let Err(err) = persist(&self.path, line.as_bytes()) {
+            self.poisoned = true;
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                format!("persisting audit log: {err}"),
+            ));
         }
-        let mut file = options.open(&self.path).map_err(|err| {
-            PricingError::new(codes::AUDIT_INTEGRITY, format!("opening audit log: {err}"))
-        })?;
-        file.write_all(line.as_bytes()).map_err(|err| {
-            PricingError::new(codes::AUDIT_INTEGRITY, format!("writing audit log: {err}"))
-        })?;
-        file.sync_data().map_err(|err| {
-            PricingError::new(codes::AUDIT_INTEGRITY, format!("syncing audit log: {err}"))
-        })?;
         self.entry_count = seq;
         self.head_hash.clone_from(&entry.hash);
         retain_audit_entry(self, entry.clone(), line.len());
@@ -767,6 +780,12 @@ impl AuditLog {
     /// count with this handle's last acknowledged append. A valid suffix deletion
     /// present before open cannot be detected without an external trusted anchor.
     pub fn verify(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                "audit log handle is unusable after an uncertain append; reopen it",
+            ));
+        }
         let (entry_count, head_hash) = scan_audit_log(&self.path, |_, _| {})?;
         if entry_count != self.entry_count || head_hash != self.head_hash {
             return Err(PricingError::new(
@@ -776,6 +795,20 @@ impl AuditLog {
         }
         Ok(())
     }
+}
+
+fn persist_audit_line(path: &Path, line: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(line)?;
+    file.sync_data()
 }
 
 // --------------------------------------------------------------------------- engine
@@ -1201,6 +1234,49 @@ mod tests {
         let err = AuditLog::open(&path).unwrap_err();
         assert_eq!(err.code, codes::AUDIT_INTEGRITY);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn uncertain_partial_append_poisons_handle_until_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-partial-append-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let mut log = AuditLog::open(&path).unwrap();
+        log.append("first", 1, Json::Null).unwrap();
+
+        let error = log
+            .append_with_persist("uncertain", 2, Json::Null, |path, line| {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                file.write_all(&line[..line.len() / 2])?;
+                Err(std::io::Error::other("injected failure after partial write"))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, codes::AUDIT_INTEGRITY);
+        assert_eq!(log.entry_count(), 1);
+        assert_eq!(
+            log.append("retry", 3, Json::Null).unwrap_err().code,
+            codes::AUDIT_INTEGRITY
+        );
+        assert_eq!(log.verify().unwrap_err().code, codes::AUDIT_INTEGRITY);
+
+        // Reopening rescans the bytes and rejects the incomplete suffix instead
+        // of reusing sequence 2 and silently extending a damaged chain.
+        assert_eq!(
+            AuditLog::open(&path).unwrap_err().code,
+            codes::AUDIT_INTEGRITY
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
