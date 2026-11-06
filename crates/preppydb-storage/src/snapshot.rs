@@ -18,6 +18,7 @@ use crate::store::Doc;
 use preppydb_crypto::crc32c;
 use preppydb_crypto::sha256::{sha256, Sha256};
 use preppydb_json::Json;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -250,6 +251,8 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
 
     let mut hasher = Sha256::new();
     let mut collections: Vec<(CollectionMeta, Vec<(String, Doc)>)> = Vec::new();
+    let mut collection_names = HashSet::new();
+    let mut document_keys: Vec<HashSet<String>> = Vec::new();
     loop {
         let mut len_buf = [0u8; 4];
         read_snapshot_exact(&mut reader, &mut len_buf, path, "frame length or footer")?;
@@ -322,7 +325,14 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
                 let meta = CollectionMeta::from_json(value.get("meta").ok_or_else(|| {
                     DbError::corrupt("snapshot", "collection frame without meta")
                 })?)?;
+                if !collection_names.insert(meta.name.clone()) {
+                    return Err(DbError::corrupt(
+                        path.display().to_string(),
+                        format!("duplicate collection '{}' in snapshot", meta.name),
+                    ));
+                }
                 collections.push((meta, Vec::new()));
+                document_keys.push(HashSet::new());
             }
             Some("doc") => {
                 let collection = value
@@ -335,18 +345,22 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
                     .get("d")
                     .ok_or_else(|| DbError::corrupt("snapshot", "doc frame without document"))?;
                 let doc = Doc::from_json(doc_json)?;
-                match collections
-                    .iter_mut()
-                    .find(|(meta, _)| meta.name == collection)
-                {
-                    Some((_, docs)) => docs.push((key.to_string(), doc)),
-                    None => {
-                        return Err(DbError::corrupt(
+                let collection_index = collections
+                    .iter()
+                    .position(|(meta, _)| meta.name == collection)
+                    .ok_or_else(|| {
+                        DbError::corrupt(
                             path.display().to_string(),
                             format!("document for unknown collection '{collection}'"),
-                        ))
-                    }
+                        )
+                    })?;
+                if !document_keys[collection_index].insert(key.to_string()) {
+                    return Err(DbError::corrupt(
+                        path.display().to_string(),
+                        format!("duplicate document key in collection '{collection}'"),
+                    ));
                 }
+                collections[collection_index].1.push((key.to_string(), doc));
             }
             other => {
                 return Err(DbError::corrupt(
@@ -464,6 +478,35 @@ mod tests {
         assert_eq!(loaded.collections[0].0.name, "profiles");
         assert_eq!(loaded.collections[0].1[0].0, "molly");
         assert_eq!(loaded.collections[0].1[0].1.version, 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_document_keys_in_snapshot_are_rejected() {
+        let dir = tempdir("duplicate-document-key");
+        let path = dir.join("snap-1.pdb");
+        let mut collections = sample();
+        let duplicate = collections[0].1[0].clone();
+        collections[0].1.push(duplicate);
+        write_snapshot(&path, 1, 1, 0, &collections).unwrap();
+
+        let error = read_snapshot(&path).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
+        assert!(error.to_string().contains("duplicate document key"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_collection_names_in_snapshot_are_rejected() {
+        let dir = tempdir("duplicate-collection-name");
+        let path = dir.join("snap-1.pdb");
+        let mut collections = sample();
+        collections.push(collections[0].clone());
+        write_snapshot(&path, 1, 1, 0, &collections).unwrap();
+
+        let error = read_snapshot(&path).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
+        assert!(error.to_string().contains("duplicate collection"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
