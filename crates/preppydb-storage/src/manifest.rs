@@ -610,6 +610,56 @@ mod tests {
     }
 
     #[test]
+    fn load_bounds_retries_when_manifest_generations_keep_changing() {
+        let dir = tempdir("generation-churn-during-open");
+        let mut first = Manifest {
+            generation: 1,
+            last_seq: 10,
+            snapshot: Some(SnapshotRef {
+                file: "snap-000000000001.pdb".into(),
+                seq: 10,
+                generation: 1,
+                sha256: "a".repeat(64),
+                doc_count: 0,
+                created_at: 1,
+                bytes: 1,
+            }),
+            ..Default::default()
+        };
+        first.publish_generation(&dir).unwrap();
+
+        let mut publications = 0;
+        let error = Manifest::load_with_selection_hook(&dir, |selected| {
+            let generation =
+                Manifest::generation_from_name(selected.file_name().unwrap().to_str().unwrap())
+                    .unwrap();
+            std::fs::remove_file(selected).unwrap();
+            let next_generation = generation + 1;
+            let mut next = Manifest {
+                generation: next_generation,
+                last_seq: next_generation * 10,
+                snapshot: Some(SnapshotRef {
+                    file: format!("snap-{next_generation:012}.pdb"),
+                    seq: next_generation * 10,
+                    generation: next_generation,
+                    sha256: "b".repeat(64),
+                    doc_count: 0,
+                    created_at: 2,
+                    bytes: 1,
+                }),
+                ..Default::default()
+            };
+            next.publish_generation(&dir).unwrap();
+            publications += 1;
+        })
+        .unwrap_err();
+
+        assert_eq!(publications, 8, "manifest retries must have a fixed bound");
+        assert_eq!(error.code(), crate::error::codes::RECOVERY_REQUIRED);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn corrupt_newest_generation_fails_closed_instead_of_falling_back() {
         let dir = tempdir("corrupt-newest-generation");
         let mut old = Manifest {
