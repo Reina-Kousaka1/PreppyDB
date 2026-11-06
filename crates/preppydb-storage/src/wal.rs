@@ -76,17 +76,35 @@ impl SyncMode {
     }
 }
 
-/// Thousands-separated segment file name, e.g. `wal/000000000042.wal`.
+const MAX_SEGMENT_INDEX: u64 = 999_999_999_999;
+
+/// Twelve-digit segment file name, e.g. `wal/000000000042.wal`.
 pub fn segment_name(index: u64) -> String {
     format!("{index:012}.wal")
 }
 
 pub fn parse_segment_name(name: &str) -> Option<u64> {
     let stem = name.strip_suffix(".wal")?;
-    if stem.len() != 12 {
+    if stem.len() != 12 || !stem.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    stem.parse::<u64>().ok()
+    stem.parse::<u64>()
+        .ok()
+        .filter(|index| (1..=MAX_SEGMENT_INDEX).contains(index))
+}
+
+fn validate_segment_index(index: u64) -> Result<()> {
+    if index == 0 {
+        return Err(DbError::Config("WAL segment index must be positive".into()));
+    }
+    if index > MAX_SEGMENT_INDEX {
+        return Err(DbError::LimitExceeded {
+            limit: "wal_segment_index",
+            max: MAX_SEGMENT_INDEX,
+            actual: index,
+        });
+    }
+    Ok(())
 }
 
 /// List existing WAL segments in append order.
@@ -100,7 +118,13 @@ pub fn list_segments(dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in entries {
         let entry = entry.map_err(|err| DbError::io("reading WAL directory entry", err))?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if parse_segment_name(&name).is_some() {
+        if name.to_ascii_lowercase().ends_with(".wal") {
+            if parse_segment_name(&name).is_none() {
+                return Err(DbError::corrupt(
+                    entry.path().display().to_string(),
+                    "WAL segment has a noncanonical file name",
+                ));
+            }
             let file_type = entry
                 .file_type()
                 .map_err(|err| DbError::io("inspecting WAL segment", err))?;
@@ -152,6 +176,7 @@ impl WalWriter {
         max_segment_bytes: u64,
         sync_mode: SyncMode,
     ) -> Result<WalWriter> {
+        validate_segment_index(index)?;
         Self::open_with_directory_sync(dir, index, max_segment_bytes, sync_mode, |path| {
             crate::snapshot::fsync_dir(path)
         })
@@ -251,6 +276,7 @@ impl WalWriter {
         max_segment_bytes: u64,
         sync_mode: SyncMode,
     ) -> Result<WalWriter> {
+        validate_segment_index(index)?;
         let path = dir.join(segment_name(index));
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|err| DbError::io(format!("inspecting {}", path.display()), err))?;
@@ -756,6 +782,40 @@ mod tests {
         let error = wal.rotate().unwrap_err();
         assert_eq!(error.code(), crate::error::codes::LIMIT_EXCEEDED);
         assert_eq!(wal.file.metadata().unwrap().len(), file_len);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn noncanonical_wal_names_fail_closed() {
+        assert_eq!(parse_segment_name("000000000001.wal"), Some(1));
+        for name in [
+            "+00000000001.wal",
+            "000000000000.wal",
+            "1000000000000.wal",
+            "000000000001.WAL",
+        ] {
+            assert_eq!(parse_segment_name(name), None);
+            let dir = tempdir("noncanonical-name");
+            std::fs::write(dir.join(name), b"unexpected WAL").unwrap();
+            assert_eq!(
+                list_segments(&dir).unwrap_err().code(),
+                crate::error::codes::CORRUPT_DATA
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        let dir = tempdir("segment-index-limit");
+        let error = match WalWriter::open(
+            &dir,
+            MAX_SEGMENT_INDEX + 1,
+            64 * 1024 * 1024,
+            SyncMode::Always,
+        ) {
+            Ok(_) => panic!("out-of-range WAL index must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), crate::error::codes::LIMIT_EXCEEDED);
+        assert!(!dir.join(segment_name(MAX_SEGMENT_INDEX + 1)).exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

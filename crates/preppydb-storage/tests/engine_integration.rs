@@ -1143,6 +1143,33 @@ fn mid_log_corruption_is_rejected_by_default() {
 }
 
 #[test]
+fn recovery_rejects_noncanonical_wal_name_instead_of_missing_commits() {
+    let dir = tempdir("noncanonical-wal-recovery");
+    {
+        let engine = open(&dir);
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "committed", Json::int(1), PutOptions::default())
+            .unwrap();
+    }
+    let wal_dir = dir.join("wal");
+    let original = wal_dir.join(wal::segment_name(1));
+    let renamed = wal_dir.join("+00000000001.wal");
+    std::fs::rename(&original, &renamed).unwrap();
+
+    let error = Engine::open(EngineConfig::new(&dir)).unwrap_err();
+    assert!(matches!(error, DbError::Corrupt { .. }));
+    assert!(renamed.exists());
+    assert!(
+        !original.exists(),
+        "failed open must not create a replacement WAL"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn terminal_complete_crc_corruption_requires_explicit_repair() {
     let dir = tempdir("corrupt-terminal-frame");
     {
