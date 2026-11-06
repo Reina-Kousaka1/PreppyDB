@@ -1527,10 +1527,7 @@ fn complete_invalid_final_wal_header_fails_closed() {
     bytes[0] ^= 1;
     std::fs::write(final_segment, &bytes).unwrap();
 
-    assert!(
-        Engine::open(cfg).is_err(),
-        "reopen must reject the same semantically invalid WAL suffix"
-    );
+    assert!(matches!(Engine::open(cfg), Err(DbError::Corrupt { .. })));
     assert_eq!(
         std::fs::metadata(final_segment).unwrap().len(),
         wal::WAL_HEADER_LEN
