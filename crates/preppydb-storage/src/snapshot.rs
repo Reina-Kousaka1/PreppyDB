@@ -129,7 +129,26 @@ pub fn write_snapshot(
     };
     let header_json = header.to_json().to_string();
 
-    let file = File::create(&tmp_path)
+    match std::fs::symlink_metadata(&tmp_path) {
+        Ok(_) => std::fs::remove_file(&tmp_path)
+            .map_err(|err| DbError::io(format!("removing {}", tmp_path.display()), err))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(DbError::io(
+                format!("inspecting {}", tmp_path.display()),
+                err,
+            ));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&tmp_path)
         .map_err(|err| DbError::io(format!("creating {}", tmp_path.display()), err))?;
     let mut writer = BufWriter::new(file);
     let mut body_hasher = Sha256::new();
@@ -536,6 +555,26 @@ mod tests {
         let error = read_snapshot(&path).unwrap_err();
         assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
         assert!(error.to_string().contains("duplicate collection"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_writer_does_not_follow_a_temporary_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir("temporary-symlink");
+        let victim = dir.join("victim");
+        let path = dir.join("snap-1.pdb");
+        let tmp_path = path.with_extension("pdb.tmp");
+        std::fs::write(&victim, b"preserve this file").unwrap();
+        symlink(&victim, &tmp_path).unwrap();
+
+        write_snapshot(&path, 1, 1, 0, &sample()).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"preserve this file");
+        assert!(!tmp_path.exists());
+        assert_eq!(read_snapshot(&path).unwrap().header.seq, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
