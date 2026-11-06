@@ -301,6 +301,7 @@ type Result<T> = std::result::Result<T, AuthError>;
 
 /// How long a login session stays valid.
 pub const SESSION_TTL_MS: i64 = 8 * 60 * 60 * 1000;
+const MAX_ACTIVE_SESSIONS: usize = 10_000;
 /// Minimum password length accepted for a login user.
 pub const MIN_PASSWORD_LEN: usize = 12;
 /// Upper bound for credential file reads, including files that grow during reading.
@@ -720,8 +721,12 @@ impl AuthStore {
         if user.disabled || !password_matches {
             return Err(AuthError("invalid credentials".to_string()));
         }
-        let token = os_random_str(32)?;
         let now = preppydb_storage::clock::now_ms();
+        self.sessions.retain(|_, session| session.expires_at > now);
+        if self.sessions.len() >= MAX_ACTIVE_SESSIONS {
+            return Err(AuthError("session limit reached".to_string()));
+        }
+        let token = os_random_str(32)?;
         self.sessions.insert(
             hex_encode(&sha256(token.as_bytes())),
             Session {
@@ -730,10 +735,6 @@ impl AuthStore {
                 expires_at: now + SESSION_TTL_MS,
             },
         );
-        // Keep the session table bounded.
-        if self.sessions.len() > 10_000 {
-            self.sessions.retain(|_, session| session.expires_at > now);
-        }
         Ok((
             token,
             Principal {
@@ -872,6 +873,37 @@ mod tests {
         assert!(store.authenticate_session(&session).is_some());
         assert!(store.logout(&session));
         assert!(store.authenticate_session(&session).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn login_prunes_expired_sessions_and_caps_active_sessions() {
+        let (mut store, dir) = store("session-cap");
+        store
+            .create_user("admin", "correct horse battery", vec![Role::Admin])
+            .unwrap();
+        let now = preppydb_storage::clock::now_ms();
+        for index in 0..MAX_ACTIVE_SESSIONS {
+            store.sessions.insert(
+                format!("session-{index}"),
+                Session {
+                    username: "admin".into(),
+                    roles: vec![Role::Admin],
+                    expires_at: now + SESSION_TTL_MS,
+                },
+            );
+        }
+        assert_eq!(
+            store.login("admin", "correct horse battery").unwrap_err().0,
+            "session limit reached"
+        );
+        assert_eq!(store.sessions.len(), MAX_ACTIVE_SESSIONS);
+
+        let expired_key = "session-0";
+        store.sessions.get_mut(expired_key).unwrap().expires_at = now - 1;
+        assert!(store.login("admin", "correct horse battery").is_ok());
+        assert_eq!(store.sessions.len(), MAX_ACTIVE_SESSIONS);
+        assert!(!store.sessions.contains_key(expired_key));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
