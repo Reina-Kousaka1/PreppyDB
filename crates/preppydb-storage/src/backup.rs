@@ -1183,6 +1183,12 @@ where
                             path.display()
                         )));
                     }
+                    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+                    if let Err(sync_error) = sync_parent(parent) {
+                        return Err(DbError::RecoveryRequired(format!(
+                            "restore publication failed and the old database was restored, but syncing its parent failed: {sync_error} (publish: {err})"
+                        )));
+                    }
                 }
                 _ => {
                     return Err(DbError::RecoveryRequired(format!(
@@ -1479,6 +1485,47 @@ mod tests {
         assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old");
         assert!(!target.join("new").exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_publication_syncs_rollback_after_staged_rename_fails() {
+        for fail_rollback_sync in [false, true] {
+            let root = tempdir("publish-rollback-sync");
+            let target = root.join("database");
+            let aside = root.join("aside");
+            let missing_stage = root.join("missing-stage");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("old"), b"old").unwrap();
+            let intent = RestoreIntent::create(&target, &missing_stage, &aside).unwrap();
+            let intent_path = intent.path.clone();
+
+            let mut sync_calls = 0;
+            let publication = publish_restore_with(&missing_stage, &target, &aside, true, |_| {
+                sync_calls += 1;
+                if fail_rollback_sync && sync_calls == 2 {
+                    return Err(DbError::io(
+                        "injected rollback sync failure",
+                        std::io::Error::other("injected"),
+                    ));
+                }
+                Ok(())
+            });
+            assert_eq!(sync_calls, 2, "move and rollback must both be synced");
+            assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old");
+
+            let error = complete_restore_publication(intent, publication, &target).unwrap_err();
+            if fail_rollback_sync {
+                assert_eq!(error.code(), crate::error::codes::RECOVERY_REQUIRED);
+                assert!(
+                    intent_path.exists(),
+                    "uncertain rollback must retain intent"
+                );
+            } else {
+                assert_eq!(error.code(), crate::error::codes::IO_ERROR);
+                assert!(!intent_path.exists(), "synced rollback may clear intent");
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
