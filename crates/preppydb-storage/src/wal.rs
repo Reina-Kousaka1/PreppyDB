@@ -30,7 +30,9 @@ pub const MAX_COLLECTED_SEGMENT_BYTES: u64 = 128 * 1024 * 1024;
 /// Durability policy for commits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyncMode {
-    /// `fsync` on every commit: no committed write can be lost, slowest.
+    /// Call `sync_data` before acknowledging every commit. This does not guarantee
+    /// power-loss durability when the OS, filesystem, device, or controller does not
+    /// honor flush requests.
     Always,
     /// A background worker attempts `fsync` every N milliseconds; commits may be
     /// acknowledged before that sync and can be lost if the process or OS fails first.

@@ -5,7 +5,9 @@
 //! * Every mutation is appended to the write-ahead log as one framed record.
 //!   Multi-document batches and transactions are a *single* record, so they are
 //!   atomic even across a crash.
-//! * `SyncMode::Always` (default) `fsync`s before the call returns.
+//! * `SyncMode::Always` (default) calls `sync_data` before a successful commit returns.
+//!   An I/O error after a write reaches the WAL leaves the outcome unknown and requires
+//!   reopen; flush success is not a universal power-loss guarantee.
 //! * A checkpoint writes a fully checksummed snapshot and then retires the log
 //!   segments it replaced. Segments are only deleted after the manifest that
 //!   references the new snapshot is durable on disk.

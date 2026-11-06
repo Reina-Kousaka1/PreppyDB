@@ -115,6 +115,9 @@ it is optional.
 ## Notes
 
 * Paths: `--data-dir` accepts POSIX and Windows paths; quote paths containing spaces.
-* All mutating commands are durable (`fsync`) before they print their result.
+* Mutating commands use the configured WAL sync mode (`always` by default). With
+  `always`, a successful commit is reported only after `sync_data` succeeds. This relies
+  on the OS, filesystem, storage device, and controller honoring flush requests and is
+  not a universal power-loss guarantee. `interval` and `never` do not sync every commit.
 * `get` prints the full envelope (`key`, `value`, `version`, timestamps); pipe through
   `jq '.value'` to see just the document.

@@ -193,7 +193,7 @@ capability is intentionally granted to administrators.
 | Mode | Guarantee |
 | --- | --- |
 | `always` | a write is acknowledged only after `sync_data` succeeds. This depends on the OS, filesystem, device, and controller honoring flush requests; it is not a universal power-loss guarantee. |
-| `interval` | A background worker attempts `sync_data` every configured interval (200 ms for `interval`). Scheduling and I/O can delay an attempt; commits are acknowledged before it, so writes since the last successful sync can be lost after a process/OS failure. A failed sync poisons the engine and subsequent reads/writes fail until reopen. Graceful shutdown performs a final sync. |
+| `interval` | A background worker attempts `sync_data` every configured interval (200 ms for `interval`). Scheduling and I/O can delay an attempt; commits are acknowledged before it, so writes since the last successful sync may be lost after an OS, hardware, or power failure. A process-only crash usually leaves the OS page cache available, but is not used to claim durability. A failed sync poisons the engine and subsequent reads/writes fail until reopen. Graceful shutdown performs a final sync. |
 | `never` | no explicit WAL sync; tests and benchmarks only. |
 
 If a WAL append or sync fails after a write may have reached the log, the operation
