@@ -1314,6 +1314,69 @@ fn verify_and_recovery_reject_torn_wal_segment_followed_by_later_segment() {
 }
 
 #[test]
+fn verify_rejects_semantically_unreplayable_but_checksummed_wal_record() {
+    let dir = tempdir("verify-semantic-wal-corruption");
+    let cfg = EngineConfig::new(&dir);
+    let engine = Engine::open(cfg.clone()).unwrap();
+    engine
+        .create_collection(CollectionMeta::new("c", 0))
+        .unwrap();
+    for key in ["a", "b"] {
+        engine
+            .put(
+                "c",
+                key,
+                Json::obj().with("value", Json::int(7)),
+                PutOptions::default(),
+            )
+            .unwrap();
+    }
+
+    let wal_dir = dir.join("wal");
+    let segments = wal::list_segments(&wal_dir).unwrap();
+    let current = segments.last().unwrap();
+    let index = current
+        .file_name()
+        .and_then(|name| wal::parse_segment_name(&name.to_string_lossy()))
+        .unwrap();
+    let mut writer = wal::WalWriter::open(&wal_dir, index, 1024 * 1024, SyncMode::Always).unwrap();
+    writer
+        .append(&Record::new(
+            engine.last_seq() + 1,
+            0,
+            Op::CreateIndex {
+                collection: "c".into(),
+                index: IndexMeta {
+                    name: "unique_value".into(),
+                    field: "value".into(),
+                    unique: true,
+                    sparse: false,
+                    created_at: 0,
+                },
+            },
+        ))
+        .unwrap();
+    drop(writer);
+
+    let report = engine.verify().unwrap();
+    assert!(
+        !report.ok,
+        "verify must reject a WAL record that recovery cannot apply"
+    );
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.contains("unique index")));
+    drop(engine);
+
+    assert!(
+        Engine::open(cfg).is_err(),
+        "reopen must reject the same semantically invalid WAL suffix"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn interrupted_final_wal_segment_header_preserves_prior_commits() {
     let dir = tempdir("torn-final-wal-header");
     let cfg = EngineConfig::new(&dir);
@@ -1464,7 +1527,10 @@ fn complete_invalid_final_wal_header_fails_closed() {
     bytes[0] ^= 1;
     std::fs::write(final_segment, &bytes).unwrap();
 
-    assert!(matches!(Engine::open(cfg), Err(DbError::Corrupt { .. })));
+    assert!(
+        Engine::open(cfg).is_err(),
+        "reopen must reject the same semantically invalid WAL suffix"
+    );
     assert_eq!(
         std::fs::metadata(final_segment).unwrap().len(),
         wal::WAL_HEADER_LEN

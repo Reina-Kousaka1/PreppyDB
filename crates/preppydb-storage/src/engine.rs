@@ -1920,8 +1920,19 @@ impl Engine {
 
     /// Verify all on-disk structures without modifying anything.
     pub fn verify(&self) -> Result<VerifyReport> {
+        // Keep the snapshot, WAL, and manifest at one logical point in time. The lock
+        // order matches commits/checkpoint (state -> writer -> manifest), avoiding a
+        // report assembled across a concurrent commit or checkpoint publication.
+        let _state = self.read();
+        let _writer = self.lock_mutex(&self.writer);
         let mut issues = Vec::new();
         let manifest = self.lock_mutex(&self.manifest).clone();
+        // Framing and sequence checks alone are insufficient: a checksummed record
+        // can still be impossible to apply (for example, a unique index that conflicts
+        // with existing documents). Reconstruct the snapshot baseline and replay the
+        // retained suffix just as open() does, so a clean report predicts reopenability.
+        let mut replay_store = Store::new(self.cfg.limits.clone());
+        let mut replay_state_valid = manifest.snapshot.is_none();
         let mut snapshot_json = None;
         if let Some(snap_ref) = &manifest.snapshot {
             let path = match validate_snapshot_reference(&manifest, snap_ref) {
@@ -1968,6 +1979,52 @@ impl Engine {
                                     snap_ref.file, data.header.seq, snap_ref.seq
                                 ));
                             }
+                            if ok {
+                                for (meta, docs) in data.collections {
+                                    let name = meta.name.clone();
+                                    if let Err(err) =
+                                        replay_store.create_collection(meta, ApplyMode::Replay)
+                                    {
+                                        ok = false;
+                                        issues.push(format!(
+                                            "snapshot {} cannot be loaded for verification: {err}",
+                                            snap_ref.file
+                                        ));
+                                        break;
+                                    }
+                                    let Some(collection) = replay_store.collections.get_mut(&name)
+                                    else {
+                                        ok = false;
+                                        issues.push(format!(
+                                            "snapshot {} omitted collection {name} during verification",
+                                            snap_ref.file
+                                        ));
+                                        break;
+                                    };
+                                    for (key, doc) in docs {
+                                        if collection.docs.insert(key.clone(), doc).is_some() {
+                                            ok = false;
+                                            issues.push(format!(
+                                                "snapshot {} contains duplicate document key {key} in collection {name}",
+                                                snap_ref.file
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                    if !ok {
+                                        break;
+                                    }
+                                    if let Err(err) = collection.rebuild_indexes() {
+                                        ok = false;
+                                        issues.push(format!(
+                                            "snapshot {} indexes cannot be rebuilt: {err}",
+                                            snap_ref.file
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                            replay_state_valid = ok;
                             snapshot_json = Some(
                                 Json::obj()
                                     .with("file", Json::str(snap_ref.file.clone()))
@@ -2033,6 +2090,17 @@ impl Engine {
                     return Ok(());
                 }
                 previous_seq = record.seq;
+                if replay_state_valid {
+                    if let Err(err) =
+                        replay_store.apply(&record.op, record.ts, record.seq, ApplyMode::Replay)
+                    {
+                        issues.push(format!(
+                            "{name}: record sequence {} cannot be replayed: {err}",
+                            record.seq
+                        ));
+                        replay_state_valid = false;
+                    }
+                }
                 replay_started = true;
                 record_count = record_count
                     .checked_add(1)
