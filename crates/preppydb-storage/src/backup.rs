@@ -1316,7 +1316,27 @@ mod tests {
             std::fs::create_dir(&staged).unwrap();
             std::fs::write(staged.join("new"), b"new-state").unwrap();
 
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let executable = std::env::current_exe().unwrap();
+            // Cargo's target runner wraps the first test process only. When this
+            // test is itself running under QEMU, explicitly use the same runner
+            // for the child process instead of trying to exec an ARM ELF directly.
+            let runner = std::env::var("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER")
+                .ok()
+                .map(|value| {
+                    value
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|parts| !parts.is_empty());
+            let mut command = if let Some(runner) = runner {
+                let mut command = std::process::Command::new(&runner[0]);
+                command.args(&runner[1..]).arg(&executable);
+                command
+            } else {
+                std::process::Command::new(executable)
+            };
+            let output = command
                 .args([
                     "--exact",
                     "backup::tests::restore_publication_crash_child",
@@ -1335,7 +1355,12 @@ mod tests {
             );
 
             let intent_path = restore_intent_path(&target).unwrap().0;
-            assert!(intent_path.exists(), "missing recovery marker at {phase}");
+            assert!(
+                intent_path.exists(),
+                "missing recovery marker at {phase}; child stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             let open_error = match Engine::open(crate::engine::EngineConfig::new(&target)) {
                 Ok(_) => panic!("open must refuse an interrupted restore at {phase}"),
                 Err(error) => error,
