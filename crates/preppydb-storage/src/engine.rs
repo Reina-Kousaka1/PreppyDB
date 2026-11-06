@@ -2461,6 +2461,44 @@ mod document_undo_tests {
     }
 
     #[test]
+    fn transaction_sync_failure_recovers_all_or_none_of_the_wal_batch() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-transaction-sync-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+
+        let mut transaction = engine.begin();
+        transaction.put("c", "first", Json::int(1), None).unwrap();
+        transaction.put("c", "second", Json::int(2), None).unwrap();
+        engine.lock_mutex(&engine.writer).inject_sync_failure();
+        let error = transaction.commit().unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::COMMIT_OUTCOME_UNKNOWN);
+        assert!(matches!(
+            engine.get_opt("c", "first"),
+            Err(DbError::CommitOutcomeUnknown(_))
+        ));
+        drop(engine);
+
+        // The failed durability barrier leaves the transaction outcome unknown,
+        // but the one-frame transaction must never recover only half its writes.
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        let first = reopened.get_opt("c", "first").unwrap();
+        let second = reopened.get_opt("c", "second").unwrap();
+        assert_eq!(first.is_some(), second.is_some());
+        if let (Some(first), Some(second)) = (first, second) {
+            assert_eq!(first.value.as_i64(), Some(1));
+            assert_eq!(second.value.as_i64(), Some(2));
+        }
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn backup_after_wal_sync_failure_preserves_unknown_outcome_error() {
         let dir = std::env::temp_dir().join(format!(
             "preppydb-backup-sync-failure-{}-{}",
