@@ -1189,6 +1189,63 @@ fn terminal_complete_crc_corruption_requires_explicit_repair() {
 }
 
 #[test]
+fn post_checkpoint_crc_corruption_preserves_snapshot_and_valid_wal_prefix() {
+    let dir = tempdir("post-checkpoint-crc-corruption");
+    {
+        let engine = open(&dir);
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "baseline", Json::int(0), PutOptions::default())
+            .unwrap();
+        engine.checkpoint().unwrap();
+        engine
+            .put("c", "valid-suffix", Json::int(1), PutOptions::default())
+            .unwrap();
+        engine
+            .put("c", "damaged-suffix", Json::int(2), PutOptions::default())
+            .unwrap();
+    }
+
+    let segment = wal::list_segments(&dir.join("wal")).unwrap().pop().unwrap();
+    let mut bytes = std::fs::read(&segment).unwrap();
+    *bytes.last_mut().unwrap() ^= 0x40;
+    std::fs::write(&segment, bytes).unwrap();
+
+    assert!(matches!(
+        Engine::open(EngineConfig::new(&dir)),
+        Err(DbError::Corrupt { .. })
+    ));
+
+    let mut repair = EngineConfig::new(&dir);
+    repair.repair = RepairPolicy::TruncateCorruptTail;
+    let engine = Engine::open(repair).unwrap();
+    assert_eq!(engine.count("c").unwrap(), 2);
+    assert_eq!(engine.get("c", "baseline").unwrap().value.as_i64(), Some(0));
+    assert_eq!(
+        engine.get("c", "valid-suffix").unwrap().value.as_i64(),
+        Some(1)
+    );
+    assert!(engine.get_opt("c", "damaged-suffix").unwrap().is_none());
+    assert!(engine
+        .recovery_notes()
+        .iter()
+        .any(|note| note.kind == "corruption_truncated"));
+    drop(engine);
+
+    let reopened = open(&dir);
+    assert_eq!(reopened.count("c").unwrap(), 2);
+    assert_eq!(
+        reopened.get("c", "valid-suffix").unwrap().value.as_i64(),
+        Some(1)
+    );
+    assert!(reopened.get_opt("c", "damaged-suffix").unwrap().is_none());
+    drop(reopened);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn sequence_gap_after_checkpoint_fails_closed_and_repair_drops_suffix() {
     let dir = tempdir("wal-sequence-gap");
     let mut cfg = EngineConfig::new(&dir);
