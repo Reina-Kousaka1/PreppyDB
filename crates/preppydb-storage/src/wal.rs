@@ -32,7 +32,8 @@ pub const MAX_COLLECTED_SEGMENT_BYTES: u64 = 128 * 1024 * 1024;
 pub enum SyncMode {
     /// `fsync` on every commit: no committed write can be lost, slowest.
     Always,
-    /// `fsync` at most every N milliseconds: a crash can lose the last N ms.
+    /// A background worker attempts `fsync` every N milliseconds; commits may be
+    /// acknowledged before that sync and can be lost if the process or OS fails first.
     Interval(u64),
     /// Never call `fsync` explicitly; relies on the OS page cache.
     Never,
@@ -127,6 +128,10 @@ pub struct WalWriter {
     unsynced_frames: u64,
     #[cfg(test)]
     fail_next_append: Option<AppendFault>,
+    #[cfg(test)]
+    fail_next_sync: bool,
+    #[cfg(test)]
+    successful_syncs: u64,
 }
 
 #[cfg(test)]
@@ -205,6 +210,10 @@ impl WalWriter {
             unsynced_frames: 0,
             #[cfg(test)]
             fail_next_append: None,
+            #[cfg(test)]
+            fail_next_sync: false,
+            #[cfg(test)]
+            successful_syncs: 0,
         })
     }
 
@@ -222,6 +231,15 @@ impl WalWriter {
 
     pub fn sync_mode(&self) -> SyncMode {
         self.sync_mode
+    }
+
+    pub(crate) fn has_unsynced_frames(&self) -> bool {
+        self.unsynced_frames != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn successful_syncs(&self) -> u64 {
+        self.successful_syncs
     }
 
     /// Append one record frame, rotating to a new segment when the cap is reached.
@@ -314,12 +332,28 @@ impl WalWriter {
         self.fail_next_append = Some(fault);
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_sync_failure(&mut self) {
+        self.fail_next_sync = true;
+    }
+
     /// `fsync` the current segment.
     pub fn sync(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_sync) {
+            return Err(DbError::io(
+                "injected WAL sync failure",
+                std::io::Error::other("injected"),
+            ));
+        }
         self.file
             .sync_data()
             .map_err(|err| DbError::io(format!("syncing {}", self.current.display()), err))?;
         self.unsynced_frames = 0;
+        #[cfg(test)]
+        {
+            self.successful_syncs = self.successful_syncs.saturating_add(1);
+        }
         Ok(())
     }
 

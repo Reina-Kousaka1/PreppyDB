@@ -26,7 +26,9 @@ use crate::wal::{self, SyncMode, WalWriter};
 use preppydb_json::Json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 /// What to do when recovery finds corruption that is not a torn tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,14 +350,66 @@ pub struct Engine {
     cfg: EngineConfig,
     paths: DataPaths,
     state: RwLock<State>,
-    writer: Mutex<WalWriter>,
+    writer: Arc<Mutex<WalWriter>>,
     manifest: Mutex<Manifest>,
     lock: Mutex<Option<FileLock>>,
     notes: Mutex<Vec<RecoveryNote>>,
-    poisoned: AtomicBool,
+    poisoned: Arc<AtomicBool>,
+    closed: AtomicBool,
+    interval_sync_worker: Mutex<Option<IntervalSyncWorker>>,
     mutations_since_checkpoint: AtomicU64,
     pub metrics: Metrics,
     started_at_ms: i64,
+}
+
+/// Periodically syncs interval-mode WAL writes without adding work to each commit.
+/// A failed background sync poisons the engine because previously acknowledged writes
+/// may no longer have a known durability outcome.
+struct IntervalSyncWorker {
+    stop: mpsc::Sender<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl IntervalSyncWorker {
+    fn start(
+        writer: Arc<Mutex<WalWriter>>,
+        poisoned: Arc<AtomicBool>,
+        interval: Duration,
+    ) -> Result<Self> {
+        let (stop, receiver) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("preppydb-wal-sync".into())
+            .spawn(move || loop {
+                match receiver.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let mut writer = writer.lock().unwrap_or_else(|err| err.into_inner());
+                        if writer.has_unsynced_frames() && writer.sync().is_err() {
+                            poisoned.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|err| DbError::io("starting WAL interval sync worker", err))?;
+        Ok(Self {
+            stop,
+            join: Some(join),
+        })
+    }
+
+    fn stop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for IntervalSyncWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 fn next_sequence(current: u64) -> Result<u64> {
@@ -424,6 +478,11 @@ fn ensure_regular_snapshot_file(path: &Path) -> Result<()> {
 impl Engine {
     /// Open (or create) a database directory, replaying the log as needed.
     pub fn open(cfg: EngineConfig) -> Result<Engine> {
+        if cfg.sync_mode == SyncMode::Interval(0) {
+            return Err(DbError::Config(
+                "sync interval must be greater than zero milliseconds".into(),
+            ));
+        }
         crate::backup::ensure_no_restore_intent(&cfg.path)?;
         let paths = DataPaths::new(cfg.path.clone());
         create_private_dir(&paths.root)?;
@@ -740,6 +799,16 @@ impl Engine {
             );
         }
 
+        let writer = Arc::new(Mutex::new(writer));
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let interval_sync_worker = match cfg.sync_mode {
+            SyncMode::Interval(milliseconds) if !cfg.read_only => Some(IntervalSyncWorker::start(
+                Arc::clone(&writer),
+                Arc::clone(&poisoned),
+                Duration::from_millis(milliseconds),
+            )?),
+            _ => None,
+        };
         let generation = manifest.generation;
         Ok(Engine {
             cfg,
@@ -749,11 +818,13 @@ impl Engine {
                 seq,
                 generation,
             }),
-            writer: Mutex::new(writer),
+            writer,
             manifest: Mutex::new(manifest),
             lock: Mutex::new(lock),
             notes: Mutex::new(notes),
-            poisoned: AtomicBool::new(false),
+            poisoned,
+            closed: AtomicBool::new(false),
+            interval_sync_worker: Mutex::new(interval_sync_worker),
             mutations_since_checkpoint: AtomicU64::new(0),
             metrics: Metrics::default(),
             started_at_ms: now_ms(),
@@ -794,6 +865,9 @@ impl Engine {
     }
 
     fn check_healthy(&self) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(DbError::Internal("engine is shut down".into()));
+        }
         if self.poisoned.load(Ordering::SeqCst) {
             return Err(DbError::CommitOutcomeUnknown(
                 "engine requires reopen after a WAL write error; the last commit outcome may be unknown"
@@ -801,6 +875,19 @@ impl Engine {
             ));
         }
         Ok(())
+    }
+
+    fn sync_wal(&self) -> Result<()> {
+        if let Err(err) = self.lock_mutex(&self.writer).sync() {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(DbError::CommitOutcomeUnknown(err.to_string()));
+        }
+        self.check_healthy()
+    }
+
+    fn stop_interval_sync_worker(&self) {
+        let worker = self.lock_mutex(&self.interval_sync_worker).take();
+        drop(worker);
     }
 
     // ------------------------------------------------------------- write path
@@ -2036,7 +2123,7 @@ impl Engine {
             ));
         }
         if !self.cfg.read_only {
-            self.lock_mutex(&self.writer).sync()?;
+            self.sync_wal()?;
         }
         action(state.seq)
     }
@@ -2046,14 +2133,20 @@ impl Engine {
         if self.cfg.read_only {
             return Ok(());
         }
-        self.lock_mutex(&self.writer).sync()
+        self.sync_wal()
     }
 
     /// Graceful shutdown: flush, checkpoint (optional) and release the lock.
     pub fn shutdown(&self) -> Result<()> {
+        let _state = self.write();
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.stop_interval_sync_worker();
         if !self.cfg.read_only {
             self.flush()?;
         }
+        self.closed.store(true, Ordering::SeqCst);
         let mut lock = self.lock_mutex(&self.lock);
         if let Some(lock) = lock.as_mut() {
             lock.release();
@@ -2064,6 +2157,12 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        let worker = self
+            .interval_sync_worker
+            .get_mut()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        drop(worker);
         let _ = self.flush();
         if let Some(lock) = self
             .lock
@@ -2111,6 +2210,98 @@ pub fn collection_ref<'a>(store: &'a Store, name: &str) -> Result<&'a Collection
 #[cfg(test)]
 mod document_undo_tests {
     use super::*;
+
+    fn interval_config(dir: &Path) -> EngineConfig {
+        let mut config = EngineConfig::new(dir);
+        config.sync_mode = SyncMode::Interval(20);
+        config
+    }
+
+    #[test]
+    fn zero_interval_is_rejected_before_creating_database_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-zero-interval-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut config = EngineConfig::new(&dir);
+        config.sync_mode = SyncMode::Interval(0);
+        assert!(matches!(Engine::open(config), Err(DbError::Config(_))));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn interval_sync_worker_flushes_acknowledged_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-interval-sync-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let engine = Engine::open(interval_config(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2)
+            && engine.lock_mutex(&engine.writer).successful_syncs() == 0
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let syncs_before_put = engine.lock_mutex(&engine.writer).successful_syncs();
+        engine
+            .put("c", "key", Json::str("value"), PutOptions::default())
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let mut observed_sync = false;
+        while start.elapsed() < Duration::from_secs(2) {
+            if engine.lock_mutex(&engine.writer).successful_syncs() > syncs_before_put {
+                observed_sync = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            observed_sync,
+            "interval worker did not sync pending WAL writes"
+        );
+        engine.shutdown().unwrap();
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interval_sync_failure_poisons_engine_and_is_reported() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-interval-sync-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let engine = Engine::open(interval_config(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine.lock_mutex(&engine.writer).inject_sync_failure();
+        engine
+            .put("c", "key", Json::str("value"), PutOptions::default())
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) && !engine.poisoned.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(engine.poisoned.load(Ordering::SeqCst));
+        assert!(matches!(
+            engine.get("c", "key"),
+            Err(DbError::CommitOutcomeUnknown(_))
+        ));
+        assert!(matches!(
+            engine.shutdown(),
+            Err(DbError::CommitOutcomeUnknown(_))
+        ));
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn exhausted_wal_sequence_returns_a_limit_error_without_mutating() {

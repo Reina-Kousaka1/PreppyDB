@@ -169,7 +169,7 @@ exits; unknown keys in the file are rejected so typos cannot silently change beh
 | `listen` | `host:port`; a non-loopback address additionally requires `allow_public_bind: true` |
 | `max_body_bytes` | request body cap, 1 KiB … 256 MiB (default 4 MiB) |
 | `rate_limit_per_second` / `_burst` | per-credential limit; anonymous requests and login attempts are keyed by client IP (port-independent); `0` disables it; burst must be ≥ rate |
-| `sync_mode` | `always` (fsync every write, default), `interval` (fsync at most every 200 ms), `never` (tests only) |
+| `sync_mode` | `always` (sync every write, default), `interval` (background sync attempt every 200 ms), `never` (tests only) |
 | `read_only` | refuse all writes; the TTL sweeper must then be disabled |
 | `ruby_planner_path` | `null` by default; an absolute, trusted Ruby executable path enables experimental document queries. The Docker image includes Debian's Ruby runtime; set this to `/usr/bin/ruby` only when enabling the feature intentionally. The Docker persistence test exercises the authenticated Ruby-plan → Rust-validation/execution path. |
 | `lua_execution_enabled` | `false` by default; enables the bounded, admin-only Lua mutation endpoint |
@@ -193,7 +193,7 @@ capability is intentionally granted to administrators.
 | Mode | Guarantee |
 | --- | --- |
 | `always` | a write is acknowledged only after `sync_data` succeeds. This depends on the OS, filesystem, device, and controller honoring flush requests; it is not a universal power-loss guarantee. |
-| `interval` | `sync_data` is attempted at most every 200 ms; writes since the last successful sync can be lost after a process/OS failure. |
+| `interval` | A background worker attempts `sync_data` every configured interval (200 ms for `interval`). Scheduling and I/O can delay an attempt; commits are acknowledged before it, so writes since the last successful sync can be lost after a process/OS failure. A failed sync poisons the engine and subsequent reads/writes fail until reopen. Graceful shutdown performs a final sync. |
 | `never` | no explicit WAL sync; tests and benchmarks only. |
 
 If a WAL append or sync fails after a write may have reached the log, the operation
