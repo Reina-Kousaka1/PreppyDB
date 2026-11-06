@@ -305,6 +305,8 @@ pub const SESSION_TTL_MS: i64 = 8 * 60 * 60 * 1000;
 pub const MIN_PASSWORD_LEN: usize = 12;
 /// Upper bound for credential file reads, including files that grow during reading.
 pub const MAX_AUTH_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const DUMMY_PASSWORD_SALT: [u8; 16] = [0; 16];
+const DUMMY_PASSWORD_HASH: [u8; 32] = [0; 32];
 
 fn read_credentials(path: &Path) -> std::io::Result<String> {
     let file = std::fs::File::open(path)?;
@@ -688,25 +690,34 @@ impl AuthStore {
 
     /// Username/password login; returns a session token valid for [`SESSION_TTL_MS`].
     pub fn login(&mut self, username: &str, password: &str) -> Result<(String, Principal)> {
+        if password.chars().count() > 512 {
+            return Err(AuthError("invalid credentials".to_string()));
+        }
         let user = self
             .users
             .iter()
             .find(|user| user.username == username)
-            .ok_or_else(|| AuthError("invalid credentials".to_string()))?
-            .clone();
-        if user.disabled {
-            return Err(AuthError("account is disabled".to_string()));
-        }
-        if password.chars().count() > 512 {
+            .cloned();
+        let (salt, iterations, expected) = match &user {
+            Some(user) => {
+                let salt = hex_decode(&user.salt_hex)
+                    .map_err(|_| AuthError("corrupt credential".to_string()))?;
+                let expected = hex_decode(&user.hash_hex)
+                    .map_err(|_| AuthError("corrupt credential".to_string()))?;
+                (salt, user.iterations, expected)
+            }
+            None => (
+                DUMMY_PASSWORD_SALT.to_vec(),
+                DEFAULT_ITERATIONS,
+                DUMMY_PASSWORD_HASH.to_vec(),
+            ),
+        };
+        let actual = pbkdf2_hmac_sha256(password.as_bytes(), &salt, iterations, expected.len());
+        let password_matches = constant_time_eq(&actual, &expected);
+        let Some(user) = user else {
             return Err(AuthError("invalid credentials".to_string()));
-        }
-        let salt =
-            hex_decode(&user.salt_hex).map_err(|_| AuthError("corrupt credential".to_string()))?;
-        let expected =
-            hex_decode(&user.hash_hex).map_err(|_| AuthError("corrupt credential".to_string()))?;
-        let actual =
-            pbkdf2_hmac_sha256(password.as_bytes(), &salt, user.iterations, expected.len());
-        if !constant_time_eq(&actual, &expected) {
+        };
+        if user.disabled || !password_matches {
             return Err(AuthError("invalid credentials".to_string()));
         }
         let token = os_random_str(32)?;
@@ -843,13 +854,19 @@ mod tests {
     #[test]
     fn password_login_and_weak_password_rejection() {
         let (mut store, dir) = store("login");
+        let missing_user = store.login("missing", "wrong password here").unwrap_err();
         assert!(store
             .create_user("admin", "short", vec![Role::Admin])
             .is_err());
         store
             .create_user("admin", "correct horse battery", vec![Role::Admin])
             .unwrap();
-        assert!(store.login("admin", "wrong password here").is_err());
+        let wrong_password = store.login("admin", "wrong password here").unwrap_err();
+        assert_eq!(missing_user.0, wrong_password.0);
+        store.set_user_disabled("admin", true).unwrap();
+        let disabled_user = store.login("admin", "correct horse battery").unwrap_err();
+        assert_eq!(missing_user.0, disabled_user.0);
+        store.set_user_disabled("admin", false).unwrap();
         let (session, principal) = store.login("admin", "correct horse battery").unwrap();
         assert!(principal.allows(Role::Admin));
         assert!(store.authenticate_session(&session).is_some());
