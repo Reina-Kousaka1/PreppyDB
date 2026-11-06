@@ -65,13 +65,46 @@ impl Doc {
             .get("value")
             .cloned()
             .ok_or_else(|| DbError::corrupt("snapshot", "document is missing 'value'"))?;
+        let version = match value.get("version") {
+            None => 1,
+            Some(value) => value
+                .as_u64()
+                .filter(|version| *version > 0)
+                .ok_or_else(|| DbError::corrupt("snapshot", "invalid document version"))?,
+        };
+        let revision = match value.get("revision") {
+            None => 0,
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| DbError::corrupt("snapshot", "invalid document revision"))?,
+        };
+        let created_at = match value.get("created_at") {
+            None => 0,
+            Some(value) => value
+                .as_i64()
+                .ok_or_else(|| DbError::corrupt("snapshot", "invalid document created_at"))?,
+        };
+        let updated_at = match value.get("updated_at") {
+            None => 0,
+            Some(value) => value
+                .as_i64()
+                .ok_or_else(|| DbError::corrupt("snapshot", "invalid document updated_at"))?,
+        };
+        let expires_at = match value.get("expires_at") {
+            None | Some(Json::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .ok_or_else(|| DbError::corrupt("snapshot", "invalid document expires_at"))?,
+            ),
+        };
         Ok(Doc {
             value: doc,
-            version: value.get("version").and_then(|v| v.as_u64()).unwrap_or(1),
-            revision: value.get("revision").and_then(|v| v.as_u64()).unwrap_or(0),
-            created_at: value.get_i64("created_at").unwrap_or(0),
-            updated_at: value.get_i64("updated_at").unwrap_or(0),
-            expires_at: value.get("expires_at").and_then(|v| v.as_i64()),
+            version,
+            revision,
+            created_at,
+            updated_at,
+            expires_at,
         })
     }
 
@@ -1002,6 +1035,42 @@ mod tests {
         let index = &s.collection("people").unwrap().indexes["by_value"].entries;
         assert!(index[&Json::int(1).canonical_bytes()].contains("a"));
         assert!(!index.contains_key(&Json::int(2).canonical_bytes()));
+    }
+
+    #[test]
+    fn snapshot_document_rejects_present_but_invalid_metadata() {
+        let valid = Doc {
+            value: Json::int(1),
+            version: 1,
+            revision: 1,
+            created_at: 1000,
+            updated_at: 1000,
+            expires_at: Some(2000),
+        }
+        .to_json();
+        for (field, value) in [
+            ("version", Json::str("invalid")),
+            ("version", Json::uint(0)),
+            ("revision", Json::str("invalid")),
+            ("created_at", Json::str("invalid")),
+            ("updated_at", Json::str("invalid")),
+            ("expires_at", Json::str("invalid")),
+        ] {
+            let mut forged = valid.clone();
+            forged.set(field, value);
+            let error = Doc::from_json(&forged).unwrap_err();
+            assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA, "{field}");
+        }
+    }
+
+    #[test]
+    fn snapshot_document_keeps_legacy_defaults_for_absent_metadata() {
+        let decoded = Doc::from_json(&Json::obj().with("value", Json::int(1))).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.revision, 0);
+        assert_eq!(decoded.created_at, 0);
+        assert_eq!(decoded.updated_at, 0);
+        assert_eq!(decoded.expires_at, None);
     }
 
     #[test]
