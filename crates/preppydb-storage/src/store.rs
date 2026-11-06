@@ -483,14 +483,29 @@ impl Store {
                 }
             }
         }
+        let (version, created_at) = match &existing {
+            Some(doc) => (
+                doc.version.checked_add(1).ok_or(DbError::LimitExceeded {
+                    limit: "document_version",
+                    max: u64::MAX,
+                    actual: u64::MAX,
+                })?,
+                doc.created_at,
+            ),
+            None => (1, now_ms),
+        };
+        let expires_at = match (expires_at, coll.meta.default_ttl_ms) {
+            (Some(expires_at), _) => Some(expires_at),
+            (None, Some(ttl)) => Some(
+                now_ms
+                    .checked_add(ttl)
+                    .ok_or_else(|| DbError::validation("default TTL overflows timestamp"))?,
+            ),
+            (None, None) => None,
+        };
         if let Some(old) = &existing {
             coll.unindex_document(key, old);
         }
-        let (version, created_at) = match &existing {
-            Some(doc) => (doc.version + 1, doc.created_at),
-            None => (1, now_ms),
-        };
-        let expires_at = expires_at.or(coll.meta.default_ttl_ms.map(|ttl| now_ms + ttl));
         let doc = Doc {
             value,
             version,
@@ -946,6 +961,50 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_document_version_rejects_update_without_changing_indexes() {
+        let mut s = store();
+        s.create_index(
+            "people",
+            IndexMeta {
+                name: "by_value".into(),
+                field: "value".into(),
+                unique: false,
+                sparse: false,
+                created_at: 0,
+            },
+            ApplyMode::Live,
+        )
+        .unwrap();
+        let original = Json::obj().with("value", Json::int(1));
+        put(&mut s, "a", original.clone()).unwrap();
+        s.collections
+            .get_mut("people")
+            .unwrap()
+            .docs
+            .get_mut("a")
+            .unwrap()
+            .version = u64::MAX;
+
+        let error = s
+            .put(
+                "people",
+                "a",
+                Json::obj().with("value", Json::int(2)),
+                None,
+                None,
+                1000,
+                2,
+                ApplyMode::Live,
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::LIMIT_EXCEEDED);
+        assert_eq!(s.get("people", "a", 1000).unwrap().unwrap().value, original);
+        let index = &s.collection("people").unwrap().indexes["by_value"].entries;
+        assert!(index[&Json::int(1).canonical_bytes()].contains("a"));
+        assert!(!index.contains_key(&Json::int(2).canonical_bytes()));
+    }
+
+    #[test]
     fn compare_and_set() {
         let mut s = store();
         put(&mut s, "a", Json::int(1)).unwrap();
@@ -1053,6 +1112,28 @@ mod tests {
             s.get("cache", "x", 1000).unwrap().unwrap().expires_at,
             Some(1500)
         );
+    }
+
+    #[test]
+    fn overflowing_default_ttl_rejects_write_without_changing_document() {
+        let mut s = Store::new(Limits::default());
+        let mut meta = CollectionMeta::new("cache", 0);
+        meta.default_ttl_ms = Some(i64::MAX);
+        s.create_collection(meta, ApplyMode::Live).unwrap();
+        let error = s
+            .put(
+                "cache",
+                "x",
+                Json::int(1),
+                None,
+                None,
+                1000,
+                1,
+                ApplyMode::Live,
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::VALIDATION_FAILED);
+        assert!(s.get("cache", "x", 1000).unwrap().is_none());
     }
 
     #[test]
