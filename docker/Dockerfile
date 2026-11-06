@@ -27,6 +27,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY clients ./clients
+COPY engines ./engines
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
@@ -35,7 +36,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       amd64) RUST_TARGET=x86_64-unknown-linux-gnu ;; \
       arm64) RUST_TARGET=aarch64-unknown-linux-gnu; \
              rustup target add "$RUST_TARGET" >/dev/null; \
-             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc ;; \
+             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc; \
+             export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc ;; \
       *) echo "unsupported TARGETARCH '$TARGETARCH' (want amd64 or arm64)" >&2; exit 1 ;; \
     esac; \
     cargo build --locked --profile "$CARGO_PROFILE" --target "$RUST_TARGET" \
@@ -52,7 +54,7 @@ FROM debian:bookworm-slim AS runtime
 # gosu lets the entrypoint fix the ownership of a fresh (root-owned) volume and then
 # drop to the unprivileged user without any shell or setuid binary of our own.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates gosu tini \
+    && apt-get install -y --no-install-recommends ca-certificates gosu ruby tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 preppydb \
     && useradd --uid 10001 --gid preppydb --shell /usr/sbin/nologin --no-create-home preppydb \
