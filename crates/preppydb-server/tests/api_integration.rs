@@ -740,10 +740,11 @@ fn personality_model_and_admin_endpoints() {
     let verify = admin.verify().unwrap();
     assert_eq!(verify.get("ok").and_then(|v| v.as_bool()), Some(true));
 
-    let archive = server.dir.join("backup.bak");
+    let archive = server.dir.with_extension("backup.bak");
     let backup = admin.backup(archive.to_str().unwrap()).unwrap();
     assert!(backup.get("entries").unwrap().as_u64().unwrap() >= 2);
     assert!(archive.exists());
+    std::fs::remove_file(&archive).unwrap();
 
     // Admin-only endpoints reject a write-scoped token.
     let writer = Client::new(&server.base_url, &server.writer).unwrap();

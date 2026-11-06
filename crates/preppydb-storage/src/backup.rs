@@ -234,6 +234,10 @@ pub fn create_backup(
     archive: &Path,
     checkpoint_first: bool,
 ) -> Result<BackupReport> {
+    // The final archive rename must never replace a live manifest, snapshot or WAL
+    // member. Check before checkpointing so a rejected destination cannot mutate the
+    // source database as a side effect.
+    validate_backup_destination(&engine.paths().root, archive)?;
     if checkpoint_first {
         engine.checkpoint()?;
     }
@@ -248,6 +252,7 @@ fn create_backup_locked(
     seq: u64,
 ) -> Result<BackupReport> {
     let root = engine.paths().root.clone();
+    validate_backup_destination(&root, archive)?;
 
     let members = collect_members(&root)?;
     let mut entries = Vec::with_capacity(members.len());
@@ -343,6 +348,11 @@ fn create_backup_locked(
         bytes >= total_len,
         "archive must contain at least its member data"
     );
+    // Re-resolve the destination after creating the parent and writing the temp file.
+    // This catches a parent symlink/reparse-point that changed before publication;
+    // descriptor-relative publication would be needed to eliminate the final TOCTOU
+    // window on hostile, concurrently modified parent directories.
+    validate_backup_destination(&root, archive)?;
     crate::fsutil::replace_file(&tmp, archive)
         .map_err(|err| DbError::io("renaming archive into place", err))?;
     temp_guard.disarm();
@@ -366,6 +376,66 @@ fn create_backup_locked(
         archive_sha256: file_hash,
         content_sha256: preppydb_crypto::hex_encode(&archive_digest),
     })
+}
+
+fn validate_backup_destination(root: &Path, archive: &Path) -> Result<()> {
+    let root = std::fs::canonicalize(root)
+        .map_err(|err| DbError::io("resolving database directory for backup", err))?;
+    let archive = if archive.is_absolute() {
+        archive.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| DbError::io("resolving backup destination", err))?
+            .join(archive)
+    };
+    let name = archive
+        .file_name()
+        .filter(|name| *name != "." && *name != "..")
+        .ok_or_else(|| DbError::validation("backup destination must name a file"))?;
+    let parent = archive.parent().unwrap_or_else(|| Path::new("."));
+    let resolved_parent = canonicalize_with_missing_suffix(parent)?;
+    let resolved_destination = resolved_parent.join(name);
+    if resolved_destination.starts_with(&root) {
+        return Err(DbError::validation(
+            "backup archive must be outside the source database directory",
+        ));
+    }
+    Ok(())
+}
+
+/// Canonicalize an output parent even when some trailing directories do not yet
+/// exist. Existing prefixes are resolved through symlinks/reparse points; the
+/// missing suffix is then normalized lexically.
+fn canonicalize_with_missing_suffix(path: &Path) -> Result<PathBuf> {
+    let mut cursor = path.to_path_buf();
+    let mut suffix = Vec::new();
+    let mut resolved = loop {
+        match std::fs::canonicalize(&cursor) {
+            Ok(resolved) => break resolved,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let Some(component) = cursor.file_name() else {
+                    return Err(DbError::io("resolving backup destination parent", err));
+                };
+                suffix.push(component.to_os_string());
+                let Some(parent) = cursor.parent() else {
+                    return Err(DbError::io("resolving backup destination parent", err));
+                };
+                cursor = parent.to_path_buf();
+            }
+            Err(err) => return Err(DbError::io("resolving backup destination parent", err)),
+        }
+    };
+    for component in suffix.iter().rev() {
+        if component == "." {
+            continue;
+        }
+        if component == ".." {
+            resolved.pop();
+        } else {
+            resolved.push(component);
+        }
+    }
+    Ok(resolved)
 }
 
 fn create_backup_temp(archive: &Path) -> Result<(PathBuf, File)> {
@@ -1217,6 +1287,56 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn backup_rejects_destination_inside_source_before_checkpoint_or_directory_creation() {
+        let root = tempdir("destination-inside-source");
+        let engine = Engine::open(crate::engine::EngineConfig::new(&root)).unwrap();
+        let generation_before = engine.stats().generation;
+        let manifest = crate::manifest::Manifest::generation_path(&root, 1);
+
+        let error = create_backup(&engine, &manifest, true).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::VALIDATION_FAILED);
+        assert_eq!(engine.stats().generation, generation_before);
+        assert!(
+            !manifest.exists(),
+            "rejected output must not replace or create a manifest"
+        );
+
+        let nested_output = root
+            .join("not-created")
+            .join("subdir")
+            .join("backup.pdbbak");
+        let error = create_backup(&engine, &nested_output, false).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::VALIDATION_FAILED);
+        assert!(!nested_output.parent().unwrap().exists());
+        assert!(engine.verify().unwrap().ok);
+
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_destination_resolves_parent_symlinks_before_checkpoint() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir("destination-parent-symlink");
+        let alias = root.with_extension("alias");
+        symlink(&root, &alias).unwrap();
+        let engine = Engine::open(crate::engine::EngineConfig::new(&root)).unwrap();
+        let generation_before = engine.stats().generation;
+        let destination = alias.join("nested").join("backup.pdbbak");
+
+        let error = create_backup(&engine, &destination, true).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::VALIDATION_FAILED);
+        assert_eq!(engine.stats().generation, generation_before);
+        assert!(!root.join("nested").exists());
+
+        drop(engine);
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn corrupt_snapshot_and_reseal_archive(archive: &Path) {

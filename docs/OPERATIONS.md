@@ -245,10 +245,12 @@ mode 0600). Sessions are memory-only and end on restart.
 ### Backups
 
 Backup holds an engine read lock while it copies and verifies the archive, so writes
-and checkpoints wait until it finishes. The temporary archive must not already exist;
-an interrupted operation may require an operator to inspect and remove that temporary
-file before retrying. This does not protect against external modification of database
-files outside the engine.
+and checkpoints wait until it finishes. It writes to a unique temporary sibling and
+verifies it before publication. Choose a unique destination path to retain prior backup
+generations; publication may replace an existing destination where the filesystem's
+rename semantics allow it. An interrupted operation may leave a temporary file for
+inspection. This does not protect against external modification of database files
+outside the engine.
 
 ```bash
 # Archive (takes a checkpoint first unless --no-checkpoint)
@@ -260,6 +262,11 @@ preppydb backup-verify --archive /backups/preppy-2026-11-04.bak
 # Restore into a new directory (existing targets are moved aside, never deleted)
 preppydb restore --archive /backups/preppy-2026-11-04.bak --target /srv/preppydb-restored
 ```
+
+The archive destination must be outside the source database directory. PreppyDB resolves
+existing parent symlinks/reparse points and checks the destination again before
+publication; concurrent hostile changes to the parent path are not protected against by
+descriptor-relative filesystem operations.
 
 The archive contains a header, every file with a SHA-256, and a trailing whole-file
 SHA-256. `backup-verify` validates both the archive checksums and the embedded database

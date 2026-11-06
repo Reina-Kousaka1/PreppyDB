@@ -217,7 +217,11 @@ The header records the creation time, whether a checkpoint was taken, the manife
 generation and per-member SHA-256 hashes. `restore` verifies the archive hash *and* every
 member hash before touching the target directory, then moves any existing target to
 `<name>.replaced-<ts>` instead of deleting it. A failed restore therefore leaves the old
-data intact.
+data intact. Backup output is rejected when its resolved destination is inside the live
+database directory, preventing the final archive rename from replacing a manifest,
+snapshot, or WAL segment. Parent paths are resolved again before publication, but the
+implementation does not claim protection against a hostile concurrent parent-directory
+replacement race.
 
 ## HTTP layer
 
