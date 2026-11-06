@@ -21,6 +21,9 @@ use preppydb_json::Json;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_BACKUP_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 pub const ARCHIVE_MAGIC: &[u8; 8] = b"PPDBBAK1";
 pub const ARCHIVE_END: &[u8; 8] = b"PPDBEND1";
@@ -265,12 +268,8 @@ fn create_backup_locked(
                 .map_err(|err| DbError::io("creating archive directory", err))?;
         }
     }
-    let tmp = archive.with_extension("bak.tmp");
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|err| DbError::io(format!("creating {}", tmp.display()), err))?;
+    let (tmp, file) = create_backup_temp(archive)?;
+    let mut temp_guard = BackupTempFile::new(tmp.clone());
     let mut writer = BufWriter::new(file);
     let mut digest = Sha256::new();
     let write = |writer: &mut BufWriter<File>, digest: &mut Sha256, bytes: &[u8]| -> Result<()> {
@@ -319,14 +318,24 @@ fn create_backup_locked(
     let mut verifier = open_archive(&tmp)?;
     verifier.verify()?;
     drop(verifier);
-    crate::fsutil::replace_file(&tmp, archive)
-        .map_err(|err| DbError::io("renaming archive into place", err))?;
-
-    let (bytes, file_hash) = crate::snapshot::file_sha256(archive)?;
+    let (bytes, file_hash) = crate::snapshot::file_sha256(&tmp)?;
     debug_assert!(
         bytes >= total_len,
         "archive must contain at least its member data"
     );
+    crate::fsutil::replace_file(&tmp, archive)
+        .map_err(|err| DbError::io("renaming archive into place", err))?;
+    temp_guard.disarm();
+    fsync_dir(archive.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(
+        || Path::new("."),
+    ))
+    .map_err(|err| {
+        DbError::io(
+            "backup archive was published but syncing its parent directory failed; publication durability is unknown",
+            std::io::Error::other(err.to_string()),
+        )
+    })?;
+
     Ok(BackupReport {
         archive: archive.display().to_string(),
         entries: entries.len(),
@@ -337,6 +346,84 @@ fn create_backup_locked(
         archive_sha256: file_hash,
         content_sha256: preppydb_crypto::hex_encode(&archive_digest),
     })
+}
+
+fn create_backup_temp(archive: &Path) -> Result<(PathBuf, File)> {
+    let parent = archive
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for _ in 0..32 {
+        let id = next_backup_temp_id()?;
+        let path = parent.join(format!(".preppydb-backup-{}-{id}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(DbError::io(
+                    format!("creating backup temporary file {}", path.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    Err(DbError::io(
+        "creating unique backup temporary file",
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not reserve a unique temporary name after 32 attempts",
+        ),
+    ))
+}
+
+fn next_backup_temp_id() -> Result<u64> {
+    let mut current = NEXT_BACKUP_TEMP_ID.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).ok_or(DbError::LimitExceeded {
+            limit: "backup_temp_id",
+            max: u64::MAX,
+            actual: u64::MAX,
+        })?;
+        match NEXT_BACKUP_TEMP_ID.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+struct BackupTempFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl BackupTempFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BackupTempFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Parsed archive header plus verification state.
@@ -1511,6 +1598,50 @@ mod tests {
         let mut output = Vec::new();
         copy_verified_member(&mut &b"good"[..], &mut output, &entry).unwrap();
         assert_eq!(output, b"good");
+    }
+
+    #[test]
+    fn backup_ignores_stale_legacy_temporary_file_and_publishes_verified_archive() {
+        let root = tempdir("stale-backup-temp");
+        let source = root.join("source");
+        let engine = Engine::open(crate::engine::EngineConfig::new(&source)).unwrap();
+        engine
+            .create_collection(crate::catalog::CollectionMeta::new("items", 0))
+            .unwrap();
+        engine
+            .put(
+                "items",
+                "one",
+                Json::str("value"),
+                crate::engine::PutOptions::default(),
+            )
+            .unwrap();
+
+        let archive = root.join("database.bak");
+        let stale_temp = archive.with_extension("bak.tmp");
+        std::fs::write(&stale_temp, b"interrupted previous backup").unwrap();
+        create_backup(&engine, &archive, false).unwrap();
+
+        assert_eq!(
+            std::fs::read(&stale_temp).unwrap(),
+            b"interrupted previous backup"
+        );
+        assert_eq!(
+            verify_backup(&archive)
+                .unwrap()
+                .get("ok")
+                .and_then(Json::as_bool),
+            Some(true)
+        );
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".preppydb-backup-")
+        }));
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
