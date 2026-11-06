@@ -626,7 +626,7 @@ pub fn restore_backup(archive: &Path, target: &Path, force: bool) -> Result<Rest
     // sibling intent both before creating the database directory and again after
     // taking its directory lock, closing the open-vs-restore race for writers.
     validate_restore_target(target, force)?;
-    let target_lock = match std::fs::symlink_metadata(target) {
+    let mut target_lock = match std::fs::symlink_metadata(target) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
             Some(FileLock::acquire(target)?)
         }
@@ -636,12 +636,18 @@ pub fn restore_backup(archive: &Path, target: &Path, force: bool) -> Result<Rest
     };
     validate_restore_target(target, force)?;
     let intent = RestoreIntent::create(target, &temp, &aside)?;
+    // The durable sibling intent now prevents new Engine::open calls from
+    // succeeding (including callers that passed the first check before the
+    // intent was created: they check again after acquiring the directory lock).
+    // Release the in-directory LOCK handle before renaming the target directory;
+    // Windows refuses to rename a directory while a file handle inside it remains
+    // open, even when the lock owner is the restoring process itself.
+    drop(target_lock.take());
     let replaced_path = complete_restore_publication(
         intent,
         publish_restore(&temp, target, &aside, force),
         target,
     )?;
-    drop(target_lock);
 
     Ok(RestoreReport {
         archive: archive.display().to_string(),
