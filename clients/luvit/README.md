@@ -5,7 +5,7 @@ A dependency-free Lua client for the PreppyDB `/v1` HTTP API, written for
 codec, so nothing has to be installed next to it.
 
 ```lua
-local preppydb = require("preppydb")
+local preppydb = require("./preppydb") -- Luvit: relative to the calling file
 
 local db, err = preppydb.new({
   url = "http://127.0.0.1:7077",
@@ -35,8 +35,14 @@ cp preppydb.lua /path/to/app/deps/preppydb.lua
 There is no `lit` package and no build step. Under luvit:
 
 ```lua
-local preppydb = require("preppydb")   -- resolves deps/preppydb.lua
+local preppydb = require("./preppydb") -- place preppydb.lua alongside the caller
 ```
+
+The default response body limit is 16 MiB; configure `max_response_bytes` in
+`preppydb.new` when a different limit is needed. The default transport stops
+collecting chunks when that limit is exceeded. Custom transports must enforce
+the same limit while receiving data: the client can check their returned body
+before decoding but cannot prevent allocations inside a custom transport.
 
 ## API
 

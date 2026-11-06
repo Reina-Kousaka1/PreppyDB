@@ -95,7 +95,7 @@ collections, documents, pricing and backups from there.
 | --- | --- |
 | Document store: collections, CRUD, scan by key prefix, CAS versions | done |
 | Atomic batches and read-committed transactions | done |
-| Write-ahead log, group `fsync`, checkpointing, atomic manifest, recovery | done |
+| Write-ahead log, group `fsync`, generation-manifest checkpointing, recovery | done |
 | Compaction, orphan-segment cleanup, TTL + expiry sweeper | done |
 | CRC32C on every WAL frame and snapshot block, SHA-256 on snapshots, `verify` | done |
 | Secondary indexes (equality, range, unique) | done, with documented limits |
@@ -161,7 +161,8 @@ build needs the crates cached or reachable from crates.io. See
   version and a per-key revision (the global sequence number of the write). Every
   mutation is appended to a WAL segment as a length-prefixed, CRC32C-protected frame
   before it is applied in memory. A checkpoint rotates the WAL, writes a checksummed
-  snapshot, atomically replaces the manifest and deletes retired segments. Recovery
+  snapshot, atomically publishes a new generation manifest without replacing the prior
+  one, then deletes retired segments. Recovery
   replays surviving segments after the snapshot sequence number and truncates a torn
   tail with an explicit report instead of silently guessing.
 * **Concurrency.** One process owns the directory (OS advisory lock, released by the

@@ -32,6 +32,59 @@ Three ways to authenticate, all as `Authorization: Bearer <token>`:
 
 Roles: `read` < `write` < `admin`.
 
+### Experimental document query
+
+When an administrator configures an absolute `ruby_planner_path`, clients with the
+`read` role may call `POST /v1/collections/{collection}/query` with, for example,
+`{"version":1,"filter":{"field":"name","op":"eq","value":"A"},"limit":100}`.
+The optional filter supports `eq`, `gte`, and `lte` on scalar values. Missing fields
+do not match, including `eq` with `null`. Range comparisons apply only to numbers or
+strings of the same kind; there is no implicit string/number conversion. Limits are
+1–1000. Rust validates the Ruby plan, rechecks the complete filter and revalidates
+index metadata under the read lock. Range and numeric index plans are not yet enabled.
+The planner runs as a separate process, not an OS sandbox. This experimental endpoint
+is disabled by default and is not a stable query-language commitment.
+
+### Controlled Lua mutation scripts
+
+`lua_execution_enabled` defaults to `false`. When an administrator explicitly enables
+it, only an `admin` principal may call `POST /v1/lua/execute`. The body contains a
+`script` string and an optional JSON `input`. The script returns exactly
+`{ result = <JSON>, operations = <array> }`; Rust accepts only `put` and `delete`
+operations, validates collection policy and operation shapes, and sends the complete
+list through the ordinary compare-and-set storage batch path. Each operation must
+include `expected_version` (`0` means insert-only; another value must match the
+document's current version). Scripts have no database handle
+and execute before any storage lock is acquired. If execution or validation fails,
+none of the returned operations are submitted.
+
+The embedded Lua 5.4 VM has a 128 KiB source limit, 2 MiB input/output limits, a 16 MiB
+VM memory limit, a 2,000,000-instruction budget and at most 1,000 mutations. It does
+not load filesystem, network, package, debug, string, dynamic-load or protected-call
+libraries. JSON `null` is `preppydb.null` and can be checked with
+`preppydb.is_null(value)`; use `preppydb.array()` to express an empty JSON array (an
+unmarked empty Lua table is an empty JSON object). Scripts are supplied per request;
+there is no persistent function catalog, trigger system, read/query access from Lua,
+or durable retry/idempotency mechanism. If a storage commit may have reached the WAL
+but append/sync reports an error, the API returns `commit_outcome_unknown`; reopen and
+inspect state before retrying the mutation.
+
+Example:
+
+```lua
+local amount = input.amount
+return {
+  result = { credited = amount },
+  operations = preppydb.array({
+    { op = "put", collection = "wallets", key = "user-1", expected_version = 0, value = { balance = amount } }
+  })
+}
+```
+
+Enabling the endpoint grants configured administrators the ability to run bounded
+Lua computation and request writes as the server identity. It should remain disabled
+unless this capability is intentionally administered.
+
 * `read` — read documents, scan, index queries, stats.
 * `write` — everything `read` plus document writes, batches, transactions, pricing ticks,
   purchases.
@@ -265,6 +318,18 @@ See [DATA-MODEL.md](DATA-MODEL.md).
 | `GET /v1/pricing/history/{item}` | read | price history for one item |
 | `GET /v1/pricing/audit` | admin | audit log entries |
 | `GET /v1/pricing/audit/verify` | admin | verify the audit hash chain |
+
+The pricing audit file and database are separate writes, not one transaction. A
+pricing mutation may already be committed if an audit append fails; in that case
+the server returns `503 audit_unavailable` and clients must inspect the operation's
+state before retrying. Further pricing mutations are rejected until the audit is
+reopened by restarting the server after the cause is resolved. A valid suffix removed
+from the audit file before the first open cannot be detected without an external
+trusted anchor. Each audit record is limited to 1 MiB and parsed with bounded JSON
+limits. The full chain is verified while streaming on open and on explicit verify; the
+server retains only a recent tail bounded by 1,000 entries and 4 MiB of serialized
+records. `GET /v1/pricing/audit` can return fewer entries than requested when the byte
+bound is reached. The verify response reports the total verified entry count.
 | `POST /v1/pricing/simulate` | read | `{"rule":{…},"steps":10,"seed":"x"}` → deterministic history, nothing stored |
 
 See [DYNAMIC-PRICING.md](DYNAMIC-PRICING.md) for invariants.
@@ -291,6 +356,9 @@ See [DYNAMIC-PRICING.md](DYNAMIC-PRICING.md) for invariants.
 | `limit_exceeded` | 422 | no | document/collection limit reached |
 | `rate_limited` | 429 | **yes** | slow down, `Retry-After` is set |
 | `database_locked` | 503 | **yes** | another process owns the directory |
+| `commit_outcome_unknown` | 503 | no | WAL append/sync failed after the mutation may have reached the log; reopen and inspect before retrying |
+| `restore_outcome_unknown` | 503 | no | restore target was renamed into place but syncing its parent failed; inspect the target and retained `previous` directory before retrying |
+| `recovery_required` | 503 | no | an interrupted restore intent blocks database open until target/staging/previous paths are inspected |
 | `internal` / `io_error` / `corrupt_data` | 500 | no | server-side failure; `corrupt_data` means a checksum failed |
 | `unsupported` | 501 | no | feature explicitly not implemented |
 

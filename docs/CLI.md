@@ -81,7 +81,10 @@ preppydb model bootstrap --data-dir ./data
 
 `verify` answers `{"ok": true, "issues": [], "segments": [...], "snapshot": {...}}` and
 exits `1` when it found a problem. `restore` verifies every checksum *before* writing and
-moves an existing target to `<target>.replaced-<ts>` instead of deleting it.
+moves an existing target to `<target>.replaced-<ts>` instead of deleting it. `backup-verify`
+also extracts to an exclusive temporary directory and strictly opens/verifies the
+embedded database, so a checksummed archive containing malformed database files fails.
+This requires temporary disk space approximately equal to the database copy.
 
 ## Pricing
 
@@ -91,6 +94,9 @@ preppydb pricing simulate --min 1000 --max 2000 --anchor 1500 \
 preppydb audit verify --data-dir ./data          # verify the audit hash chain
 preppydb audit show   --data-dir ./data [--file PATH]
 ```
+
+`audit verify` reports the total record count after streaming the full file. `audit show`
+prints the bounded in-memory tail (up to 1,000 entries and 4 MiB serialized).
 
 `pricing simulate` is pure computation: it validates the bounds, runs a seeded walk and
 prints the resulting history. It never touches a database.

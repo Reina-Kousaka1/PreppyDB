@@ -102,6 +102,14 @@ AuditEntry { seq, kind, at, detail, previous_hash, hash }
 entry breaks it and is reported instead of being ignored. The log is append-only from the
 server's point of view — there is no rotate/truncate endpoint.
 
+Audit records are streamed and verified one at a time on open and explicit verify; a
+record is limited to 1 MiB and parsed with bounded JSON depth/item limits. The in-memory
+history view retains only the newest entries, bounded to 1,000 records and 4 MiB of
+serialized data. `GET /v1/pricing/audit` may therefore return fewer records than its
+requested limit. The verify endpoint reports the total verified record count. This
+does not detect deletion of a valid suffix that occurred before the first open, since
+the file has no independent external head anchor.
+
 ## API walkthrough
 
 ```bash
