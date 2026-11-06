@@ -1321,6 +1321,91 @@ fn sequence_gap_after_checkpoint_fails_closed_and_repair_drops_suffix() {
 }
 
 #[test]
+fn interrupted_corruption_repair_fails_closed_then_can_be_repaired_again() {
+    let dir = tempdir("interrupted-corruption-repair");
+    let mut cfg = EngineConfig::new(&dir);
+    cfg.sync_mode = SyncMode::Always;
+    cfg.max_segment_bytes = wal::WAL_HEADER_LEN + 1;
+    {
+        let engine = Engine::open(cfg.clone()).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "baseline", Json::int(0), PutOptions::default())
+            .unwrap();
+        engine.checkpoint().unwrap();
+        for index in 0..4 {
+            engine
+                .put(
+                    "c",
+                    &format!("post-checkpoint-{index}"),
+                    Json::int(index),
+                    PutOptions::default(),
+                )
+                .unwrap();
+        }
+    }
+
+    let segments = wal::list_segments(&dir.join("wal")).unwrap();
+    assert!(
+        segments.len() >= 4,
+        "expected rotated segments: {segments:?}"
+    );
+
+    // Model a crash after repair has durably truncated a corrupt segment to its
+    // valid prefix but before it removes later segments. The default open must
+    // reject this ambiguous state instead of treating the suffix as committed.
+    let first_post_checkpoint_segment = &segments[0];
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(first_post_checkpoint_segment)
+        .unwrap();
+    file.set_len(wal::WAL_HEADER_LEN).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    assert!(matches!(
+        Engine::open(cfg.clone()),
+        Err(DbError::Corrupt { .. })
+    ));
+
+    cfg.repair = RepairPolicy::TruncateCorruptTail;
+    let repaired = Engine::open(cfg.clone()).unwrap();
+    assert_eq!(repaired.count("c").unwrap(), 1);
+    assert_eq!(
+        repaired.get("c", "baseline").unwrap().value.as_i64(),
+        Some(0)
+    );
+    assert!(repaired
+        .get_opt("c", "post-checkpoint-0")
+        .unwrap()
+        .is_none());
+    assert!(repaired
+        .recovery_notes()
+        .iter()
+        .any(|note| note.kind == "corruption_truncated"));
+    repaired
+        .put("c", "after-repair", Json::int(9), PutOptions::default())
+        .unwrap();
+    drop(repaired);
+
+    cfg.repair = RepairPolicy::Strict;
+    let reopened = Engine::open(cfg).unwrap();
+    assert_eq!(reopened.count("c").unwrap(), 2);
+    assert_eq!(
+        reopened.get("c", "baseline").unwrap().value.as_i64(),
+        Some(0)
+    );
+    assert_eq!(
+        reopened.get("c", "after-repair").unwrap().value.as_i64(),
+        Some(9)
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn verify_and_recovery_reject_torn_wal_segment_followed_by_later_segment() {
     let dir = tempdir("torn-wal-before-later-segment");
     let mut cfg = EngineConfig::new(&dir);
