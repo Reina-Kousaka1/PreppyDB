@@ -660,6 +660,26 @@ impl AuditLog {
     /// Open (or create) an audit log file and load its existing entries.
     pub fn open(path: impl Into<PathBuf>) -> Result<AuditLog> {
         let path = path.into();
+        // Windows may report a child of a regular file as NotFound. Without this
+        // check, scan_audit_log would mistake an unusable path for a new log.
+        if let Some(parent) = path.parent() {
+            match std::fs::metadata(parent) {
+                Ok(metadata) if !metadata.is_dir() => {
+                    return Err(PricingError::new(
+                        codes::AUDIT_INTEGRITY,
+                        "audit log parent is not a directory",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(PricingError::new(
+                        codes::AUDIT_INTEGRITY,
+                        format!("reading audit log parent: {error}"),
+                    ));
+                }
+                Ok(_) => {}
+            }
+        }
         let mut log = AuditLog {
             path,
             entries: std::collections::VecDeque::new(),
@@ -1288,6 +1308,24 @@ mod tests {
         let error = AuditLog::open(&path).unwrap_err();
         assert_eq!(error.code, codes::AUDIT_INTEGRITY);
         assert!(error.message.contains("entry size limit"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_log_rejects_regular_file_as_parent() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-parent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join("regular-file");
+        std::fs::write(&parent, b"not a directory").unwrap();
+        let error = AuditLog::open(parent.join("audit.log")).unwrap_err();
+        assert_eq!(error.code, codes::AUDIT_INTEGRITY);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
