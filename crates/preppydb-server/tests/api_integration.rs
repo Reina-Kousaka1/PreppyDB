@@ -663,6 +663,31 @@ fn pricing_audit_failure_is_reported_and_disables_further_writes() {
 }
 
 #[test]
+fn admin_recovery_reports_pricing_audit_startup_failure() {
+    let server = start("pricing-audit-open-failure", |config| {
+        let blocker = config.data_path.join("audit-parent-file");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        config.pricing_audit_path = Some(blocker.join("pricing-audit.log"));
+    });
+
+    let recovery = admin_client(&server).recovery().unwrap();
+    let audit = recovery.get("pricing_audit").unwrap();
+    assert_eq!(audit.get("available").and_then(Json::as_bool), Some(false));
+    let diagnostic = audit
+        .get_str("startup_error")
+        .expect("audit initialization failure must be diagnosable to admins");
+    assert!(diagnostic.contains("audit_log_integrity"));
+
+    let rule = preppydb_json::parse(
+        r#"{"item_id":"hat","min_price_cents":100,"max_price_cents":200,"anchor_price_cents":150,"step_cents":20}"#,
+    )
+    .unwrap();
+    let error = admin_client(&server).put_price_rule(&rule).unwrap_err();
+    assert_eq!(error.status(), Some(503));
+    assert_eq!(error.code(), Some("audit_unavailable"));
+}
+
+#[test]
 fn simulate_is_reproducible_and_writes_nothing() {
     let server = start("simulate", |config| {
         config.pricing_seed = Some("sim-seed".to_string());

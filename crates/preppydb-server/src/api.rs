@@ -38,6 +38,7 @@ pub struct ApiState {
     login_limiter: Mutex<RateLimiter>,
     pub counters: Arc<ServerCounters>,
     pub pricing: Mutex<PricingState>,
+    audit_startup_error: Option<String>,
     pricing_operations: Mutex<()>,
     pub started_at: i64,
     requests: AtomicU64,
@@ -56,7 +57,10 @@ impl ApiState {
             None => PricingEngine::from_entropy()
                 .unwrap_or_else(|_| PricingEngine::with_seed(b"fallback")),
         };
-        let audit = AuditLog::open(config.audit_file()).ok();
+        let (audit, audit_startup_error) = match AuditLog::open(config.audit_file()) {
+            Ok(audit) => (Some(audit), None),
+            Err(error) => (None, Some(format!("{}: {}", error.code, error.message))),
+        };
         ApiState {
             engine,
             config: config.clone(),
@@ -72,11 +76,18 @@ impl ApiState {
                 engine: pricing_engine,
                 audit,
             }),
+            audit_startup_error,
             pricing_operations: Mutex::new(()),
             started_at: preppydb_storage::clock::now_ms(),
             requests: AtomicU64::new(0),
             pricing_collections_ready: AtomicBool::new(false),
         }
+    }
+
+    /// Startup diagnostic for an unavailable pricing audit log. The detailed value is
+    /// exposed only through admin diagnostics; pricing mutations remain fail-closed.
+    pub fn audit_startup_error(&self) -> Option<&str> {
+        self.audit_startup_error.as_deref()
     }
 
     // ---------------------------------------------------------------- helpers
@@ -788,10 +799,28 @@ impl ApiState {
                         .iter()
                         .map(|note| note.to_json())
                         .collect();
+                    let audit_available = self
+                        .pricing
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .audit
+                        .is_some();
                     ok_data(
                         Json::obj()
                             .with("notes", Json::Array(notes))
-                            .with("config", self.config.to_json()),
+                            .with("config", self.config.to_json())
+                            .with(
+                                "pricing_audit",
+                                Json::obj()
+                                    .with("available", Json::Bool(audit_available))
+                                    .with(
+                                        "startup_error",
+                                        self.audit_startup_error
+                                            .as_deref()
+                                            .map(Json::str)
+                                            .unwrap_or(Json::Null),
+                                    ),
+                            ),
                     )
                 })
             }

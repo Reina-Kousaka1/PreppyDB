@@ -330,6 +330,11 @@ limits. The full chain is verified while streaming on open and on explicit verif
 server retains only a recent tail bounded by 1,000 entries and 4 MiB of serialized
 records. `GET /v1/pricing/audit` can return fewer entries than requested when the byte
 bound is reached. The verify response reports the total verified entry count.
+
+If the audit log cannot be opened at startup, the server records the diagnostic,
+continues to serve non-pricing operations, and rejects pricing mutations. The server
+logs the initialization failure; an administrator can also inspect `pricing_audit`
+in `GET /v1/admin/recovery`, which reports availability and the startup diagnostic.
 | `POST /v1/pricing/simulate` | read | `{"rule":{…},"steps":10,"seed":"x"}` → deterministic history, nothing stored |
 
 See [DYNAMIC-PRICING.md](DYNAMIC-PRICING.md) for invariants.

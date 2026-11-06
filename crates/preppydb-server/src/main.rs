@@ -210,6 +210,11 @@ fn run() -> Result<(), String> {
         auth,
         Arc::clone(&counters),
     ));
+    if let Some(error) = state.audit_startup_error() {
+        eprintln!(
+            "pricing audit log initialization failed ({error}); pricing mutations will fail closed"
+        );
+    }
     let listener = std::net::TcpListener::bind(&config.listen)
         .map_err(|err| format!("cannot bind {}: {err}", config.listen))?;
     let bound = listener
