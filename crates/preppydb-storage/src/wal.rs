@@ -98,6 +98,15 @@ pub fn list_segments(dir: &Path) -> Result<Vec<PathBuf>> {
         let entry = entry.map_err(|err| DbError::io("reading WAL directory entry", err))?;
         let name = entry.file_name().to_string_lossy().to_string();
         if parse_segment_name(&name).is_some() {
+            let file_type = entry
+                .file_type()
+                .map_err(|err| DbError::io("inspecting WAL segment", err))?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                return Err(DbError::corrupt(
+                    entry.path().display().to_string(),
+                    "WAL segment is not a regular file",
+                ));
+            }
             segments.push(entry.path());
         }
     }
@@ -139,12 +148,23 @@ impl WalWriter {
         std::fs::create_dir_all(dir)
             .map_err(|err| DbError::io(format!("creating {}", dir.display()), err))?;
         let path = dir.join(segment_name(index));
-        let existed = path.exists();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
+        let existed = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => true,
+            Ok(_) => {
+                return Err(DbError::corrupt(
+                    path.display().to_string(),
+                    "WAL segment is not a regular file",
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => return Err(DbError::io("inspecting WAL segment", err)),
+        };
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        if !existed {
+            options.create_new(true);
+        }
+        let mut file = options
             .open(&path)
             .map_err(|err| DbError::io(format!("opening {}", path.display()), err))?;
         let len = file
@@ -748,6 +768,42 @@ mod tests {
         assert_eq!(parse_segment_name("1.wal"), None);
         assert_eq!(parse_segment_name("garbage.wal"), None);
         assert_eq!(parse_segment_name("000000000002.wal.bak"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_writer_rejects_symlinked_segment_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir("symlink-segment");
+        let wal_dir = dir.join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, wal_dir.join(segment_name(1))).unwrap();
+
+        let error = match WalWriter::open(&wal_dir, 1, 1024, SyncMode::Always) {
+            Ok(_) => panic!("WAL writer accepted a symlinked segment"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn segment_listing_rejects_symlinked_segments() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir("list-symlink-segment");
+        let target = dir.join("target");
+        std::fs::write(&target, b"not a wal").unwrap();
+        symlink(&target, dir.join(segment_name(1))).unwrap();
+
+        let error = list_segments(&dir).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
