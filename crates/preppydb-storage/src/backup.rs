@@ -525,14 +525,22 @@ struct ArchiveReader {
     expected_digest: [u8; 32],
 }
 
+fn read_archive_exact(reader: &mut impl Read, buffer: &mut [u8], part: &str) -> Result<()> {
+    reader.read_exact(buffer).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            DbError::corrupt("backup", format!("truncated archive {part}"))
+        } else {
+            DbError::io(format!("reading archive {part}"), error)
+        }
+    })
+}
+
 fn open_archive(archive: &Path) -> Result<ArchiveReader> {
     let file = File::open(archive)
         .map_err(|err| DbError::io(format!("opening {}", archive.display()), err))?;
     let mut reader = BufReader::new(file);
     let mut magic = [0u8; 8];
-    reader
-        .read_exact(&mut magic)
-        .map_err(|err| DbError::io("reading archive magic", err))?;
+    read_archive_exact(&mut reader, &mut magic, "magic")?;
     if &magic != ARCHIVE_MAGIC {
         return Err(DbError::corrupt(
             archive.display().to_string(),
@@ -540,9 +548,7 @@ fn open_archive(archive: &Path) -> Result<ArchiveReader> {
         ));
     }
     let mut len_buf = [0u8; 4];
-    reader
-        .read_exact(&mut len_buf)
-        .map_err(|err| DbError::io("reading archive header length", err))?;
+    read_archive_exact(&mut reader, &mut len_buf, "header length")?;
     let header_len = u32::from_le_bytes(len_buf);
     if header_len > 16 << 20 {
         return Err(DbError::corrupt(
@@ -551,9 +557,7 @@ fn open_archive(archive: &Path) -> Result<ArchiveReader> {
         ));
     }
     let mut header_bytes = vec![0u8; header_len as usize];
-    reader
-        .read_exact(&mut header_bytes)
-        .map_err(|err| DbError::io("reading archive header", err))?;
+    read_archive_exact(&mut reader, &mut header_bytes, "header")?;
     let header_text = std::str::from_utf8(&header_bytes)
         .map_err(|err| DbError::corrupt("backup", format!("header is not UTF-8: {err}")))?;
     let header = preppydb_json::parse(header_text)
@@ -594,9 +598,7 @@ fn open_archive(archive: &Path) -> Result<ArchiveReader> {
         .seek(SeekFrom::Start(total - 32))
         .map_err(|err| DbError::io("seeking archive digest", err))?;
     let mut expected_digest = [0u8; 32];
-    reader
-        .read_exact(&mut expected_digest)
-        .map_err(|err| DbError::io("reading archive digest", err))?;
+    read_archive_exact(&mut reader, &mut expected_digest, "digest")?;
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|err| DbError::io("rewinding archive", err))?;
@@ -667,9 +669,7 @@ impl ArchiveReader {
     fn verify(&mut self) -> Result<()> {
         let mut digest = Sha256::new();
         let mut prefix = vec![0u8; self.data_start as usize];
-        self.file
-            .read_exact(&mut prefix)
-            .map_err(|err| DbError::io("reading archive prefix", err))?;
+        read_archive_exact(&mut self.file, &mut prefix, "prefix")?;
         digest.update(&prefix);
         let entries = self.entries.clone();
         for entry in &entries {
@@ -684,9 +684,7 @@ impl ArchiveReader {
             let mut buffer = vec![0u8; 64 * 1024];
             while remaining > 0 {
                 let want = (buffer.len() as u64).min(remaining) as usize;
-                self.file
-                    .read_exact(&mut buffer[..want])
-                    .map_err(|err| DbError::io("reading archive member", err))?;
+                read_archive_exact(&mut self.file, &mut buffer[..want], "member")?;
                 digest.update(&buffer[..want]);
                 hasher.update(&buffer[..want]);
                 remaining -= want as u64;
@@ -700,9 +698,7 @@ impl ArchiveReader {
             }
         }
         let mut end = [0u8; 8];
-        self.file
-            .read_exact(&mut end)
-            .map_err(|err| DbError::io("reading archive end marker", err))?;
+        read_archive_exact(&mut self.file, &mut end, "end marker")?;
         if &end != ARCHIVE_END {
             return Err(DbError::corrupt("backup", "missing archive end marker"));
         }
@@ -1226,9 +1222,7 @@ fn copy_verified_member(
     let mut digest = Sha256::new();
     while remaining > 0 {
         let want = (buffer.len() as u64).min(remaining) as usize;
-        input
-            .read_exact(&mut buffer[..want])
-            .map_err(|err| DbError::io("reading archive member", err))?;
+        read_archive_exact(input, &mut buffer[..want], "member")?;
         digest.update(&buffer[..want]);
         output
             .write_all(&buffer[..want])
@@ -1284,6 +1278,40 @@ pub fn archive_sha256(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use preppydb_crypto::sha256::sha256;
+
+    #[test]
+    fn truncated_archive_prefix_is_classified_as_corruption() {
+        let root = tempdir("truncated-prefix");
+        let archive = root.join("truncated.pdbbak");
+        let mut incomplete_header = ARCHIVE_MAGIC.to_vec();
+        incomplete_header.extend_from_slice(&5u32.to_le_bytes());
+        incomplete_header.extend_from_slice(b"{}");
+        for bytes in [
+            ARCHIVE_MAGIC[..1].to_vec(),
+            [&ARCHIVE_MAGIC[..], &[1u8]].concat(),
+            incomplete_header,
+        ] {
+            std::fs::write(&archive, bytes).unwrap();
+            let error = match open_archive(&archive) {
+                Ok(_) => panic!("truncated archive was accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_reader_keeps_real_read_errors_distinct_from_truncation() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected read failure"))
+            }
+        }
+        let error = read_archive_exact(&mut FailingReader, &mut [0u8; 1], "member").unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::IO_ERROR);
+    }
 
     fn tempdir(tag: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1795,6 +1823,9 @@ mod tests {
         let mut output = Vec::new();
         assert!(copy_verified_member(&mut &b"evil"[..], &mut output, &entry).is_err());
         assert_eq!(output, b"evil");
+        let mut output = Vec::new();
+        let error = copy_verified_member(&mut &b"go"[..], &mut output, &entry).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
         let mut output = Vec::new();
         copy_verified_member(&mut &b"good"[..], &mut output, &entry).unwrap();
         assert_eq!(output, b"good");
