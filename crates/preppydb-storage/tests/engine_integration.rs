@@ -1273,6 +1273,58 @@ fn post_checkpoint_crc_corruption_preserves_snapshot_and_valid_wal_prefix() {
 }
 
 #[test]
+fn post_checkpoint_crc_corruption_in_middle_segment_discards_later_segments_on_repair() {
+    let dir = tempdir("post-checkpoint-multi-segment-crc");
+    let mut cfg = EngineConfig::new(&dir);
+    cfg.sync_mode = SyncMode::Always;
+    cfg.max_segment_bytes = wal::WAL_HEADER_LEN + 1;
+    {
+        let engine = Engine::open(cfg.clone()).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "baseline", Json::int(0), PutOptions::default())
+            .unwrap();
+        engine.checkpoint().unwrap();
+        for (key, value) in [("before", 1), ("damaged", 2), ("after", 3)] {
+            engine
+                .put("c", key, Json::int(value), PutOptions::default())
+                .unwrap();
+        }
+    }
+
+    let segments = wal::list_segments(&dir.join("wal")).unwrap();
+    assert!(segments.len() >= 3, "expected rotated segments: {segments:?}");
+    let mut bytes = std::fs::read(&segments[1]).unwrap();
+    *bytes.last_mut().unwrap() ^= 0x40;
+    std::fs::write(&segments[1], bytes).unwrap();
+
+    assert!(matches!(Engine::open(cfg.clone()), Err(DbError::Corrupt { .. })));
+    cfg.repair = RepairPolicy::TruncateCorruptTail;
+    let engine = Engine::open(cfg.clone()).unwrap();
+    assert_eq!(engine.count("c").unwrap(), 2);
+    assert_eq!(engine.get("c", "baseline").unwrap().value.as_i64(), Some(0));
+    assert_eq!(engine.get("c", "before").unwrap().value.as_i64(), Some(1));
+    assert!(engine.get_opt("c", "damaged").unwrap().is_none());
+    assert!(engine.get_opt("c", "after").unwrap().is_none());
+    assert!(!segments[2].exists(), "repair must remove the later WAL suffix");
+    engine
+        .put("c", "after-repair", Json::int(4), PutOptions::default())
+        .unwrap();
+    drop(engine);
+
+    let reopened = Engine::open(cfg).unwrap();
+    assert_eq!(reopened.count("c").unwrap(), 3);
+    assert_eq!(
+        reopened.get("c", "after-repair").unwrap().value.as_i64(),
+        Some(4)
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn sequence_gap_after_checkpoint_fails_closed_and_repair_drops_suffix() {
     let dir = tempdir("wal-sequence-gap");
     let mut cfg = EngineConfig::new(&dir);
