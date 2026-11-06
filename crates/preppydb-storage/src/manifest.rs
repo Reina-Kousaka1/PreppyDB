@@ -293,10 +293,18 @@ impl Manifest {
         {
             let entry =
                 entry.map_err(|err| DbError::io("reading manifest directory entry", err))?;
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
             let Some(generation) = Self::generation_from_name(&name) else {
+                if name
+                    .to_ascii_uppercase()
+                    .starts_with(VERSIONED_MANIFEST_PREFIX)
+                {
+                    return Err(DbError::corrupt(
+                        entry.path().display().to_string(),
+                        "manifest generation has a noncanonical file name",
+                    ));
+                }
                 continue;
             };
             if newest
@@ -583,6 +591,36 @@ mod tests {
         );
         assert!(Manifest::generation_path(&dir, 2).is_file());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_generation_name_does_not_fall_back_to_older_manifest() {
+        let dir = tempdir("malformed-generation-name");
+        let mut older = Manifest::default();
+        older.save(&dir).unwrap();
+        let mut newer = Manifest {
+            generation: 2,
+            snapshot: Some(SnapshotRef {
+                file: "snap-000000000002.pdb".into(),
+                seq: 0,
+                generation: 2,
+                sha256: "a".repeat(64),
+                doc_count: 0,
+                created_at: 1,
+                bytes: 1,
+            }),
+            ..Default::default()
+        };
+        newer.publish_generation(&dir).unwrap();
+        std::fs::rename(
+            Manifest::generation_path(&dir, 2),
+            dir.join("MANIFEST-+00000000002.json"),
+        )
+        .unwrap();
+
+        let error = Manifest::load(&dir).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
