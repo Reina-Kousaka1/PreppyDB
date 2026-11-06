@@ -1259,7 +1259,9 @@ mod tests {
                     .append(true)
                     .open(path)?;
                 file.write_all(&line[..line.len() / 2])?;
-                Err(std::io::Error::other("injected failure after partial write"))
+                Err(std::io::Error::other(
+                    "injected failure after partial write",
+                ))
             })
             .unwrap_err();
         assert_eq!(error.code, codes::AUDIT_INTEGRITY);
