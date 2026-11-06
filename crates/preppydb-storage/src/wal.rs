@@ -218,7 +218,6 @@ impl WalWriter {
             .metadata()
             .map_err(|err| DbError::io("stat WAL segment", err))?
             .len();
-        let newly_created = !existed;
         if !existed || len == 0 {
             // Fresh segment: write the header.
             file.seek(SeekFrom::Start(0))
@@ -230,12 +229,10 @@ impl WalWriter {
             file.sync_all()
                 .map_err(|err| DbError::io("syncing WAL header", err))?;
         }
-        if newly_created {
-            // The segment header must reach stable storage before any record can be
-            // acknowledged in this newly created directory entry. File sync alone
-            // does not persist the name on filesystems that require directory sync.
-            sync_directory(dir)?;
-        }
+        // Even an existing segment can be a remnant of a previous creation whose
+        // directory sync failed. Its presence after that failure does not prove the
+        // filename durable. Recheck the barrier before publishing any writer.
+        sync_directory(dir)?;
         let current_len = file
             .metadata()
             .map_err(|err| DbError::io("stat WAL segment", err))?
@@ -684,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn new_segment_syncs_its_directory_before_open_returns() {
+    fn segment_open_syncs_its_directory_before_writer_publication() {
         let dir = tempdir("directory-sync");
         let mut calls = 0;
         let writer = WalWriter::open_with_directory_sync(
@@ -702,11 +699,19 @@ mod tests {
         assert_eq!(calls, 1);
         drop(writer);
 
-        let writer =
-            WalWriter::open_with_directory_sync(&dir, 1, 64 * 1024 * 1024, SyncMode::Never, |_| {
-                panic!("opening an existing segment must not resync its directory")
-            })
-            .unwrap();
+        let writer = WalWriter::open_with_directory_sync(
+            &dir,
+            1,
+            64 * 1024 * 1024,
+            SyncMode::Never,
+            |synced_dir| {
+                calls += 1;
+                assert_eq!(synced_dir, dir);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
         drop(writer);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -734,6 +739,40 @@ mod tests {
         assert!(path.is_file());
         let writer = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always)
             .expect("a later successful open can safely reuse the header");
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reopening_a_segment_rechecks_a_failed_directory_durability_barrier() {
+        let dir = tempdir("directory-sync-reopen");
+        let fail_sync = |_: &Path| {
+            Err(DbError::io(
+                "syncing WAL directory",
+                std::io::Error::other("injected"),
+            ))
+        };
+        assert!(WalWriter::open_with_directory_sync(
+            &dir,
+            1,
+            64 * 1024 * 1024,
+            SyncMode::Always,
+            fail_sync,
+        )
+        .is_err());
+        assert!(dir.join(segment_name(1)).is_file());
+
+        // The filename still exists, but the first directory sync failed. Its
+        // durability cannot be inferred from the presence of the file.
+        assert!(WalWriter::open_with_directory_sync(
+            &dir,
+            1,
+            64 * 1024 * 1024,
+            SyncMode::Always,
+            fail_sync,
+        )
+        .is_err());
+        let writer = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always).unwrap();
         drop(writer);
         std::fs::remove_dir_all(dir).unwrap();
     }
