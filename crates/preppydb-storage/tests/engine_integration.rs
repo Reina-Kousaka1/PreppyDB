@@ -1720,6 +1720,35 @@ fn backup_and_restore_roundtrip() {
 }
 
 #[test]
+fn backup_from_read_only_handle_is_rejected_without_publishing_archive() {
+    let dir = tempdir("read-only-backup");
+    {
+        let engine = open(&dir);
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "key", Json::int(1), PutOptions::default())
+            .unwrap();
+    }
+
+    let mut config = EngineConfig::new(&dir);
+    config.read_only = true;
+    config.take_lock = false;
+    let engine = Engine::open(config).unwrap();
+    let archive = dir.with_extension("bak");
+    let error = backup::create_backup(&engine, &archive, false).unwrap_err();
+    assert_eq!(error.code(), preppydb_storage::error::codes::UNSUPPORTED);
+    assert!(!archive.exists());
+    drop(engine);
+
+    let reopened = open(&dir);
+    assert_eq!(reopened.get("c", "key").unwrap().value.as_i64(), Some(1));
+    drop(reopened);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn restore_refuses_to_replace_a_database_with_an_active_writer() {
     let root = tempdir("restore-active-writer");
     let target = root.join("database");

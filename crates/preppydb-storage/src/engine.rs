@@ -2227,11 +2227,14 @@ impl Engine {
 
     /// Hold a stable view of on-disk files while a backup reads them.
     pub(crate) fn with_stable_files<T>(&self, action: impl FnOnce(u64) -> Result<T>) -> Result<T> {
+        if self.cfg.read_only {
+            return Err(DbError::Unsupported(
+                "consistent backup requires a writable engine holding the database lock".into(),
+            ));
+        }
         let state = self.read();
         self.check_healthy()?;
-        if !self.cfg.read_only {
-            self.sync_wal()?;
-        }
+        self.sync_wal()?;
         action(state.seq)
     }
 

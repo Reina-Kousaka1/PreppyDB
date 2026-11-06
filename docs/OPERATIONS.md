@@ -264,7 +264,9 @@ preppydb restore --archive /backups/preppy-2026-11-04.bak --target /srv/preppydb
 The archive contains a header, every file with a SHA-256, and a trailing whole-file
 SHA-256. `backup-verify` validates both the archive checksums and the embedded database
 by extracting it to an exclusive temporary directory and opening/verifying it with strict
-read-only recovery. `restore` performs that validation, copies and rechecks each member,
+read-only recovery. Backup creation requires a writable engine that holds the database
+lock; read-only handles do not coordinate with a live writer and are rejected. `restore`
+performs that validation, copies and rechecks each member,
 then strictly opens/verifies the staged database before publishing it; an invalid archive
 or database leaves the target untouched. Verification requires temporary disk space
 approximately equal to the database copy. Files and staged directories are synced before
