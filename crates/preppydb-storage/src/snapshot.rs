@@ -28,6 +28,22 @@ pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 const FOOTER_MARKER: u32 = 0xFFFF_FFFF;
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 
+fn checked_frame_len(payload_len: usize) -> Result<u32> {
+    let actual = u64::try_from(payload_len).unwrap_or(u64::MAX);
+    if actual > u64::from(MAX_FRAME_LEN) {
+        return Err(DbError::LimitExceeded {
+            limit: "snapshot_frame_bytes",
+            max: u64::from(MAX_FRAME_LEN),
+            actual,
+        });
+    }
+    u32::try_from(payload_len).map_err(|_| DbError::LimitExceeded {
+        limit: "snapshot_frame_bytes",
+        max: u64::from(MAX_FRAME_LEN),
+        actual,
+    })
+}
+
 /// Header of a snapshot file.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SnapshotHeader {
@@ -137,8 +153,9 @@ pub fn write_snapshot(
                        payload: &[u8],
                        bytes: &mut u64|
      -> Result<()> {
+        let payload_len = checked_frame_len(payload.len())?;
         let mut frame = Vec::with_capacity(payload.len() + 8);
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload_len.to_le_bytes());
         frame.extend_from_slice(&crc32c(payload, 0).to_le_bytes());
         frame.extend_from_slice(payload);
         writer
@@ -508,6 +525,17 @@ mod tests {
         assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
         assert!(error.to_string().contains("duplicate collection"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_frame_writer_enforces_reader_limit_without_narrowing() {
+        assert_eq!(
+            checked_frame_len(MAX_FRAME_LEN as usize).unwrap(),
+            MAX_FRAME_LEN
+        );
+        let error = checked_frame_len(MAX_FRAME_LEN as usize + 1).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::LIMIT_EXCEEDED);
+        assert!(error.to_string().contains("snapshot_frame_bytes"));
     }
 
     #[test]
