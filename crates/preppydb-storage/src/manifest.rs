@@ -168,6 +168,12 @@ impl Manifest {
             .get("generation")
             .and_then(Json::as_u64)
             .ok_or_else(|| DbError::corrupt("manifest", "invalid or missing generation"))?;
+        if generation > MAX_MANIFEST_GENERATION {
+            return Err(DbError::corrupt(
+                "manifest",
+                "generation exceeds the publishable manifest range",
+            ));
+        }
         let last_seq = value
             .get("last_seq")
             .and_then(Json::as_u64)
@@ -823,6 +829,24 @@ mod tests {
                     .with("bytes", Json::uint(100)),
             );
         assert!(Manifest::from_json(&inconsistent_snapshot).is_err());
+    }
+
+    #[test]
+    fn legacy_manifest_rejects_unpublishable_generation() {
+        let manifest = Manifest {
+            generation: MAX_MANIFEST_GENERATION + 1,
+            snapshot: Some(SnapshotRef {
+                file: "snap-1000000000000.pdb".into(),
+                seq: 0,
+                generation: MAX_MANIFEST_GENERATION + 1,
+                sha256: "a".repeat(64),
+                doc_count: 0,
+                created_at: 0,
+                bytes: 1,
+            }),
+            ..Default::default()
+        };
+        assert!(Manifest::from_json(&manifest.to_json()).is_err());
     }
 
     #[test]
