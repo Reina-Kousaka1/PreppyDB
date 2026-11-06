@@ -40,6 +40,27 @@ local function new_client(responses, options)
   return client, calls
 end
 
+do
+  local bad_token = "token\r\nX-Injected: yes"
+  local transport, calls = recorder({})
+  local rejected, err = preppydb.new({
+    url = "http://127.0.0.1:7077",
+    token = bad_token,
+    transport = transport,
+  })
+  t:equal(rejected, nil, "constructor rejects header-injecting tokens")
+  t:truthy(type(err) == "string", "invalid token returns a configuration error")
+  t:equal(#calls, 0, "constructor does not call transport")
+
+  local client = new_client({}, { token = nil })
+  client.token = bad_token
+  local _, call_error = client:call("GET", "/healthz")
+  t:equal(call_error and call_error.code, "invalid_token", "sync call rejects injected token")
+  client:call_async("GET", "/healthz", nil, function(_, async_error)
+    t:equal(async_error and async_error.code, "invalid_token", "async call rejects injected token")
+  end)
+end
+
 -- ------------------------------------------------------------- happy paths
 do
   local client, calls = new_client({

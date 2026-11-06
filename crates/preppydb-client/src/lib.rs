@@ -87,6 +87,23 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 
 const MAX_RESPONSE_HEADERS: usize = 16 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BEARER_TOKEN_BYTES: usize = 512;
+
+fn valid_bearer_token(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_BEARER_TOKEN_BYTES {
+        return false;
+    }
+    let padding_start = bytes
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(bytes.len());
+    padding_start > 0
+        && bytes[..padding_start].iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
+        && bytes[padding_start..].iter().all(|byte| *byte == b'=')
+}
 
 fn bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> Result<String> {
     let mut bytes = Vec::new();
@@ -147,6 +164,11 @@ impl std::fmt::Debug for Client {
 impl Client {
     /// Build a client for `base_url` such as `http://127.0.0.1:7070`.
     pub fn new(base_url: &str, token: &str) -> Result<Client> {
+        if !valid_bearer_token(token) {
+            return Err(ClientError::Configuration(
+                "bearer token must contain 1–512 permitted ASCII bytes".into(),
+            ));
+        }
         let mut client = Client::from_url(base_url)?;
         client.token = Some(token.to_string());
         Ok(client)
@@ -158,6 +180,14 @@ impl Client {
     }
 
     fn from_url(base_url: &str) -> Result<Client> {
+        if base_url
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(ClientError::Configuration(
+                "base URL contains whitespace or control characters".into(),
+            ));
+        }
         let trimmed = base_url.trim_end_matches('/');
         if trimmed.starts_with("https://") {
             return Err(ClientError::Configuration(
@@ -215,6 +245,13 @@ impl Client {
     // ------------------------------------------------------------------ transport
 
     fn request(&self, method: &str, path: &str, body: Option<&Json>) -> Result<Json> {
+        if self
+            .token
+            .as_deref()
+            .is_some_and(|token| !valid_bearer_token(token))
+        {
+            return Err(ClientError::Configuration("invalid bearer token".into()));
+        }
         let payload = match body {
             Some(body) => body.to_string(),
             None => String::new(),
@@ -407,6 +444,11 @@ impl Client {
             .with("password", Json::str(password));
         let data = self.data("POST", "/v1/auth/login", Some(&body))?;
         if let Some(token) = data.get_str("token") {
+            if !valid_bearer_token(token) {
+                return Err(ClientError::Protocol(
+                    "server returned an invalid bearer token".into(),
+                ));
+            }
             self.token = Some(token.to_string());
         }
         Ok(data)
@@ -780,6 +822,25 @@ mod tests {
         assert!(Client::anonymous("ftp://x").is_err());
         assert!(Client::anonymous("http://").is_err());
         assert!(Client::anonymous("http://host:notaport").is_err());
+        assert!(Client::anonymous("http://host/\r\nX-Injected: yes").is_err());
+    }
+
+    #[test]
+    fn bearer_tokens_cannot_inject_headers() {
+        assert!(valid_bearer_token("valid-token"));
+        assert!(!valid_bearer_token("=="));
+        assert!(!valid_bearer_token("foo=bar"));
+        assert!(Client::new("http://127.0.0.1:7070", "valid-token").is_ok());
+        assert!(matches!(
+            Client::new("http://127.0.0.1:7070", "token\r\nX-Injected: yes"),
+            Err(ClientError::Configuration(_))
+        ));
+        let mut client = Client::anonymous("http://127.0.0.1:7070").unwrap();
+        client.set_token("token\r\nX-Injected: yes");
+        assert!(matches!(
+            client.request("GET", "/healthz", None),
+            Err(ClientError::Configuration(_))
+        ));
     }
 
     #[test]

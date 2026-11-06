@@ -491,6 +491,11 @@ end
 local Client = {}
 Client.__index = Client
 
+local function valid_bearer_token(token)
+  return type(token) == "string" and #token > 0 and #token <= 512
+    and token:match("^[A-Za-z0-9._~+/%-]+=*$") ~= nil
+end
+
 --- Create a client.
 -- options.url          base url, e.g. "http://127.0.0.1:7077"
 -- options.token        bearer token (optional; required for non-public endpoints)
@@ -502,6 +507,9 @@ function preppydb.new(options)
   options = options or {}
   if type(options) ~= "table" then
     error("preppydb.new expects an options table", 2)
+  end
+  if options.token ~= nil and not valid_bearer_token(options.token) then
+    return nil, "token must contain 1–512 permitted ASCII bytes"
   end
   local response_limit = options.max_response_bytes or 16 * 1024 * 1024
   if type(response_limit) ~= "number" or response_limit < 0 or response_limit ~= math.floor(response_limit) or response_limit > 2147483647 then
@@ -552,6 +560,9 @@ end
 --- Issue one request synchronously.
 -- Returns decoded body, or nil plus an error table.
 function Client:call(method, path, body, options)
+  if self.token ~= nil and not valid_bearer_token(self.token) then
+    return nil, { code = "invalid_token", message = "invalid bearer token", retryable = false }
+  end
   local payload
   if body ~= nil then
     local ok, encoded = pcall(preppydb.encode, body)
@@ -645,6 +656,10 @@ end
 --- Asynchronous variant for event-loop code (luvit).
 -- `callback(result, err)` receives what the synchronous methods return.
 function Client:call_async(method, path, body, callback)
+  if self.token ~= nil and not valid_bearer_token(self.token) then
+    callback(nil, { code = "invalid_token", message = "invalid bearer token", retryable = false })
+    return
+  end
   local payload
   if body ~= nil then
     local encoded_ok, encoded = pcall(preppydb.encode, body)
@@ -719,6 +734,9 @@ end
 function Client:login(username, password)
   local data, err = self:call("POST", "/v1/auth/login", { username = username, password = password })
   if data and data.token then
+    if not valid_bearer_token(data.token) then
+      return nil, { code = "invalid_response", message = "server returned an invalid bearer token", retryable = false }
+    end
     self.token = data.token
   end
   return data, err
