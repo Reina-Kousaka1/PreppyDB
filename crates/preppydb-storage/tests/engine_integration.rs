@@ -269,6 +269,32 @@ fn manifest_snapshot_symlink_is_rejected() {
 }
 
 #[test]
+fn incomplete_legacy_manifest_with_snapshot_fails_closed() {
+    let dir = tempdir("incomplete-legacy-manifest");
+    let engine = open(&dir);
+    engine
+        .create_collection(CollectionMeta::new("c", 0))
+        .unwrap();
+    engine
+        .put("c", "key", Json::str("committed"), PutOptions::default())
+        .unwrap();
+    let checkpoint = engine.checkpoint().unwrap();
+    drop(engine);
+
+    assert!(checkpoint.path.is_file());
+    remove_all_manifests(&dir);
+    std::fs::write(Manifest::path(&dir), r#"{"format_version":1}"#).unwrap();
+
+    let error = Engine::open(EngineConfig::new(&dir)).unwrap_err();
+    assert!(matches!(error, DbError::Corrupt { .. }), "{error}");
+    assert!(
+        checkpoint.path.is_file(),
+        "recovery must not delete the snapshot"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn missing_manifest_after_retired_wal_history_fails_closed() {
     let dir = tempdir("missing-manifest-retired-history");
     let engine = open(&dir);

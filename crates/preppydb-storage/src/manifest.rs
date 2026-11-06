@@ -130,10 +130,31 @@ impl Manifest {
                 ),
             ));
         }
+        let generation = value
+            .get("generation")
+            .and_then(Json::as_u64)
+            .ok_or_else(|| DbError::corrupt("manifest", "invalid or missing generation"))?;
+        let last_seq = value
+            .get("last_seq")
+            .and_then(Json::as_u64)
+            .ok_or_else(|| DbError::corrupt("manifest", "invalid or missing last_seq"))?;
         let snapshot = match value.get("snapshot") {
             None | Some(Json::Null) => None,
             Some(entry) => Some(SnapshotRef::from_json(entry)?),
         };
+        if let Some(reference) = &snapshot {
+            if generation != reference.generation || reference.seq > last_seq {
+                return Err(DbError::corrupt(
+                    "manifest",
+                    "snapshot generation or sequence is inconsistent with manifest watermarks",
+                ));
+            }
+        } else if generation != 0 || last_seq != 0 {
+            return Err(DbError::corrupt(
+                "manifest",
+                "non-empty manifest watermarks require a snapshot reference",
+            ));
+        }
         let wal = value
             .get("wal")
             .and_then(|v| v.as_array())
@@ -146,11 +167,8 @@ impl Manifest {
             .unwrap_or_default();
         Ok(Manifest {
             format_version,
-            generation: value
-                .get("generation")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            last_seq: value.get("last_seq").and_then(|v| v.as_u64()).unwrap_or(0),
+            generation,
+            last_seq,
             snapshot,
             wal,
             created_at: value.get_i64("created_at").unwrap_or(0),
@@ -412,6 +430,15 @@ mod tests {
         let mut legacy = Manifest {
             generation: 1,
             last_seq: 10,
+            snapshot: Some(SnapshotRef {
+                file: "snap-000000000001.pdb".into(),
+                seq: 10,
+                generation: 1,
+                sha256: "legacy-hash".into(),
+                doc_count: 0,
+                created_at: 1,
+                bytes: 1,
+            }),
             ..Default::default()
         };
         legacy.save(&dir).unwrap();
@@ -420,6 +447,15 @@ mod tests {
         let mut next = Manifest {
             generation: 2,
             last_seq: 20,
+            snapshot: Some(SnapshotRef {
+                file: "snap-000000000002.pdb".into(),
+                seq: 20,
+                generation: 2,
+                sha256: "next-hash".into(),
+                doc_count: 0,
+                created_at: 2,
+                bytes: 1,
+            }),
             ..Default::default()
         };
         next.publish_generation(&dir).unwrap();
@@ -486,6 +522,36 @@ mod tests {
         let err = Manifest::load(&dir).unwrap_err();
         assert!(err.to_string().contains("invalid JSON"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_or_inconsistent_watermarks_are_corruption() {
+        let valid = Manifest::default().to_json();
+        let mut missing_generation = valid.clone();
+        missing_generation.remove_key("generation");
+        assert!(Manifest::from_json(&missing_generation).is_err());
+
+        let mut missing_sequence = valid.clone();
+        missing_sequence.remove_key("last_seq");
+        assert!(Manifest::from_json(&missing_sequence).is_err());
+
+        let inconsistent_empty = valid
+            .clone()
+            .with("generation", Json::uint(1))
+            .with("last_seq", Json::uint(1));
+        assert!(Manifest::from_json(&inconsistent_empty).is_err());
+
+        let inconsistent_snapshot = valid
+            .with("generation", Json::uint(2))
+            .with("last_seq", Json::uint(4))
+            .with(
+                "snapshot",
+                Json::obj()
+                    .with("file", Json::str("snap-000000000001.pdb"))
+                    .with("generation", Json::uint(1))
+                    .with("seq", Json::uint(5)),
+            );
+        assert!(Manifest::from_json(&inconsistent_snapshot).is_err());
     }
 
     #[test]
