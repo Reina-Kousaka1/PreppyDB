@@ -121,7 +121,9 @@ The parser also checks the declared collection/document counts, rejects duplicat
 collection names and duplicate document keys, and applies the same 64 MiB maximum frame
 size as the writer. Snapshot temporary files are created exclusively after removing any
 stale temporary directory entry without following it. Snapshot and WAL segment symlinks
-are rejected during file discovery/opening.
+are rejected during file discovery/opening. Manifest watermarks are required and must
+agree with any snapshot reference; incomplete or inconsistent watermarks are rejected
+instead of defaulting to an empty database state.
 
 ### Recovery
 
