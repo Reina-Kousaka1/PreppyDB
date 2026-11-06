@@ -2228,11 +2228,7 @@ impl Engine {
     /// Hold a stable view of on-disk files while a backup reads them.
     pub(crate) fn with_stable_files<T>(&self, action: impl FnOnce(u64) -> Result<T>) -> Result<T> {
         let state = self.read();
-        if self.poisoned.load(Ordering::SeqCst) {
-            return Err(DbError::Internal(
-                "engine is in a failed state after a WAL write error; restart required".into(),
-            ));
-        }
+        self.check_healthy()?;
         if !self.cfg.read_only {
             self.sync_wal()?;
         }
@@ -2454,6 +2450,34 @@ mod document_undo_tests {
         assert!(reopened.get_opt("c", "other").unwrap().is_none());
         drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn backup_after_wal_sync_failure_preserves_unknown_outcome_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-backup-sync-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let archive = dir.with_extension("bak");
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine.lock_mutex(&engine.writer).inject_sync_failure();
+        assert_eq!(
+            engine
+                .put("c", "key", Json::int(1), PutOptions::default())
+                .unwrap_err()
+                .code(),
+            crate::error::codes::COMMIT_OUTCOME_UNKNOWN
+        );
+
+        let error = crate::backup::create_backup(&engine, &archive, false).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::COMMIT_OUTCOME_UNKNOWN);
+        assert!(!archive.exists());
+        drop(engine);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
