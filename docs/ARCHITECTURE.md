@@ -117,7 +117,11 @@ all platforms has not yet been qualified; in particular Windows fault-injection 
 is still required. The manifest reference is treated as untrusted input: its filename
 must exactly match its generation, and snapshot header/length metadata is checked before
 the snapshot is applied. The parser validates the footer digest and rejects trailing bytes.
-Snapshot symlinks are rejected.
+The parser also checks the declared collection/document counts, rejects duplicate
+collection names and duplicate document keys, and applies the same 64 MiB maximum frame
+size as the writer. Snapshot temporary files are created exclusively after removing any
+stale temporary directory entry without following it. Snapshot and WAL segment symlinks
+are rejected during file discovery/opening.
 
 ### Recovery
 
