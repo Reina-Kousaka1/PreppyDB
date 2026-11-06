@@ -1357,11 +1357,18 @@ fn interrupted_corruption_repair_fails_closed_then_can_be_repaired_again() {
     // valid prefix but before it removes later segments. The default open must
     // reject this ambiguous state instead of treating the suffix as committed.
     let first_post_checkpoint_segment = &segments[0];
+    let mut bytes = std::fs::read(first_post_checkpoint_segment).unwrap();
+    bytes[wal::WAL_HEADER_LEN as usize + 4] ^= 0x80;
+    std::fs::write(first_post_checkpoint_segment, bytes).unwrap();
+    let damaged = wal::scan_segment(first_post_checkpoint_segment).unwrap();
+    assert!(damaged.corruption.is_some());
+    assert_eq!(damaged.valid_len, wal::WAL_HEADER_LEN);
+
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(first_post_checkpoint_segment)
         .unwrap();
-    file.set_len(wal::WAL_HEADER_LEN).unwrap();
+    file.set_len(damaged.valid_len).unwrap();
     file.sync_all().unwrap();
     drop(file);
 
