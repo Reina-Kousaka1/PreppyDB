@@ -1356,12 +1356,12 @@ impl Engine {
         self.check_writable("schema write")?;
         let mut state = self.write();
         self.check_writable("schema write")?;
+        let seq = next_sequence(state.seq)?;
         let previous = state
             .store
             .collections
             .remove(collection)
             .ok_or_else(|| DbError::CollectionNotFound(collection.to_string()))?;
-        let seq = next_sequence(state.seq)?;
         let record = Record::new(
             seq,
             now_ms(),
@@ -2329,6 +2329,28 @@ pub fn collection_ref<'a>(store: &'a Store, name: &str) -> Result<&'a Collection
 #[cfg(test)]
 mod document_undo_tests {
     use super::*;
+
+    #[test]
+    fn drop_collection_sequence_overflow_preserves_live_collection() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-drop-sequence-overflow-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        let original_seq = engine.read().seq;
+        engine.write().seq = u64::MAX;
+
+        assert!(engine.drop_collection("c", true).is_err());
+        assert!(engine.read().store.has_collection("c"));
+
+        engine.write().seq = original_seq;
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn interval_config(dir: &Path) -> EngineConfig {
         let mut config = EngineConfig::new(dir);
