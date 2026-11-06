@@ -161,10 +161,13 @@ impl Drop for FileLock {
     }
 }
 
-/// Write a file that only the current user can read (mode 0600 on Unix).
+/// Create a new file that only the current user can read (mode 0600 on Unix).
+///
+/// Existing paths are rejected rather than truncated. This keeps callers from
+/// accidentally following a symlink planted at a report or temporary-file path.
 pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -321,5 +324,28 @@ mod tests {
         let lock = FileLock::acquire(&dir).unwrap();
         drop(lock);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_does_not_follow_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir("private-symlink");
+        let outside_dir = tempdir("private-sentinel");
+        let sentinel = outside_dir.join("sentinel");
+        std::fs::write(&sentinel, b"preserve").unwrap();
+        let link = dir.join("report.json");
+        symlink(&sentinel, &link).unwrap();
+
+        assert!(write_private(&link, b"overwrite").is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(outside_dir).unwrap();
     }
 }

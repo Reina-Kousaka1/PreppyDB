@@ -378,6 +378,12 @@ impl AuthStore {
             }
         }
         let tmp = self.path.with_extension("json.tmp");
+        match std::fs::symlink_metadata(&tmp) {
+            Ok(_) => std::fs::remove_file(&tmp)
+                .map_err(|err| AuthError(format!("removing stale {}: {err}", tmp.display())))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(AuthError(format!("inspecting {}: {err}", tmp.display()))),
+        }
         preppydb_storage::lock::write_private(&tmp, text.as_bytes())
             .map_err(|err| AuthError(err.to_string()))?;
         preppydb_storage::fsutil::replace_file(&tmp, &self.path)
@@ -760,6 +766,34 @@ mod tests {
         assert!(reopened.authenticate_token(&secret).is_some());
         assert!(reopened.login("admin", "correct horse battery").is_ok());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_save_does_not_follow_a_symlinked_temporary_file() {
+        use std::os::unix::fs::symlink;
+
+        let (mut store, dir) = store("save-symlink");
+        let outside_dir = std::env::temp_dir().join(format!(
+            "preppydb-auth-sentinel-{}-{}",
+            std::process::id(),
+            preppydb_storage::clock::now_ms()
+        ));
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let sentinel = outside_dir.join("sentinel");
+        std::fs::write(&sentinel, b"preserve").unwrap();
+        let temp = store.path().with_extension("json.tmp");
+        symlink(&sentinel, &temp).unwrap();
+
+        store
+            .create_user("admin", "correct horse battery", vec![Role::Admin])
+            .unwrap();
+
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve");
+        assert!(std::fs::symlink_metadata(store.path()).unwrap().is_file());
+        assert!(!temp.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(outside_dir).unwrap();
     }
 
     #[test]
