@@ -187,6 +187,59 @@ fn manifest_snapshot_header_metadata_mismatch_fails_closed() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn recovery_rejects_duplicate_document_keys_in_snapshot() {
+    let dir = tempdir("duplicate-snapshot-document-key");
+    let snap_dir = dir.join("snap");
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    let snapshot_path = snap_dir.join("snap-000000000001.pdb");
+    let meta = CollectionMeta::new("people", 0);
+    let document = preppydb_storage::store::Doc {
+        value: doc("same"),
+        version: 1,
+        revision: 0,
+        created_at: 1,
+        updated_at: 1,
+        expires_at: None,
+    };
+    let written = snapshot::write_snapshot(
+        &snapshot_path,
+        1,
+        0,
+        1,
+        &[(
+            meta,
+            vec![("same".into(), document.clone()), ("same".into(), document)],
+        )],
+    )
+    .unwrap();
+
+    let manifest = Manifest {
+        generation: 1,
+        snapshot: Some(SnapshotRef {
+            file: snapshot_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            seq: 0,
+            generation: 1,
+            sha256: written.body_sha256,
+            doc_count: written.header.doc_count,
+            created_at: written.header.created_at,
+            bytes: written.bytes,
+        }),
+        ..Manifest::default()
+    };
+    save_active_manifest(&dir, &manifest);
+
+    assert!(matches!(
+        Engine::open(EngineConfig::new(&dir)),
+        Err(DbError::Corrupt { .. })
+    ));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn manifest_snapshot_symlink_is_rejected() {
