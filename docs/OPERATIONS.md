@@ -246,10 +246,12 @@ mode 0600). Sessions are memory-only and end on restart.
 
 Backup holds an engine read lock while it copies and verifies the archive, so writes
 and checkpoints wait until it finishes. It writes to a unique temporary sibling and
-verifies it before publication. Choose a unique destination path to retain prior backup
-generations; publication may replace an existing destination where the filesystem's
-rename semantics allow it. An interrupted operation may leave a temporary file for
-inspection. This does not protect against external modification of database files
+verifies both archive checksums and the recoverability of the embedded database before
+publication. This adds a read and temporary extraction of the database copy, requiring
+temporary disk space approximately equal to that copy. Choose a unique destination path
+to retain prior backup generations; publication may replace an existing destination
+where the filesystem's rename semantics allow it. An interrupted operation may leave a
+temporary file for inspection. This does not protect against external modification of database files
 outside the engine.
 
 ```bash

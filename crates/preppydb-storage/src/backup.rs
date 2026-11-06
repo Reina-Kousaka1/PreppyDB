@@ -340,9 +340,10 @@ fn create_backup_locked(
     file.sync_all()
         .map_err(|err| DbError::io("syncing archive", err))?;
     drop(file);
-    let mut verifier = open_archive(&tmp)?;
-    verifier.verify()?;
-    drop(verifier);
+    // Hashes alone prove that copied members match this archive's header, not
+    // that its snapshot, manifest and WAL form a recoverable database. Reopen the
+    // staged archive before publication so a successful backup is restorable.
+    verify_backup(&tmp)?;
     let (bytes, file_hash) = crate::snapshot::file_sha256(&tmp)?;
     debug_assert!(
         bytes >= total_len,
@@ -1871,6 +1872,37 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".preppydb-backup-")
         }));
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_does_not_publish_a_semantically_corrupt_snapshot() {
+        let root = tempdir("corrupt-source-snapshot");
+        let source = root.join("source");
+        let engine = Engine::open(crate::engine::EngineConfig::new(&source)).unwrap();
+        engine
+            .create_collection(crate::catalog::CollectionMeta::new("items", 0))
+            .unwrap();
+        engine
+            .put(
+                "items",
+                "one",
+                Json::str("value"),
+                crate::engine::PutOptions::default(),
+            )
+            .unwrap();
+        engine.checkpoint().unwrap();
+
+        let manifest = crate::manifest::Manifest::load(&source).unwrap().unwrap();
+        let snapshot = source.join("snap").join(manifest.snapshot.unwrap().file);
+        let mut bytes = std::fs::read(&snapshot).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(&snapshot, bytes).unwrap();
+
+        let archive = root.join("database.pdbbak");
+        assert!(create_backup(&engine, &archive, false).is_err());
+        assert!(!archive.exists(), "invalid backup must not be published");
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();
     }
