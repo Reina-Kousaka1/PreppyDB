@@ -130,25 +130,29 @@ impl TokenRecord {
             )
     }
 
-    fn from_json(value: &Json) -> TokenRecord {
-        TokenRecord {
-            id: value.get_str("id").unwrap_or_default().to_string(),
-            name: value.get_str("name").unwrap_or_default().to_string(),
-            hash_hex: value.get_str("hash").unwrap_or_default().to_string(),
-            roles: value
-                .get("roles")
-                .and_then(|v| v.as_array())
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().and_then(Role::parse))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            created_at: value.get_i64("created_at").unwrap_or(0),
-            expires_at: value.get("expires_at").and_then(|v| v.as_i64()),
-            last_used_at: value.get("last_used_at").and_then(|v| v.as_i64()),
+    fn from_json(value: &Json) -> Result<TokenRecord> {
+        let id = required_string(value, "id")?;
+        let name = required_string(value, "name")?;
+        let hash_hex = required_string(value, "hash")?;
+        let hash = hex_decode(&hash_hex)
+            .map_err(|_| AuthError("auth file contains an invalid token hash".into()))?;
+        if id.len() > 64 || name.trim().is_empty() || name.len() > 64 || hash.len() != 32 {
+            return Err(AuthError(
+                "auth file contains an invalid token record".into(),
+            ));
         }
+        let created_at = value
+            .get_i64("created_at")
+            .ok_or_else(|| AuthError("auth file contains an invalid token creation time".into()))?;
+        Ok(TokenRecord {
+            id,
+            name,
+            hash_hex,
+            roles: parse_roles(value)?,
+            created_at,
+            expires_at: optional_i64(value, "expires_at")?,
+            last_used_at: optional_i64(value, "last_used_at")?,
+        })
     }
 }
 
@@ -202,27 +206,74 @@ impl UserRecord {
                 "auth file contains unsupported PBKDF2 iteration count".into(),
             ));
         }
+        let username = required_string(value, "username")?;
+        validate_username(&username)?;
+        let salt_hex = required_string(value, "salt")?;
+        let salt = hex_decode(&salt_hex)
+            .map_err(|_| AuthError("auth file contains an invalid password salt".into()))?;
+        let hash_hex = required_string(value, "hash")?;
+        let hash = hex_decode(&hash_hex)
+            .map_err(|_| AuthError("auth file contains an invalid password hash".into()))?;
+        if salt.len() != 16 || hash.len() != 32 {
+            return Err(AuthError(
+                "auth file contains an invalid password hash record".into(),
+            ));
+        }
+        let created_at = value
+            .get_i64("created_at")
+            .ok_or_else(|| AuthError("auth file contains an invalid user creation time".into()))?;
+        let disabled = value
+            .get("disabled")
+            .and_then(|item| item.as_bool())
+            .ok_or_else(|| AuthError("auth file contains an invalid disabled flag".into()))?;
         Ok(UserRecord {
-            username: value.get_str("username").unwrap_or_default().to_string(),
-            salt_hex: value.get_str("salt").unwrap_or_default().to_string(),
+            username,
+            salt_hex,
             iterations: iterations as u32,
-            hash_hex: value.get_str("hash").unwrap_or_default().to_string(),
-            roles: value
-                .get("roles")
-                .and_then(|v| v.as_array())
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().and_then(Role::parse))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            created_at: value.get_i64("created_at").unwrap_or(0),
-            disabled: value
-                .get("disabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            hash_hex,
+            roles: parse_roles(value)?,
+            created_at,
+            disabled,
         })
+    }
+}
+
+fn required_string(value: &Json, key: &str) -> Result<String> {
+    value
+        .get_str(key)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| AuthError(format!("auth file is missing a valid '{key}'")))
+}
+
+fn parse_roles(value: &Json) -> Result<Vec<Role>> {
+    let items = value
+        .get("roles")
+        .and_then(|item| item.as_array())
+        .ok_or_else(|| AuthError("auth file is missing a valid roles array".into()))?;
+    let mut roles = Vec::with_capacity(items.len());
+    for item in items {
+        let role = item
+            .as_str()
+            .and_then(Role::parse)
+            .ok_or_else(|| AuthError("auth file contains an unknown role".into()))?;
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+    if roles.is_empty() {
+        return Err(AuthError("auth file contains an empty roles array".into()));
+    }
+    Ok(roles)
+}
+
+fn optional_i64(value: &Json, key: &str) -> Result<Option<i64>> {
+    match value.get(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(item) => item
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| AuthError(format!("auth file contains an invalid '{key}'"))),
     }
 }
 
@@ -274,18 +325,48 @@ fn read_credentials(path: &Path) -> std::io::Result<String> {
 }
 
 fn parse_credentials(text: &str) -> Result<(Vec<UserRecord>, Vec<TokenRecord>)> {
-    let value = preppydb_json::parse(text)
-        .map_err(|err| AuthError(format!("auth file is not valid JSON: {err}")))?;
+    let value = preppydb_json::parse_with_limit(
+        text,
+        preppydb_json::ParseLimits {
+            max_depth: 32,
+            max_string_len: MAX_AUTH_FILE_BYTES as usize,
+            max_items: 200_000,
+            max_bytes: MAX_AUTH_FILE_BYTES as usize,
+        },
+    )
+    .map_err(|err| AuthError(format!("auth file is not valid JSON: {err}")))?;
+    if value.as_object().is_none() {
+        return Err(AuthError("auth file root must be an object".into()));
+    }
+    if value
+        .get("format_version")
+        .is_some_and(|version| version.as_i64() != Some(1))
+    {
+        return Err(AuthError(
+            "auth file has an unsupported format version".into(),
+        ));
+    }
     let users = value
         .get("users")
-        .and_then(|v| v.as_array())
-        .map(|items| items.iter().map(UserRecord::from_json).collect())
+        .map(|v| {
+            v.as_array()
+                .ok_or_else(|| AuthError("auth file 'users' must be an array".into()))?
+                .iter()
+                .map(UserRecord::from_json)
+                .collect()
+        })
         .transpose()?
         .unwrap_or_default();
     let tokens = value
         .get("tokens")
-        .and_then(|v| v.as_array())
-        .map(|items| items.iter().map(TokenRecord::from_json).collect())
+        .map(|v| {
+            v.as_array()
+                .ok_or_else(|| AuthError("auth file 'tokens' must be an array".into()))?
+                .iter()
+                .map(TokenRecord::from_json)
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
         .unwrap_or_default();
     Ok((users, tokens))
 }
@@ -955,22 +1036,60 @@ mod tests {
 
     #[test]
     fn imported_password_iterations_are_bounded_without_integer_wraparound() {
+        let imported_user = |iterations| {
+            Json::obj()
+                .with("username", Json::str("reader"))
+                .with("salt", Json::str("00000000000000000000000000000000"))
+                .with("iterations", iterations)
+                .with(
+                    "hash",
+                    Json::str("0000000000000000000000000000000000000000000000000000000000000000"),
+                )
+                .with("roles", Json::array(vec![Json::str("read")]))
+                .with("created_at", Json::int(0))
+                .with("disabled", Json::Bool(false))
+        };
         for invalid in [
             Json::Null,
             Json::Bool(true),
             Json::str("120000"),
             Json::int(-1),
         ] {
-            let value = Json::obj().with("iterations", invalid);
+            let value = imported_user(invalid);
             assert!(UserRecord::from_json(&value).is_err());
         }
         for count in [0, 1, 9_999, 1_000_001, u32::MAX as u64 + 1] {
-            let value = Json::obj().with("iterations", Json::uint(count));
+            let value = imported_user(Json::uint(count));
             assert!(UserRecord::from_json(&value).is_err(), "accepted {count}");
         }
         for count in [10_000, DEFAULT_ITERATIONS, 1_000_000] {
-            let value = Json::obj().with("iterations", Json::uint(count as u64));
+            let value = imported_user(Json::uint(count as u64));
             assert_eq!(UserRecord::from_json(&value).unwrap().iterations, count);
         }
+    }
+
+    #[test]
+    fn malformed_credential_records_fail_closed() {
+        let (mut store, dir) = store("strict-credentials");
+        store
+            .create_user("admin", "correct horse battery", vec![Role::Admin])
+            .unwrap();
+        let original = std::fs::read_to_string(store.path()).unwrap();
+        let mut value = preppydb_json::parse(&original).unwrap();
+        value.get_mut("users").unwrap().as_array_mut().unwrap()[0].set(
+            "roles",
+            Json::array(vec![Json::str("admin"), Json::str("owner")]),
+        );
+        assert!(parse_credentials(&value.to_string()).is_err());
+
+        let mut value = preppydb_json::parse(&original).unwrap();
+        value.get_mut("users").unwrap().as_array_mut().unwrap()[0].remove_key("hash");
+        assert!(parse_credentials(&value.to_string()).is_err());
+
+        let mut value = preppydb_json::parse(&original).unwrap();
+        value.set("format_version", Json::int(2));
+        assert!(parse_credentials(&value.to_string()).is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
