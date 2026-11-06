@@ -265,7 +265,12 @@ The archive contains a header, every file with a SHA-256, and a trailing whole-f
 SHA-256. `backup-verify` validates both the archive checksums and the embedded database
 by extracting it to an exclusive temporary directory and opening/verifying it with strict
 read-only recovery. Backup creation requires a writable engine that holds the database
-lock; read-only handles do not coordinate with a live writer and are rejected. `restore`
+lock; read-only handles are rejected for backup. A read-only open takes a shared lock by
+default when the persistent `LOCK` file exists, so it cannot race a writer's checkpoint
+or recovery cleanup. Set `take_lock=false` only for explicit live inspection; that mode
+does not provide a stable cross-process view and can fail closed if files change while
+opening. Databases without a `LOCK` file remain readable for compatibility but cannot be
+coordinated through that file. `restore`
 performs that validation, copies and rechecks each member,
 then strictly opens/verifies the staged database before publishing it; an invalid archive
 or database leaves the target untouched. Verification requires temporary disk space

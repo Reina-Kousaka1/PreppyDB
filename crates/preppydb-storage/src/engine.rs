@@ -64,7 +64,8 @@ pub struct EngineConfig {
     pub limits: Limits,
     /// Take a checkpoint automatically after this many mutations (`None` = never).
     pub checkpoint_every_mutations: Option<u64>,
-    /// Open read-only (no WAL writes, no checkpoints, no locks).
+    /// Open read-only (no WAL writes or checkpoints). When `take_lock` is true,
+    /// acquire a shared directory lock if the database has a lock file.
     pub read_only: bool,
     /// Take the directory lock (disable only for read-only inspection of a live DB).
     pub take_lock: bool,
@@ -512,8 +513,12 @@ impl Engine {
             create_private_dir(&paths.snap_dir)?;
         }
 
-        let lock = if cfg.take_lock && !cfg.read_only {
-            Some(FileLock::acquire(&paths.root)?)
+        let lock = if cfg.take_lock {
+            if cfg.read_only {
+                FileLock::acquire_shared(&paths.root)?
+            } else {
+                Some(FileLock::acquire(&paths.root)?)
+            }
         } else {
             None
         };

@@ -1888,6 +1888,38 @@ fn second_writer_is_locked_out() {
 }
 
 #[test]
+fn read_only_open_uses_shared_lock_unless_live_inspection_is_explicit() {
+    let dir = tempdir("readonly-shared-lock");
+    let writer = open(&dir);
+    writer
+        .create_collection(CollectionMeta::new("c", 0))
+        .unwrap();
+    writer
+        .put("c", "key", Json::int(1), PutOptions::default())
+        .unwrap();
+
+    let mut config = EngineConfig::new(&dir);
+    config.read_only = true;
+    assert!(matches!(
+        Engine::open(config.clone()),
+        Err(DbError::Locked(_))
+    ));
+
+    config.take_lock = false;
+    let reader = Engine::open(config).unwrap();
+    assert_eq!(reader.get("c", "key").unwrap().value.as_i64(), Some(1));
+    drop(reader);
+
+    drop(writer);
+    let mut config = EngineConfig::new(&dir);
+    config.read_only = true;
+    let reader = Engine::open(config).unwrap();
+    assert_eq!(reader.get("c", "key").unwrap().value.as_i64(), Some(1));
+    drop(reader);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn read_only_open_does_not_create_a_missing_database() {
     let dir = tempdir("readonly-missing-database");
     std::fs::remove_dir(&dir).unwrap();

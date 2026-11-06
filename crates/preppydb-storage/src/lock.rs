@@ -83,6 +83,36 @@ impl FileLock {
         })
     }
 
+    /// Take a shared lock for a read-only open without creating or changing `LOCK`.
+    ///
+    /// A missing lock file is accepted for compatibility with existing databases
+    /// created before directory locking was introduced. Such a handle is uncoordinated;
+    /// callers that require an explicit live inspection can also disable locking in
+    /// `EngineConfig`.
+    pub fn acquire_shared(dir: &Path) -> Result<Option<FileLock>> {
+        let path = dir.join(LOCK_FILE);
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(DbError::io(format!("opening {}", path.display()), err)),
+        };
+        match file.try_lock_shared() {
+            Ok(()) => Ok(Some(FileLock {
+                file: Some(file),
+                path,
+                pid: std::process::id(),
+            })),
+            Err(TryLockError::WouldBlock) => Err(DbError::Locked(format!(
+                "database directory is open for writing ({} is locked)",
+                path.display()
+            ))),
+            Err(TryLockError::Error(err)) => Err(DbError::io(
+                format!("locking {} for reading", path.display()),
+                err,
+            )),
+        }
+    }
+
     /// Release the lock. Idempotent; also called from `Drop`.
     pub fn release(&mut self) {
         if let Some(file) = self.file.take() {
@@ -215,6 +245,35 @@ mod tests {
         // Once the first handle is gone the lock is free again.
         let second = FileLock::acquire(&dir).unwrap();
         drop(second);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shared_lock_excludes_writers_without_mutating_lock_metadata() {
+        let dir = tempdir("shared");
+        let exclusive = FileLock::acquire(&dir).unwrap();
+        assert!(matches!(
+            FileLock::acquire_shared(&dir),
+            Err(DbError::Locked(_))
+        ));
+        drop(exclusive);
+
+        let path = dir.join(LOCK_FILE);
+        let before = std::fs::read(&path).unwrap();
+        let shared = FileLock::acquire_shared(&dir).unwrap().unwrap();
+        assert!(matches!(FileLock::acquire(&dir), Err(DbError::Locked(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(shared);
+
+        drop(FileLock::acquire(&dir).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shared_lock_does_not_create_a_missing_lock_file() {
+        let dir = tempdir("shared-missing");
+        assert!(FileLock::acquire_shared(&dir).unwrap().is_none());
+        assert!(!dir.join(LOCK_FILE).exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
