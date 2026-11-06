@@ -305,6 +305,18 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
                     ),
                 ));
             }
+            let actual_collections = u64::try_from(collections.len()).map_err(|_| {
+                DbError::corrupt(path.display().to_string(), "collection count overflow")
+            })?;
+            if actual_collections != header.collections {
+                return Err(DbError::corrupt(
+                    path.display().to_string(),
+                    format!(
+                        "header announces {} collections but the body contains {actual_collections}",
+                        header.collections
+                    ),
+                ));
+            }
             return Ok(SnapshotData {
                 header,
                 collections,
@@ -661,6 +673,26 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let err = read_snapshot(&path).unwrap_err();
         assert!(err.to_string().contains("announces"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn collection_count_mismatch_detected() {
+        let dir = tempdir("collection-count");
+        let path = dir.join("snap-1.pdb");
+        write_snapshot(&path, 1, 1, 0, &sample()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let needle = b"\"collections\":1";
+        let position = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("collection count in header");
+        bytes[position + needle.len() - 1] = b'2';
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = read_snapshot(&path).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
+        assert!(error.to_string().contains("announces 2 collections"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
