@@ -764,6 +764,18 @@ pub fn verify_backup(archive: &Path) -> Result<Json> {
 /// Steps: open → verify everything → extract into a sibling temp directory → fsync →
 /// move any existing target aside → rename temp into place → fsync parent.
 pub fn restore_backup(archive: &Path, target: &Path, force: bool) -> Result<RestoreReport> {
+    restore_backup_with_staged_sync(archive, target, force, sync_restore_tree)
+}
+
+fn restore_backup_with_staged_sync<F>(
+    archive: &Path,
+    target: &Path,
+    force: bool,
+    sync_staged_tree: F,
+) -> Result<RestoreReport>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
     let mut reader = open_archive(archive)?;
     reader.verify()?;
     let entry_count = reader.entry_count();
@@ -787,7 +799,7 @@ pub fn restore_backup(archive: &Path, target: &Path, force: bool) -> Result<Rest
 
     extract_archive(&mut reader, &temp)?;
     verify_restored_database(&temp)?;
-    sync_restore_tree(&temp)?;
+    sync_staged_tree(&temp)?;
 
     let aside = parent.join(format!(
         "{}.replaced-{stamp}",
@@ -1938,6 +1950,53 @@ mod tests {
             std::fs::read(target.join("keep")).unwrap(),
             b"original database marker"
         );
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".target.restore-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_tree_sync_failure_cleans_stage_and_preserves_existing_target() {
+        let root = tempdir("staged-sync-failure");
+        let source = root.join("source");
+        let engine = Engine::open(crate::engine::EngineConfig::new(&source)).unwrap();
+        engine
+            .create_collection(crate::catalog::CollectionMeta::new("items", 0))
+            .unwrap();
+        engine
+            .put(
+                "items",
+                "one",
+                Json::str("value"),
+                crate::engine::PutOptions::default(),
+            )
+            .unwrap();
+        let archive = root.join("database.bak");
+        create_backup(&engine, &archive, true).unwrap();
+        drop(engine);
+
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"original database marker").unwrap();
+        let error = restore_backup_with_staged_sync(&archive, &target, true, |_| {
+            Err(DbError::io(
+                "injected staged directory sync failure",
+                std::io::Error::other("injected"),
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), crate::error::codes::IO_ERROR);
+        assert_eq!(
+            std::fs::read(target.join("keep")).unwrap(),
+            b"original database marker"
+        );
+        assert!(!restore_intent_path(&target).unwrap().0.exists());
         assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
             !entry
                 .unwrap()
