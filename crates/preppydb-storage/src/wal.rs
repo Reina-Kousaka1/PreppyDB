@@ -152,6 +152,21 @@ impl WalWriter {
         max_segment_bytes: u64,
         sync_mode: SyncMode,
     ) -> Result<WalWriter> {
+        Self::open_with_directory_sync(dir, index, max_segment_bytes, sync_mode, |path| {
+            crate::snapshot::fsync_dir(path)
+        })
+    }
+
+    fn open_with_directory_sync<F>(
+        dir: &Path,
+        index: u64,
+        max_segment_bytes: u64,
+        sync_mode: SyncMode,
+        sync_directory: F,
+    ) -> Result<WalWriter>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
         std::fs::create_dir_all(dir)
             .map_err(|err| DbError::io(format!("creating {}", dir.display()), err))?;
         let path = dir.join(segment_name(index));
@@ -178,6 +193,7 @@ impl WalWriter {
             .metadata()
             .map_err(|err| DbError::io("stat WAL segment", err))?
             .len();
+        let newly_created = !existed;
         if !existed || len == 0 {
             // Fresh segment: write the header.
             file.seek(SeekFrom::Start(0))
@@ -188,6 +204,12 @@ impl WalWriter {
                 .map_err(|err| DbError::io("writing WAL header", err))?;
             file.sync_all()
                 .map_err(|err| DbError::io("syncing WAL header", err))?;
+        }
+        if newly_created {
+            // The segment header must reach stable storage before any record can be
+            // acknowledged in this newly created directory entry. File sync alone
+            // does not persist the name on filesystems that require directory sync.
+            sync_directory(dir)?;
         }
         let current_len = file
             .metadata()
@@ -633,6 +655,61 @@ mod tests {
         path.push(unique);
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn new_segment_syncs_its_directory_before_open_returns() {
+        let dir = tempdir("directory-sync");
+        let mut calls = 0;
+        let writer = WalWriter::open_with_directory_sync(
+            &dir,
+            1,
+            64 * 1024 * 1024,
+            SyncMode::Never,
+            |synced_dir| {
+                calls += 1;
+                assert_eq!(synced_dir, dir);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        drop(writer);
+
+        let writer =
+            WalWriter::open_with_directory_sync(&dir, 1, 64 * 1024 * 1024, SyncMode::Never, |_| {
+                panic!("opening an existing segment must not resync its directory")
+            })
+            .unwrap();
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_new_segment_directory_sync_prevents_writer_publication() {
+        let dir = tempdir("directory-sync-failure");
+        let result = WalWriter::open_with_directory_sync(
+            &dir,
+            1,
+            64 * 1024 * 1024,
+            SyncMode::Always,
+            |_| {
+                Err(DbError::io(
+                    "syncing WAL directory",
+                    std::io::Error::other("injected"),
+                ))
+            },
+        );
+        assert!(result.is_err());
+
+        // The segment header can exist after the failed barrier, but no WalWriter was
+        // published and no record could be appended/acknowledged through this open.
+        let path = dir.join(segment_name(1));
+        assert!(path.is_file());
+        let writer = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always)
+            .expect("a later successful open can safely reuse the header");
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn record(seq: u64) -> Record {

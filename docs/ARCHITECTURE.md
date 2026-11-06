@@ -85,6 +85,12 @@ truncated during recovery; a torn frame in the middle of the log is treated as
 corruption and aborts recovery unless `RepairPolicy::TruncateCorruptTail` is set
 explicitly (`preppydb --repair`).
 
+A newly created segment's header is synced, then its containing directory is synced
+before the writer is returned and can accept records. On Unix this requests directory
+entry durability. The current non-Unix helper does not issue a directory flush, so this
+does not establish equivalent Windows power-loss durability; OS, filesystem, device,
+and controller behavior still bound the commit guarantee.
+
 An incomplete final segment header (shorter than the fixed 12-byte header and with no
 possible record frame) is also treated as interrupted segment creation: writable open
 removes that final segment after validating the preceding WAL history and syncs the WAL
