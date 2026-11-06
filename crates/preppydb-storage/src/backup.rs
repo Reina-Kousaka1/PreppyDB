@@ -1302,6 +1302,14 @@ mod tests {
 
     #[test]
     fn restore_publication_process_crashes_fail_closed_at_rename_boundaries() {
+        // The ARM64 workflow uses qemu-user without binfmt_misc, so it cannot
+        // re-execute this test binary as a child. The same crash cases run in the
+        // native Linux and Windows jobs; only the emulated job opts out explicitly.
+        if std::env::var_os("PREPPYDB_SKIP_CHILD_CRASH").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
         for phase in [
             "before_publish",
             "after_old_target_move",
@@ -1316,27 +1324,7 @@ mod tests {
             std::fs::create_dir(&staged).unwrap();
             std::fs::write(staged.join("new"), b"new-state").unwrap();
 
-            let executable = std::env::current_exe().unwrap();
-            // Cargo's target runner wraps the first test process only. When this
-            // test is itself running under QEMU, explicitly use the same runner
-            // for the child process instead of trying to exec an ARM ELF directly.
-            let runner = std::env::var("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER")
-                .ok()
-                .map(|value| {
-                    value
-                        .split_whitespace()
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .filter(|parts| !parts.is_empty());
-            let mut command = if let Some(runner) = runner {
-                let mut command = std::process::Command::new(&runner[0]);
-                command.args(&runner[1..]).arg(&executable);
-                command
-            } else {
-                std::process::Command::new(executable)
-            };
-            let output = command
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "backup::tests::restore_publication_crash_child",
