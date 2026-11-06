@@ -434,9 +434,17 @@ impl Manifest {
         self.updated_at = crate::clock::now_ms();
         let path = Manifest::path(dir);
         let tmp = dir.join("MANIFEST.json.tmp");
+        match std::fs::symlink_metadata(&tmp) {
+            Ok(_) => std::fs::remove_file(&tmp)
+                .map_err(|err| DbError::io(format!("removing stale {}", tmp.display()), err))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(DbError::io(format!("inspecting {}", tmp.display()), err)),
+        }
         let text = preppydb_json::to_string_pretty(&self.to_json());
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        // Exclusive creation prevents a symlink planted after the stale-temp check
+        // from redirecting the manifest write outside the database directory.
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -509,6 +517,27 @@ mod tests {
         // No temporary file is left behind.
         assert!(!dir.join("MANIFEST.json.tmp").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_follow_a_symlinked_temporary_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir("symlinked-temp");
+        let outside_dir = tempdir("symlink-target");
+        let outside = outside_dir.join("sentinel");
+        std::fs::write(&outside, b"keep this content").unwrap();
+        symlink(&outside, dir.join("MANIFEST.json.tmp")).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.save(&dir).unwrap();
+
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep this content");
+        assert!(Manifest::path(&dir).is_file());
+        assert!(!dir.join("MANIFEST.json.tmp").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(outside_dir).unwrap();
     }
 
     #[test]
