@@ -336,7 +336,8 @@ After a process crash such as `kill -9`, startup validates and replays the persi
    removes every later WAL segment. This is destructive repair, not a substitute for
    restoring a verified backup. For example:
    `preppydb checkpoint --data-dir ./data --repair` (or start the server with
-   `"repair": "truncate"`). Read-only opens never perform corruption repair;
+   `"repair": "truncate"`). Recovery also refuses to open when the replayed sequence
+   remains below the manifest's `last_seq` watermark. Read-only opens never perform corruption repair;
    `preppydb wal` only *reports* what it finds.
 
 ### Upgrades

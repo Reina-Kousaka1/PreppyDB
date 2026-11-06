@@ -1841,6 +1841,71 @@ fn backup_from_read_only_handle_is_rejected_without_publishing_archive() {
 }
 
 #[test]
+fn missing_wal_suffix_below_manifest_watermark_fails_closed() {
+    let dir = tempdir("manifest-ahead-of-recovered-wal");
+    let engine = open(&dir);
+    engine
+        .create_collection(CollectionMeta::new("c", 0))
+        .unwrap();
+    engine
+        .put("c", "before", Json::int(1), PutOptions::default())
+        .unwrap();
+    let checkpoint = engine.checkpoint().unwrap();
+    engine
+        .put("c", "after", Json::int(2), PutOptions::default())
+        .unwrap();
+    let committed_seq = engine.last_seq();
+    assert!(committed_seq > checkpoint.header.seq);
+    drop(engine);
+
+    // A manifest watermark can describe a WAL suffix beyond its snapshot. Removing
+    // that suffix simulates lost/corrupt WAL history; open must not silently accept
+    // the older snapshot and merely advance the sequence counter.
+    let mut manifest = Manifest::load(&dir).unwrap().unwrap();
+    manifest.last_seq = committed_seq;
+    save_active_manifest(&dir, &manifest);
+    for segment in wal::list_segments(&dir.join("wal")).unwrap() {
+        std::fs::remove_file(segment).unwrap();
+    }
+
+    let error = Engine::open(EngineConfig::new(&dir))
+        .expect_err("missing WAL records below the durable manifest watermark must fail closed");
+    assert_eq!(error.code(), preppydb_storage::error::codes::CORRUPT_DATA);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn manifest_watermark_ahead_of_snapshot_is_valid_when_wal_reaches_it() {
+    let dir = tempdir("manifest-ahead-with-complete-wal");
+    let engine = open(&dir);
+    engine
+        .create_collection(CollectionMeta::new("c", 0))
+        .unwrap();
+    engine
+        .put("c", "before", Json::int(1), PutOptions::default())
+        .unwrap();
+    let checkpoint = engine.checkpoint().unwrap();
+    engine
+        .put("c", "after", Json::int(2), PutOptions::default())
+        .unwrap();
+    let committed_seq = engine.last_seq();
+    assert!(committed_seq > checkpoint.header.seq);
+    drop(engine);
+
+    // A legacy or future manifest may watermark the committed WAL suffix beyond the
+    // snapshot. This remains valid when the complete WAL history reaches that mark.
+    let mut manifest = Manifest::load(&dir).unwrap().unwrap();
+    manifest.last_seq = committed_seq;
+    save_active_manifest(&dir, &manifest);
+
+    let reopened = open(&dir);
+    assert_eq!(reopened.last_seq(), committed_seq);
+    assert_eq!(reopened.get("c", "after").unwrap().value.as_i64(), Some(2));
+    drop(reopened);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn restore_refuses_to_replace_a_database_with_an_active_writer() {
     let root = tempdir("restore-active-writer");
     let target = root.join("database");

@@ -141,7 +141,10 @@ instead of defaulting to an empty database state.
    implemented.
 2. Load the snapshot (verify block CRCs and the file hash).
 3. Replay WAL records in sequence order, skipping records already covered by the
-   snapshot. Complete bad-CRC frames fail closed by default.
+   snapshot. Recovery must reach the manifest's `last_seq` watermark; missing WAL
+   history below that watermark fails closed. A watermark beyond the snapshot remains
+   valid when the retained WAL suffix reaches it. Complete bad-CRC frames fail closed
+   by default.
 4. A partial final frame is truncated automatically. Explicit writable
    `RepairPolicy::TruncateCorruptTail` truncates at the first corrupt or discontinuous
    frame and removes later WAL segments; this deliberately discards the untrusted suffix.

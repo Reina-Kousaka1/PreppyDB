@@ -781,15 +781,13 @@ impl Engine {
         }
 
         if manifest.last_seq > seq {
-            notes.push(RecoveryNote {
-                at: now_ms(),
-                kind: "manifest_ahead".into(),
-                detail: format!(
-                    "manifest last_seq {} is ahead of the replayed log ({}); keeping the higher value so sequence numbers are never reused",
+            return Err(DbError::corrupt(
+                "manifest",
+                format!(
+                    "manifest last_seq {} is ahead of the recovered sequence {}; WAL history is incomplete",
                     manifest.last_seq, seq
                 ),
-            });
-            seq = manifest.last_seq;
+            ));
         }
 
         // ---- 3. open the WAL for appending -------------------------------------
@@ -2190,6 +2188,12 @@ impl Engine {
                         scan.corruption.clone().map(Json::str).unwrap_or(Json::Null),
                     ),
             );
+        }
+        if previous_seq < manifest.last_seq {
+            issues.push(format!(
+                "manifest last_seq {} is ahead of the verifiable WAL sequence {}; WAL history is incomplete",
+                manifest.last_seq, previous_seq
+            ));
         }
         Ok(VerifyReport {
             ok: issues.is_empty(),
