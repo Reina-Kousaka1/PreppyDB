@@ -1295,12 +1295,18 @@ fn post_checkpoint_crc_corruption_in_middle_segment_discards_later_segments_on_r
     }
 
     let segments = wal::list_segments(&dir.join("wal")).unwrap();
-    assert!(segments.len() >= 3, "expected rotated segments: {segments:?}");
+    assert!(
+        segments.len() >= 3,
+        "expected rotated segments: {segments:?}"
+    );
     let mut bytes = std::fs::read(&segments[1]).unwrap();
     *bytes.last_mut().unwrap() ^= 0x40;
     std::fs::write(&segments[1], bytes).unwrap();
 
-    assert!(matches!(Engine::open(cfg.clone()), Err(DbError::Corrupt { .. })));
+    assert!(matches!(
+        Engine::open(cfg.clone()),
+        Err(DbError::Corrupt { .. })
+    ));
     cfg.repair = RepairPolicy::TruncateCorruptTail;
     let engine = Engine::open(cfg.clone()).unwrap();
     assert_eq!(engine.count("c").unwrap(), 2);
@@ -1308,7 +1314,10 @@ fn post_checkpoint_crc_corruption_in_middle_segment_discards_later_segments_on_r
     assert_eq!(engine.get("c", "before").unwrap().value.as_i64(), Some(1));
     assert!(engine.get_opt("c", "damaged").unwrap().is_none());
     assert!(engine.get_opt("c", "after").unwrap().is_none());
-    assert!(!segments[2].exists(), "repair must remove the later WAL suffix");
+    assert!(
+        !segments[2].exists(),
+        "repair must remove the later WAL suffix"
+    );
     engine
         .put("c", "after-repair", Json::int(4), PutOptions::default())
         .unwrap();
