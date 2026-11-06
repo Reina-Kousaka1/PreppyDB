@@ -130,16 +130,20 @@ jobs:
           $out = Join-Path $env:RUNNER_TEMP "smoke-server.out"
           $err = Join-Path $env:RUNNER_TEMP "smoke-server.err"
           $server = $null
+          $stage = "initialization"
           try {
             $init = & .\target\release\preppydb-server.exe --data-dir $data --bootstrap-token ci --init-only 2>&1
-            $init | ForEach-Object { Write-Host "init: $_" }
             # Pick the token by shape (32 random bytes, base64url) rather than by line number.
             $token = ($init | Where-Object { $_ -match '^[A-Za-z0-9_-]{40,}$' } | Select-Object -First 1)
             if (-not $token) { throw "no bootstrap token was printed" }
+            # Mask before writing any initialization output: init includes the one-time secret.
+            Write-Host "::add-mask::$token"
+            $init | Where-Object { $_ -notmatch '^[A-Za-z0-9_-]{40,}$' } | ForEach-Object { Write-Host "init: $_" }
             $server = Start-Process -FilePath .\target\release\preppydb-server.exe `
                 -ArgumentList "--data-dir", $data, "--listen", "127.0.0.1:7070" `
                 -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
             $healthy = $false
+            $stage = "health check"
             for ($i = 0; $i -lt 30; $i++) {
               Start-Sleep -Milliseconds 500
               if ($server.HasExited) {
@@ -152,15 +156,18 @@ jobs:
             }
             if (-not $healthy) { throw "server did not become healthy" }
             $headers = @{ Authorization = "Bearer $token" }
+            $stage = "create collection"
             Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections" `
                 -Headers $headers -ContentType "application/json" -Body '{"name":"windows_smoke"}' | Out-Null
+            $stage = "insert document"
             Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents" `
                 -Headers $headers -ContentType "application/json" -Body '{"key":"k","value":{"ok":true}}' | Out-Null
+            $stage = "read document"
             $doc = Invoke-RestMethod -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents/k" -Headers $headers
             if ($doc.data.value.ok -ne $true) { throw "document did not round-trip" }
             Write-Host "smoke test passed"
           } catch {
-            Write-Host "::error::$($_.Exception.Message)"
+            Write-Host "::error::Smoke test failed during $stage`: $($_.Exception.ToString())"
             if (Test-Path $out) { Get-Content $out -Tail 30 | ForEach-Object { Write-Host "server-out: $_" } }
             if (Test-Path $err) { Get-Content $err -Tail 30 | ForEach-Object { Write-Host "server-err: $_" } }
             exit 1
