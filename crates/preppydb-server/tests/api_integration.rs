@@ -59,6 +59,29 @@ fn admin_client(server: &TestServer) -> Client {
     Client::new(&server.base_url, &server.admin).unwrap()
 }
 
+#[cfg(feature = "ruby-integration-tests")]
+fn test_ruby_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("PREPPYDB_TEST_RUBY") {
+        let path = PathBuf::from(path);
+        assert!(path.is_absolute(), "PREPPYDB_TEST_RUBY must be absolute");
+        return path;
+    }
+
+    let executable_names: &[&str] = if cfg!(windows) {
+        &["ruby.exe", "ruby"]
+    } else {
+        &["ruby"]
+    };
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .flat_map(|directory| {
+            executable_names
+                .iter()
+                .map(move |name| directory.join(name))
+        })
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("Ruby executable not found on PATH"))
+}
+
 fn start<F>(tag: &str, tweak: F) -> TestServer
 where
     F: FnOnce(&mut ServerConfig),
@@ -394,9 +417,7 @@ fn unknown_endpoints_and_methods_are_structured() {
 #[cfg(feature = "ruby-integration-tests")]
 fn ruby_query_endpoint_requires_read_permission_and_executes_index_plan() {
     let server = start("ruby-query", |config| {
-        config.ruby_planner_path = Some(PathBuf::from(
-            std::env::var("PREPPYDB_TEST_RUBY").unwrap_or_else(|_| "/usr/bin/ruby".into()),
-        ));
+        config.ruby_planner_path = Some(test_ruby_path());
     });
     let admin = admin_client(&server);
     admin.create_collection("users", None).unwrap();
@@ -773,9 +794,7 @@ fn index_queries_over_http() {
 #[cfg(feature = "ruby-integration-tests")]
 fn ruby_query_result_can_drive_a_lua_cas_write_through_rust_storage() {
     let server = start("ruby-lua-composition", |config| {
-        config.ruby_planner_path = Some(PathBuf::from(
-            std::env::var("PREPPYDB_TEST_RUBY").unwrap_or_else(|_| "/usr/bin/ruby".into()),
-        ));
+        config.ruby_planner_path = Some(test_ruby_path());
         config.lua_execution_enabled = true;
     });
     let admin = admin_client(&server);
