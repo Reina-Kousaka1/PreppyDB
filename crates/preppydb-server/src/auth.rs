@@ -452,7 +452,10 @@ impl AuthStore {
             disabled: false,
         };
         self.users.push(record.clone());
-        self.save()?;
+        if let Err(error) = self.save() {
+            self.users.pop();
+            return Err(error);
+        }
         Ok(record)
     }
 
@@ -471,10 +474,21 @@ impl AuthStore {
             .iter_mut()
             .find(|user| user.username == username)
             .ok_or_else(|| AuthError(format!("user '{username}' not found")))?;
+        let previous_salt = user.salt_hex.clone();
+        let previous_hash = user.hash_hex.clone();
+        let previous_iterations = user.iterations;
         user.salt_hex = hex_encode(&salt);
         user.hash_hex = hex_encode(&hash);
         user.iterations = DEFAULT_ITERATIONS;
-        self.save()
+        if let Err(error) = self.save() {
+            if let Some(user) = self.users.iter_mut().find(|user| user.username == username) {
+                user.salt_hex = previous_salt;
+                user.hash_hex = previous_hash;
+                user.iterations = previous_iterations;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn set_user_disabled(&mut self, username: &str, disabled: bool) -> Result<()> {
@@ -483,8 +497,15 @@ impl AuthStore {
             .iter_mut()
             .find(|user| user.username == username)
             .ok_or_else(|| AuthError(format!("user '{username}' not found")))?;
+        let previous_disabled = user.disabled;
         user.disabled = disabled;
-        self.save()
+        if let Err(error) = self.save() {
+            if let Some(user) = self.users.iter_mut().find(|user| user.username == username) {
+                user.disabled = previous_disabled;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------ tokens
@@ -519,17 +540,24 @@ impl AuthStore {
             last_used_at: None,
         };
         self.tokens.push(record.clone());
-        self.save()?;
+        if let Err(error) = self.save() {
+            self.tokens.pop();
+            return Err(error);
+        }
         Ok((secret, record))
     }
 
     /// Revoke a token by id. Returns whether it existed.
     pub fn revoke_token(&mut self, id: &str) -> Result<bool> {
+        let previous = self.tokens.clone();
         let before = self.tokens.len();
         self.tokens.retain(|token| token.id != id);
         let removed = self.tokens.len() != before;
         if removed {
-            self.save()?;
+            if let Err(error) = self.save() {
+                self.tokens = previous;
+                return Err(error);
+            }
         }
         Ok(removed)
     }
@@ -838,6 +866,55 @@ mod tests {
         std::fs::write(store.path(), original).unwrap();
         store.reload_if_changed().unwrap();
         assert!(store.authenticate_session(&session).is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_auth_persistence_does_not_publish_mutations_in_memory() {
+        let (mut store, dir) = store("failed-save-rollback");
+        store
+            .create_user("admin", "correct horse battery", vec![Role::Admin])
+            .unwrap();
+        let temp = store.path().with_extension("json.tmp");
+
+        // A directory at the temporary-file path makes exclusive temp creation
+        // fail before the credential file can be replaced.
+        std::fs::create_dir(&temp).unwrap();
+        assert!(store.set_user_disabled("admin", true).is_err());
+        assert!(store.has_admin(), "failed save disabled admin in memory");
+        std::fs::remove_dir(&temp).unwrap();
+
+        std::fs::create_dir(&temp).unwrap();
+        assert!(store
+            .set_password("admin", "new correct horse battery")
+            .is_err());
+        std::fs::remove_dir(&temp).unwrap();
+        assert!(store.login("admin", "correct horse battery").is_ok());
+        assert!(store.login("admin", "new correct horse battery").is_err());
+
+        let (secret, token) = store
+            .create_token("service", vec![Role::Write], None)
+            .unwrap();
+        std::fs::create_dir(&temp).unwrap();
+        assert!(store.revoke_token(&token.id).is_err());
+        std::fs::remove_dir(&temp).unwrap();
+        assert!(store.authenticate_token(&secret).is_some());
+
+        std::fs::create_dir(&temp).unwrap();
+        assert!(store
+            .create_token("not-persisted", vec![Role::Read], None)
+            .is_err());
+        std::fs::remove_dir(&temp).unwrap();
+        assert_eq!(store.tokens.len(), 1);
+
+        std::fs::create_dir(&temp).unwrap();
+        assert!(store
+            .create_user("writer", "another correct horse", vec![Role::Write])
+            .is_err());
+        std::fs::remove_dir(&temp).unwrap();
+        assert_eq!(store.user_count(), 1);
+        assert!(store.users.iter().all(|user| user.username != "writer"));
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 
