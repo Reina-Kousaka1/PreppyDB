@@ -44,20 +44,54 @@ impl SnapshotRef {
     }
 
     pub fn from_json(value: &Json) -> Result<SnapshotRef> {
+        let file = value
+            .get_str("file")
+            .ok_or_else(|| DbError::corrupt("manifest", "snapshot entry without 'file'"))?;
+        let seq = value
+            .get("seq")
+            .and_then(Json::as_u64)
+            .ok_or_else(|| DbError::corrupt("manifest", "snapshot entry without valid 'seq'"))?;
+        let generation = value
+            .get("generation")
+            .and_then(Json::as_u64)
+            .ok_or_else(|| {
+                DbError::corrupt("manifest", "snapshot entry without valid 'generation'")
+            })?;
+        let sha256 = value
+            .get_str("sha256")
+            .ok_or_else(|| DbError::corrupt("manifest", "snapshot entry without 'sha256'"))?;
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(DbError::corrupt(
+                "manifest",
+                "snapshot entry has an invalid SHA-256",
+            ));
+        }
+        let doc_count = value
+            .get("doc_count")
+            .and_then(Json::as_u64)
+            .ok_or_else(|| {
+                DbError::corrupt("manifest", "snapshot entry without valid 'doc_count'")
+            })?;
+        let created_at = value.get_i64("created_at").ok_or_else(|| {
+            DbError::corrupt("manifest", "snapshot entry without valid 'created_at'")
+        })?;
+        let bytes = value
+            .get("bytes")
+            .and_then(Json::as_u64)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| DbError::corrupt("manifest", "snapshot entry without valid 'bytes'"))?;
         Ok(SnapshotRef {
-            file: value
-                .get_str("file")
-                .ok_or_else(|| DbError::corrupt("manifest", "snapshot entry without 'file'"))?
-                .to_string(),
-            seq: value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
-            generation: value
-                .get("generation")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            sha256: value.get_str("sha256").unwrap_or("").to_string(),
-            doc_count: value.get("doc_count").and_then(|v| v.as_u64()).unwrap_or(0),
-            created_at: value.get_i64("created_at").unwrap_or(0),
-            bytes: value.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+            file: file.to_string(),
+            seq,
+            generation,
+            sha256: sha256.to_string(),
+            doc_count,
+            created_at,
+            bytes,
         })
     }
 }
@@ -155,16 +189,19 @@ impl Manifest {
                 "non-empty manifest watermarks require a snapshot reference",
             ));
         }
-        let wal = value
-            .get("wal")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let wal = match value.get("wal") {
+            None => Vec::new(),
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| DbError::corrupt("manifest", "'wal' must be an array"))?
+                .iter()
+                .map(|item| {
+                    item.as_str().map(str::to_string).ok_or_else(|| {
+                        DbError::corrupt("manifest", "'wal' entries must be strings")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
         Ok(Manifest {
             format_version,
             generation,
@@ -408,7 +445,7 @@ mod tests {
             file: "snap-000000000003.pdb".into(),
             seq: 99,
             generation: 3,
-            sha256: "abc".into(),
+            sha256: "a".repeat(64),
             doc_count: 4,
             created_at: 1,
             bytes: 100,
@@ -434,7 +471,7 @@ mod tests {
                 file: "snap-000000000001.pdb".into(),
                 seq: 10,
                 generation: 1,
-                sha256: "legacy-hash".into(),
+                sha256: "b".repeat(64),
                 doc_count: 0,
                 created_at: 1,
                 bytes: 1,
@@ -451,7 +488,7 @@ mod tests {
                 file: "snap-000000000002.pdb".into(),
                 seq: 20,
                 generation: 2,
-                sha256: "next-hash".into(),
+                sha256: "c".repeat(64),
                 doc_count: 0,
                 created_at: 2,
                 bytes: 1,
@@ -549,9 +586,42 @@ mod tests {
                 Json::obj()
                     .with("file", Json::str("snap-000000000001.pdb"))
                     .with("generation", Json::uint(1))
-                    .with("seq", Json::uint(5)),
+                    .with("seq", Json::uint(5))
+                    .with("sha256", Json::str("d".repeat(64)))
+                    .with("doc_count", Json::uint(0))
+                    .with("created_at", Json::int(1))
+                    .with("bytes", Json::uint(100)),
             );
         assert!(Manifest::from_json(&inconsistent_snapshot).is_err());
+    }
+
+    #[test]
+    fn snapshot_reference_requires_checksum_and_length_metadata() {
+        let valid = SnapshotRef {
+            file: "snap-000000000001.pdb".into(),
+            seq: 1,
+            generation: 1,
+            sha256: "a".repeat(64),
+            doc_count: 0,
+            created_at: 1,
+            bytes: 100,
+        }
+        .to_json();
+        assert!(SnapshotRef::from_json(&valid).is_ok());
+
+        let mut missing_hash = valid.clone();
+        missing_hash.remove_key("sha256");
+        assert!(SnapshotRef::from_json(&missing_hash).is_err());
+
+        let mut missing_length = valid.clone();
+        missing_length.remove_key("bytes");
+        assert!(SnapshotRef::from_json(&missing_length).is_err());
+
+        let invalid_hash = valid.clone().with("sha256", Json::str("not-a-checksum"));
+        assert!(SnapshotRef::from_json(&invalid_hash).is_err());
+
+        let zero_length = valid.with("bytes", Json::uint(0));
+        assert!(SnapshotRef::from_json(&zero_length).is_err());
     }
 
     #[test]
