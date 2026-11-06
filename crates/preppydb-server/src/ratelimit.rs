@@ -39,9 +39,9 @@ impl RateLimiter {
         if !self.enabled() {
             return true;
         }
-        if self.buckets.len() > MAX_BUCKETS && !self.buckets.contains_key(key) {
+        if self.buckets.len() >= MAX_BUCKETS && !self.buckets.contains_key(key) {
             self.prune(now_ms);
-            if self.buckets.len() > MAX_BUCKETS {
+            if self.buckets.len() >= MAX_BUCKETS && !self.buckets.contains_key(key) {
                 return false; // refuse rather than grow without bound
             }
         }
@@ -116,5 +116,19 @@ mod tests {
         assert_eq!(limiter.tracked(), 1);
         limiter.prune(60_000);
         assert_eq!(limiter.tracked(), 0);
+    }
+
+    #[test]
+    fn refuses_new_keys_at_the_bucket_bound() {
+        let mut limiter = RateLimiter::new(1, 1);
+        for i in 0..MAX_BUCKETS {
+            assert!(limiter.check(&format!("client-{i}"), 0));
+        }
+        assert_eq!(limiter.tracked(), MAX_BUCKETS);
+        assert!(!limiter.check("one-too-many", 0));
+        assert_eq!(limiter.tracked(), MAX_BUCKETS);
+        // Existing keys remain usable under the cap.
+        assert!(!limiter.check("client-0", 0));
+        assert_eq!(limiter.tracked(), MAX_BUCKETS);
     }
 }

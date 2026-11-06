@@ -34,6 +34,10 @@ pub struct ServerConfig {
     pub auth_path: Option<PathBuf>,
     /// Optional override for the pricing audit log location.
     pub pricing_audit_path: Option<PathBuf>,
+    /// Trusted absolute path to Ruby; absent disables the experimental query endpoint.
+    pub ruby_planner_path: Option<PathBuf>,
+    /// Enables bounded, admin-only server-side Lua mutation scripts.
+    pub lua_execution_enabled: bool,
     /// Worker threads for the HTTP server.
     pub workers: usize,
 }
@@ -56,6 +60,8 @@ impl ServerConfig {
             repair: RepairPolicy::Strict,
             auth_path: None,
             pricing_audit_path: None,
+            ruby_planner_path: None,
+            lua_execution_enabled: false,
             workers: 8,
         }
     }
@@ -97,6 +103,13 @@ impl ServerConfig {
         if self.data_path.as_os_str().is_empty() {
             problems.push("data_path must be set".to_string());
         }
+        if self
+            .ruby_planner_path
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            problems.push("ruby_planner_path must be an absolute path".into());
+        }
         if self.max_body_bytes < 1024 {
             problems.push("max_body_bytes must be at least 1024".to_string());
         }
@@ -128,6 +141,17 @@ impl ServerConfig {
             .with("rate_limit_burst", Json::uint(self.rate_limit_burst as u64))
             .with("sync_mode", Json::str(self.sync_mode.as_str()))
             .with("read_only", Json::Bool(self.read_only))
+            .with(
+                "ruby_planner_path",
+                self.ruby_planner_path
+                    .as_ref()
+                    .map(|path| Json::str(path.to_string_lossy().to_string()))
+                    .unwrap_or(Json::Null),
+            )
+            .with(
+                "lua_execution_enabled",
+                Json::Bool(self.lua_execution_enabled),
+            )
             .with(
                 "cors_origins",
                 Json::Array(
@@ -190,6 +214,8 @@ impl ServerConfig {
                                 | "repair"
                                 | "auth_path"
                                 | "pricing_audit_path"
+                                | "ruby_planner_path"
+                                | "lua_execution_enabled"
                                 | "workers"
                         )
                     })
@@ -213,13 +239,16 @@ impl ServerConfig {
             self.allow_public_bind = value;
         }
         if let Some(value) = value.get("max_body_bytes").and_then(|v| v.as_u64()) {
-            self.max_body_bytes = value as usize;
+            self.max_body_bytes = usize::try_from(value)
+                .map_err(|_| "max_body_bytes exceeds this platform's addressable range")?;
         }
         if let Some(value) = value.get("rate_limit_per_second").and_then(|v| v.as_u64()) {
-            self.rate_limit_per_second = value as u32;
+            self.rate_limit_per_second = u32::try_from(value)
+                .map_err(|_| "rate_limit_per_second exceeds the supported range")?;
         }
         if let Some(value) = value.get("rate_limit_burst").and_then(|v| v.as_u64()) {
-            self.rate_limit_burst = value as u32;
+            self.rate_limit_burst =
+                u32::try_from(value).map_err(|_| "rate_limit_burst exceeds the supported range")?;
         }
         if let Some(value) = value.get_str("sync_mode") {
             self.sync_mode = SyncMode::parse(value).map_err(|err| err.to_string())?;
@@ -272,8 +301,25 @@ impl ServerConfig {
         if let Some(value) = value.get_str("pricing_audit_path") {
             self.pricing_audit_path = Some(PathBuf::from(value));
         }
+        match value.get("ruby_planner_path") {
+            None => (),
+            Some(Json::Null) => self.ruby_planner_path = None,
+            Some(value) => {
+                self.ruby_planner_path = Some(PathBuf::from(
+                    value
+                        .as_str()
+                        .ok_or("ruby_planner_path must be a string or null")?,
+                ))
+            }
+        }
+        if let Some(value) = value.get("lua_execution_enabled") {
+            self.lua_execution_enabled = value
+                .as_bool()
+                .ok_or("lua_execution_enabled must be a boolean")?;
+        }
         if let Some(value) = value.get("workers").and_then(|v| v.as_u64()) {
-            self.workers = value as usize;
+            self.workers = usize::try_from(value)
+                .map_err(|_| "workers exceeds this platform's addressable range")?;
         }
         Ok(())
     }
@@ -337,6 +383,26 @@ mod tests {
     }
 
     #[test]
+    fn lua_execution_is_opt_in_and_requires_a_boolean() {
+        let mut config = ServerConfig::new("/tmp/x");
+        assert!(!config.lua_execution_enabled);
+        config
+            .merge_json(&preppydb_json::parse(r#"{"lua_execution_enabled":true}"#).unwrap())
+            .unwrap();
+        assert!(config.lua_execution_enabled);
+        assert_eq!(
+            config
+                .to_json()
+                .get("lua_execution_enabled")
+                .and_then(Json::as_bool),
+            Some(true)
+        );
+        assert!(config
+            .merge_json(&preppydb_json::parse(r#"{"lua_execution_enabled":"yes"}"#).unwrap())
+            .is_err());
+    }
+
+    #[test]
     fn validation_catches_nonsense() {
         let mut config = ServerConfig::new("/tmp/x");
         config.max_body_bytes = 10;
@@ -345,6 +411,29 @@ mod tests {
         config.rate_limit_burst = 10;
         let problems = config.validate();
         assert!(problems.len() >= 3, "{problems:?}");
+    }
+
+    #[test]
+    fn json_integer_settings_reject_values_that_would_wrap() {
+        let too_large_u32 = u32::MAX as u64 + 1;
+        for input in [
+            format!(r#"{{"rate_limit_per_second":{too_large_u32}}}"#),
+            format!(r#"{{"rate_limit_burst":{too_large_u32}}}"#),
+        ] {
+            let mut config = ServerConfig::new("/tmp/x");
+            let value = preppydb_json::parse(&input).unwrap();
+            assert!(config.merge_json(&value).is_err(), "accepted {input}");
+        }
+
+        if usize::BITS < u64::BITS {
+            let too_large_usize = usize::MAX as u64 + 1;
+            for key in ["max_body_bytes", "workers"] {
+                let input = format!(r#"{{"{key}":{too_large_usize}}}"#);
+                let mut config = ServerConfig::new("/tmp/x");
+                let value = preppydb_json::parse(&input).unwrap();
+                assert!(config.merge_json(&value).is_err(), "accepted {input}");
+            }
+        }
     }
 
     #[test]

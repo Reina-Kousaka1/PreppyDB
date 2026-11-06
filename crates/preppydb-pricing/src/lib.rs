@@ -22,6 +22,7 @@ use preppydb_crypto::rng::ChaCha20Rng;
 use preppydb_crypto::sha256::sha256;
 use preppydb_json::Json;
 use std::collections::BTreeMap;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 
 // --------------------------------------------------------------------------- errors
@@ -122,9 +123,14 @@ impl DiscountRule {
     }
 
     pub fn from_json(value: &Json) -> Result<DiscountRule> {
+        let percent = value
+            .get("percent")
+            .and_then(|value| value.as_u64())
+            .and_then(|percent| u32::try_from(percent).ok())
+            .ok_or_else(|| PricingError::new(codes::INVALID_RULE, "discount percent is invalid"))?;
         Ok(DiscountRule {
             label: value.get_str("label").unwrap_or("discount").to_string(),
-            percent: value.get("percent").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            percent,
             starts_at: value.get("starts_at").and_then(|v| v.as_i64()),
             ends_at: value.get("ends_at").and_then(|v| v.as_i64()),
         })
@@ -500,7 +506,154 @@ impl AuditEntry {
 #[derive(Debug)]
 pub struct AuditLog {
     path: PathBuf,
-    entries: Vec<AuditEntry>,
+    /// A bounded in-memory tail for the administrative history endpoint.
+    entries: std::collections::VecDeque<AuditEntry>,
+    entry_sizes: std::collections::VecDeque<usize>,
+    retained_bytes: usize,
+    entry_count: u64,
+    head_hash: String,
+}
+
+/// Maximum serialized size of one audit record, including its line terminator.
+/// The append-only log can grow over time, but a single malformed record must not
+/// trigger an unbounded allocation while opening it.
+pub const MAX_AUDIT_ENTRY_BYTES: usize = 1024 * 1024;
+/// Bound both the number and serialized size of audit records retained in memory.
+/// The full log is verified as a stream and is never kept in RAM.
+pub const MAX_AUDIT_RETAINED_ENTRIES: usize = 1000;
+pub const MAX_AUDIT_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+
+const ZERO_AUDIT_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn scan_audit_log<F>(path: &Path, mut visit: F) -> Result<(u64, String)>
+where
+    F: FnMut(AuditEntry, usize),
+{
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, ZERO_AUDIT_HASH.to_string()));
+        }
+        Err(err) => {
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                format!("reading audit log: {err}"),
+            ));
+        }
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line_no = 0usize;
+    let mut entry_count = 0u64;
+    let mut previous = ZERO_AUDIT_HASH.to_string();
+    loop {
+        let mut line = Vec::new();
+        let bytes_read = reader
+            .by_ref()
+            .take((MAX_AUDIT_ENTRY_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)
+            .map_err(|err| {
+                PricingError::new(codes::AUDIT_INTEGRITY, format!("reading audit log: {err}"))
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_no = line_no.checked_add(1).ok_or_else(|| {
+            PricingError::new(codes::AUDIT_INTEGRITY, "audit line count overflow")
+        })?;
+        if line.len() > MAX_AUDIT_ENTRY_BYTES {
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                format!("audit log line {line_no} exceeds the entry size limit"),
+            ));
+        }
+        if line.last() != Some(&b'\n') {
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                "audit log has an incomplete final line",
+            ));
+        }
+        let entry_size = line.len();
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let line = std::str::from_utf8(&line).map_err(|_| {
+            PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                format!("audit log line {line_no} is not UTF-8"),
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = preppydb_json::parse_with_limit(
+            line,
+            preppydb_json::ParseLimits {
+                max_depth: 64,
+                max_string_len: MAX_AUDIT_ENTRY_BYTES,
+                max_items: 10_000,
+                max_bytes: MAX_AUDIT_ENTRY_BYTES,
+            },
+        )
+        .map_err(|err| {
+            PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                format!("audit log line {line_no} is not valid bounded JSON: {err}"),
+            )
+        })?;
+        let entry = AuditEntry::from_json(&value)?;
+        let expected_seq = entry_count
+            .checked_add(1)
+            .ok_or_else(|| PricingError::new(codes::AUDIT_INTEGRITY, "audit sequence overflow"))?;
+        if entry.seq != expected_seq {
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                format!(
+                    "audit entry {line_no} has seq {} (expected {expected_seq})",
+                    entry.seq
+                ),
+            ));
+        }
+        if entry.prev_hash != previous {
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                format!("audit entry {line_no} does not chain to its predecessor"),
+            ));
+        }
+        let expected_hash = AuditEntry::compute_hash(
+            entry.seq,
+            entry.at,
+            &entry.kind,
+            &entry.detail,
+            &entry.prev_hash,
+        );
+        if entry.hash != expected_hash {
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                format!("audit entry {line_no} hash mismatch (log was modified)"),
+            ));
+        }
+        previous.clone_from(&entry.hash);
+        entry_count = expected_seq;
+        visit(entry, entry_size);
+    }
+    Ok((entry_count, previous))
+}
+
+fn retain_audit_entry(log: &mut AuditLog, entry: AuditEntry, serialized_size: usize) {
+    log.entries.push_back(entry);
+    log.entry_sizes.push_back(serialized_size);
+    log.retained_bytes = log.retained_bytes.saturating_add(serialized_size);
+    while log.entries.len() > MAX_AUDIT_RETAINED_ENTRIES
+        || log.retained_bytes > MAX_AUDIT_RETAINED_BYTES
+    {
+        if log.entries.is_empty() {
+            break;
+        }
+        log.entries.pop_front();
+        let removed_size = log.entry_sizes.pop_front().unwrap_or(0);
+        log.retained_bytes = log.retained_bytes.saturating_sub(removed_size);
+    }
 }
 
 impl AuditLog {
@@ -509,26 +662,18 @@ impl AuditLog {
         let path = path.into();
         let mut log = AuditLog {
             path,
-            entries: Vec::new(),
+            entries: std::collections::VecDeque::new(),
+            entry_sizes: std::collections::VecDeque::new(),
+            retained_bytes: 0,
+            entry_count: 0,
+            head_hash: ZERO_AUDIT_HASH.to_string(),
         };
-        if log.path.exists() {
-            let text = std::fs::read_to_string(&log.path).map_err(|err| {
-                PricingError::new(codes::AUDIT_INTEGRITY, format!("reading audit log: {err}"))
-            })?;
-            for (line_no, line) in text.lines().enumerate() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let value = preppydb_json::parse(line).map_err(|err| {
-                    PricingError::new(
-                        codes::AUDIT_INTEGRITY,
-                        format!("audit log line {} is not JSON: {err}", line_no + 1),
-                    )
-                })?;
-                log.entries.push(AuditEntry::from_json(&value)?);
-            }
-            log.verify()?;
-        }
+        let path = log.path.clone();
+        let (entry_count, head_hash) = scan_audit_log(&path, |entry, size| {
+            retain_audit_entry(&mut log, entry, size);
+        })?;
+        log.entry_count = entry_count;
+        log.head_hash = head_hash;
         Ok(log)
     }
 
@@ -536,17 +681,22 @@ impl AuditLog {
         &self.path
     }
 
-    pub fn entries(&self) -> &[AuditEntry] {
+    pub fn entries(&self) -> &std::collections::VecDeque<AuditEntry> {
         &self.entries
+    }
+
+    /// Total verified entries in the file; `entries()` returns only the bounded recent tail.
+    pub fn entry_count(&self) -> u64 {
+        self.entry_count
     }
 
     /// Append an entry, chaining it to the previous one and flushing to disk.
     pub fn append(&mut self, kind: &str, at: i64, detail: Json) -> Result<AuditEntry> {
-        let seq = self.entries.len() as u64 + 1;
-        let prev_hash = match self.entries.last() {
-            Some(entry) => entry.hash.clone(),
-            None => "0".repeat(64),
-        };
+        let seq = self
+            .entry_count
+            .checked_add(1)
+            .ok_or_else(|| PricingError::new(codes::AUDIT_INTEGRITY, "audit sequence overflow"))?;
+        let prev_hash = self.head_hash.clone();
         let hash = AuditEntry::compute_hash(seq, at, kind, &detail, &prev_hash);
         let entry = AuditEntry {
             seq,
@@ -557,6 +707,12 @@ impl AuditLog {
             hash,
         };
         let line = format!("{}\n", entry.to_json());
+        if line.len() > MAX_AUDIT_ENTRY_BYTES {
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                "serialized audit entry exceeds the entry size limit",
+            ));
+        }
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|err| {
@@ -581,44 +737,22 @@ impl AuditLog {
         file.sync_data().map_err(|err| {
             PricingError::new(codes::AUDIT_INTEGRITY, format!("syncing audit log: {err}"))
         })?;
-        self.entries.push(entry.clone());
+        self.entry_count = seq;
+        self.head_hash.clone_from(&entry.hash);
+        retain_audit_entry(self, entry.clone(), line.len());
         Ok(entry)
     }
 
-    /// Verify the hash chain (detects edits, reordering and truncation at the end).
+    /// Stream and verify the complete on-disk hash chain, then compare its head and
+    /// count with this handle's last acknowledged append. A valid suffix deletion
+    /// present before open cannot be detected without an external trusted anchor.
     pub fn verify(&self) -> Result<()> {
-        let mut previous = "0".repeat(64);
-        for (index, entry) in self.entries.iter().enumerate() {
-            let expected_seq = index as u64 + 1;
-            if entry.seq != expected_seq {
-                return Err(PricingError::new(
-                    codes::AUDIT_INTEGRITY,
-                    format!(
-                        "audit entry {index} has seq {} (expected {expected_seq})",
-                        entry.seq
-                    ),
-                ));
-            }
-            if entry.prev_hash != previous {
-                return Err(PricingError::new(
-                    codes::AUDIT_INTEGRITY,
-                    format!("audit entry {index} does not chain to its predecessor"),
-                ));
-            }
-            let recomputed = AuditEntry::compute_hash(
-                entry.seq,
-                entry.at,
-                &entry.kind,
-                &entry.detail,
-                &entry.prev_hash,
-            );
-            if recomputed != entry.hash {
-                return Err(PricingError::new(
-                    codes::AUDIT_INTEGRITY,
-                    format!("audit entry {index} hash mismatch (log was modified)"),
-                ));
-            }
-            previous = entry.hash.clone();
+        let (entry_count, head_hash) = scan_audit_log(&self.path, |_, _| {})?;
+        if entry_count != self.entry_count || head_hash != self.head_hash {
+            return Err(PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                "audit log changed since it was opened",
+            ));
         }
         Ok(())
     }
@@ -1043,9 +1177,118 @@ mod tests {
         let tampered = text.replacen("\"amount\":250", "\"amount\":1", 1);
         assert_ne!(text, tampered);
         std::fs::write(&path, tampered).unwrap();
+        assert_eq!(log.verify().unwrap_err().code, codes::AUDIT_INTEGRITY);
         let err = AuditLog::open(&path).unwrap_err();
         assert_eq!(err.code, codes::AUDIT_INTEGRITY);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn audit_log_retains_a_bounded_tail_but_verifies_the_full_history() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-bounded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let payload = "x".repeat(400_000);
+        let mut log = AuditLog::open(&path).unwrap();
+        for at in 0..12 {
+            log.append(
+                "large_detail",
+                at,
+                Json::obj().with("payload", Json::str(payload.clone())),
+            )
+            .unwrap();
+        }
+        assert_eq!(log.entry_count(), 12);
+        assert!(log.entries().len() < 12);
+        assert!(log.retained_bytes <= MAX_AUDIT_RETAINED_BYTES);
+        assert_eq!(log.entries().back().unwrap().seq, 12);
+        log.verify().unwrap();
+
+        let reopened = AuditLog::open(&path).unwrap();
+        assert_eq!(reopened.entry_count(), 12);
+        assert_eq!(reopened.entries(), log.entries());
+        assert!(reopened.retained_bytes <= MAX_AUDIT_RETAINED_BYTES);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_log_reports_full_entry_count_when_recent_tail_is_bounded_by_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-count-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let mut log = AuditLog::open(&path).unwrap();
+        for at in 0..(MAX_AUDIT_RETAINED_ENTRIES + 3) {
+            log.append("small", at as i64, Json::Null).unwrap();
+        }
+        assert_eq!(log.entry_count(), (MAX_AUDIT_RETAINED_ENTRIES + 3) as u64);
+        assert_eq!(log.entries().len(), MAX_AUDIT_RETAINED_ENTRIES);
+        assert_eq!(log.entries().front().unwrap().seq, 4);
+        assert_eq!(
+            log.entries().back().unwrap().seq,
+            (MAX_AUDIT_RETAINED_ENTRIES + 3) as u64
+        );
+        assert!(log.retained_bytes <= MAX_AUDIT_RETAINED_BYTES);
+        log.verify().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_log_rejects_missing_final_newline() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-tail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("audit.log");
+        let mut log = AuditLog::open(&path).unwrap();
+        log.append("test", 1, Json::Null).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            AuditLog::open(&path).unwrap_err().code,
+            codes::AUDIT_INTEGRITY
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_log_rejects_oversized_record_with_bounded_line_read() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-oversized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_AUDIT_ENTRY_BYTES + 1) as u64).unwrap();
+        drop(file);
+
+        let error = AuditLog::open(&path).unwrap_err();
+        assert_eq!(error.code, codes::AUDIT_INTEGRITY);
+        assert!(error.message.contains("entry size limit"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1065,6 +1308,25 @@ mod tests {
         )
         .unwrap();
         assert!(PriceRule::from_json(&bad).is_err());
+
+        let mut overflow_discount = rule.to_json();
+        overflow_discount.set(
+            "discounts",
+            Json::Array(vec![Json::obj()
+                .with("label", Json::str("overflow"))
+                .with("percent", Json::uint(u32::MAX as u64 + 2))]),
+        );
+        assert!(DiscountRule::from_json(
+            overflow_discount
+                .get("discounts")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .first()
+                .unwrap()
+        )
+        .is_err());
+        assert!(PriceRule::from_json(&overflow_discount).is_err());
     }
 
     #[test]

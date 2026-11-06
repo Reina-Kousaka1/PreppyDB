@@ -353,6 +353,25 @@ fn request_limits_are_enforced() {
 }
 
 #[test]
+fn anonymous_rate_limit_is_shared_across_tcp_connections_from_same_ip() {
+    let server = start("rate-limit-ip", |config| {
+        config.rate_limit_per_second = 1;
+        config.rate_limit_burst = 1;
+    });
+
+    // `raw` opens a fresh TCP connection each time. The listener records only the
+    // peer IP, so a new ephemeral client port cannot allocate a fresh anonymous bucket.
+    let (first, _, _) = raw(&server.base_url, "GET", "/v1/stats", None, None);
+    let (second, _, body) = raw(&server.base_url, "GET", "/v1/stats", None, None);
+    assert_eq!(first, 401);
+    assert_eq!(second, 429);
+    assert_eq!(
+        body.get_path("error.code").and_then(|value| value.as_str()),
+        Some("rate_limited")
+    );
+}
+
+#[test]
 fn unknown_endpoints_and_methods_are_structured() {
     let server = start("routing", |_| {});
     let (status, _, body) = raw(
@@ -369,6 +388,101 @@ fn unknown_endpoints_and_methods_are_structured() {
     );
     let (status, _, _) = raw(&server.base_url, "PUT", "/healthz", None, None);
     assert_eq!(status, 404);
+}
+
+#[test]
+#[cfg(feature = "ruby-integration-tests")]
+fn ruby_query_endpoint_requires_read_permission_and_executes_index_plan() {
+    let server = start("ruby-query", |config| {
+        config.ruby_planner_path = Some(PathBuf::from(
+            std::env::var("PREPPYDB_TEST_RUBY").unwrap_or_else(|_| "/usr/bin/ruby".into()),
+        ));
+    });
+    let admin = admin_client(&server);
+    admin.create_collection("users", None).unwrap();
+    admin
+        .create_index("users", "by_name", "name", false)
+        .unwrap();
+    admin
+        .put_document("users", "a", &Json::obj().with("name", Json::str("A")))
+        .unwrap();
+    admin
+        .put_document("users", "b", &Json::obj().with("name", Json::str("B")))
+        .unwrap();
+    let query = r#"{"version":1,"filter":{"field":"name","op":"eq","value":"A"},"limit":10}"#;
+    assert_eq!(
+        raw(
+            &server.base_url,
+            "POST",
+            "/v1/collections/users/query",
+            None,
+            Some(query)
+        )
+        .0,
+        401
+    );
+    let (status, _, body) = raw(
+        &server.base_url,
+        "POST",
+        "/v1/collections/users/query",
+        Some(&server.reader),
+        Some(query),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body.get_path("data.count").and_then(Json::as_u64), Some(1));
+    let (_, _, mismatch) = raw(
+        &server.base_url,
+        "POST",
+        "/v1/collections/users/query",
+        Some(&server.reader),
+        Some(r#"{"version":1,"collection":"other"}"#),
+    );
+    assert_eq!(
+        mismatch.get_path("error.code").and_then(Json::as_str),
+        Some("invalid_query")
+    );
+}
+
+#[test]
+fn credential_corruption_fails_closed_over_http() {
+    let server = start("auth-reload-corrupt", |_| {});
+    let path = server.dir.join("auth.json");
+    let valid = std::fs::read(&path).unwrap();
+    assert_eq!(
+        raw(
+            &server.base_url,
+            "GET",
+            "/v1/stats",
+            Some(&server.admin),
+            None
+        )
+        .0,
+        200
+    );
+    std::fs::write(&path, b"{invalid").unwrap();
+    assert_eq!(
+        raw(
+            &server.base_url,
+            "GET",
+            "/v1/stats",
+            Some(&server.admin),
+            None
+        )
+        .0,
+        503
+    );
+    std::fs::write(&path, valid).unwrap();
+    assert_eq!(
+        raw(
+            &server.base_url,
+            "GET",
+            "/v1/stats",
+            Some(&server.admin),
+            None
+        )
+        .0,
+        200
+    );
 }
 
 #[test]
@@ -502,6 +616,32 @@ fn pricing_flow_is_version_bound_and_immutable() {
 }
 
 #[test]
+fn pricing_audit_failure_is_reported_and_disables_further_writes() {
+    let server = start("pricing-audit-failure", |_| {});
+    let client = Client::new(&server.base_url, &server.writer).unwrap();
+    let rule = preppydb_json::parse(r#"{"item_id":"skirt","min_price_cents":2000,"max_price_cents":4000,"anchor_price_cents":2500,"step_cents":100}"#).unwrap();
+    client.put_price_rule(&rule).unwrap();
+    let path = server.dir.join("pricing-audit.log");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let err = client.put_price_rule(&rule).unwrap_err();
+    assert_eq!(err.status(), Some(503));
+    assert_eq!(err.code(), Some("audit_unavailable"));
+    let stored = client.get_document("price_rules", "skirt").unwrap();
+    assert_eq!(
+        stored.get_path("value.version").and_then(|v| v.as_u64()),
+        Some(2)
+    );
+    let err = client.put_price_rule(&rule).unwrap_err();
+    assert_eq!(err.code(), Some("audit_unavailable"));
+    let stored = client.get_document("price_rules", "skirt").unwrap();
+    assert_eq!(
+        stored.get_path("value.version").and_then(|v| v.as_u64()),
+        Some(2)
+    );
+}
+
+#[test]
 fn simulate_is_reproducible_and_writes_nothing() {
     let server = start("simulate", |config| {
         config.pricing_seed = Some("sim-seed".to_string());
@@ -627,4 +767,237 @@ fn index_queries_over_http() {
     let rows = body.get_path("data.rows").unwrap().as_array().unwrap();
     assert_eq!(rows.len(), 2);
     drop(client);
+}
+
+#[test]
+#[cfg(feature = "ruby-integration-tests")]
+fn ruby_query_result_can_drive_a_lua_cas_write_through_rust_storage() {
+    let server = start("ruby-lua-composition", |config| {
+        config.ruby_planner_path = Some(PathBuf::from(
+            std::env::var("PREPPYDB_TEST_RUBY").unwrap_or_else(|_| "/usr/bin/ruby".into()),
+        ));
+        config.lua_execution_enabled = true;
+    });
+    let admin = admin_client(&server);
+    admin.create_collection("accounts", None).unwrap();
+    admin
+        .create_index("accounts", "by_owner", "owner", true)
+        .unwrap();
+    admin
+        .put_document(
+            "accounts",
+            "acct-1",
+            &Json::obj()
+                .with("owner", Json::str("alice"))
+                .with("balance", Json::int(100)),
+        )
+        .unwrap();
+
+    let (status, _, query_result) = raw(
+        &server.base_url,
+        "POST",
+        "/v1/collections/accounts/query",
+        Some(&server.reader),
+        Some(r#"{"version":1,"filter":{"field":"owner","op":"eq","value":"alice"},"limit":1}"#),
+    );
+    assert_eq!(status, 200, "{query_result}");
+    let row = query_result
+        .get_path("data.documents")
+        .and_then(Json::as_array)
+        .and_then(|rows| rows.first())
+        .expect("Ruby-planned Rust query should return one account");
+    let input = Json::obj().with("account", row.clone());
+    let script = r#"
+        local account = input.account
+        return {
+            result = { key = account.key, previous = account.value.balance },
+            operations = preppydb.array({{
+                op = "put", collection = "accounts", key = account.key,
+                expected_version = account.version,
+                value = { owner = account.value.owner, balance = account.value.balance + 25 }
+            }})
+        }
+    "#;
+    let (status, _, mutation) = raw(
+        &server.base_url,
+        "POST",
+        "/v1/lua/execute",
+        Some(&server.admin),
+        Some(&preppydb_json::to_string(
+            &Json::obj()
+                .with("script", Json::str(script))
+                .with("input", input),
+        )),
+    );
+    assert_eq!(status, 200, "{mutation}");
+    assert_eq!(
+        mutation
+            .get_path("data.applied_operations")
+            .and_then(Json::as_u64),
+        Some(1)
+    );
+    let (status, _, stored) = raw(
+        &server.base_url,
+        "GET",
+        "/v1/collections/accounts/documents/acct-1",
+        Some(&server.reader),
+        None,
+    );
+    assert_eq!(status, 200, "{stored}");
+    assert_eq!(
+        stored.get_path("data.value.balance").and_then(Json::as_i64),
+        Some(125)
+    );
+    assert_eq!(
+        stored.get_path("data.version").and_then(Json::as_u64),
+        Some(2)
+    );
+}
+
+#[test]
+fn lua_execution_is_admin_gated_and_commits_validated_batch_atomically() {
+    let disabled = start("lua-disabled", |_| {});
+    let disabled_body = Json::obj().with(
+        "script",
+        Json::str("return {result=true, operations=preppydb.array({{op='put',collection='items',key='a',expected_version=0,value={x=1}}})}"),
+    );
+    let (status, _, body) = raw(
+        &disabled.base_url,
+        "POST",
+        "/v1/lua/execute",
+        Some(&disabled.admin),
+        Some(&preppydb_json::to_string(&disabled_body)),
+    );
+    assert_eq!(status, 503);
+    assert_eq!(
+        body.get_path("error.code").and_then(Json::as_str),
+        Some("lua_execution_unavailable")
+    );
+
+    let server = start("lua-enabled", |config| config.lua_execution_enabled = true);
+    let (status, _, _) = raw(
+        &server.base_url,
+        "POST",
+        "/v1/collections",
+        Some(&server.admin),
+        Some(r#"{"name":"items"}"#),
+    );
+    assert_eq!(status, 200);
+
+    let source = r#"
+        local amount = input.amount
+        return {
+            result = { credited = amount },
+            operations = preppydb.array({
+                { op = "put", collection = "items", key = "alice", expected_version = 0, value = { balance = amount } },
+                { op = "put", collection = "items", key = "bob", expected_version = 0, value = { balance = amount * 2 } }
+            })
+        }
+    "#;
+    let execute_body = Json::obj()
+        .with("script", Json::str(source))
+        .with("input", Json::obj().with("amount", Json::int(125)));
+    let (status, _, body) = raw(
+        &server.base_url,
+        "POST",
+        "/v1/lua/execute",
+        Some(&server.admin),
+        Some(&preppydb_json::to_string(&execute_body)),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body.get_path("data.applied_operations")
+            .and_then(Json::as_u64),
+        Some(2)
+    );
+    let (_, _, alice) = raw(
+        &server.base_url,
+        "GET",
+        "/v1/collections/items/documents/alice",
+        Some(&server.reader),
+        None,
+    );
+    assert_eq!(
+        alice.get_path("data.value.balance").and_then(Json::as_i64),
+        Some(125)
+    );
+    let alice_version = alice
+        .get_path("data.version")
+        .and_then(Json::as_u64)
+        .unwrap();
+    let conditional = Json::obj()
+        .with(
+            "script",
+            Json::str("return {result=true, operations=preppydb.array({{op='put',collection='items',key='alice',expected_version=input.version,value={balance=126}}})}"),
+        )
+        .with("input", Json::obj().with("version", Json::uint(alice_version)));
+    for expected_status in [200, 409] {
+        let (status, _, _) = raw(
+            &server.base_url,
+            "POST",
+            "/v1/lua/execute",
+            Some(&server.admin),
+            Some(&preppydb_json::to_string(&conditional)),
+        );
+        assert_eq!(status, expected_status);
+    }
+
+    let admin = admin_client(&server);
+    admin
+        .create_index("items", "unique_balance", "balance", true)
+        .unwrap();
+    let conflicting = Json::obj().with(
+        "script",
+        Json::str(
+            "return {result=true, operations=preppydb.array({{op='put',collection='items',key='charlie',expected_version=0,value={balance=500}},{op='put',collection='items',key='dave',expected_version=0,value={balance=500}}})}",
+        ),
+    );
+    let (status, _, _) = raw(
+        &server.base_url,
+        "POST",
+        "/v1/lua/execute",
+        Some(&server.admin),
+        Some(&preppydb_json::to_string(&conflicting)),
+    );
+    assert_eq!(status, 400);
+    for key in ["charlie", "dave"] {
+        let (status, _, _) = raw(
+            &server.base_url,
+            "GET",
+            &format!("/v1/collections/items/documents/{key}"),
+            Some(&server.reader),
+            None,
+        );
+        assert_eq!(status, 404);
+    }
+
+    let (status, _, _) = raw(
+        &server.base_url,
+        "POST",
+        "/v1/lua/execute",
+        Some(&server.writer),
+        Some(&preppydb_json::to_string(&execute_body)),
+    );
+    assert_eq!(status, 403);
+
+    let invalid = Json::obj().with(
+        "script",
+        Json::str("return {result=true, operations=preppydb.array({{op='unknown',collection='items',key='partial'}})}"),
+    );
+    let (status, _, _) = raw(
+        &server.base_url,
+        "POST",
+        "/v1/lua/execute",
+        Some(&server.admin),
+        Some(&preppydb_json::to_string(&invalid)),
+    );
+    assert_eq!(status, 422);
+    let (status, _, _) = raw(
+        &server.base_url,
+        "GET",
+        "/v1/collections/items/documents/partial",
+        Some(&server.reader),
+        None,
+    );
+    assert_eq!(status, 404);
 }

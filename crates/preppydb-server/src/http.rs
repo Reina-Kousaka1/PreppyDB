@@ -7,7 +7,7 @@
 
 use preppydb_json::Json;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
@@ -296,10 +296,16 @@ fn handle_connection(
 ) {
     let peer = stream
         .peer_addr()
-        .map(|addr: SocketAddr| addr.to_string())
+        .map(|addr: SocketAddr| addr.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    let _ = stream.set_read_timeout(Some(limits.io_timeout));
-    let _ = stream.set_write_timeout(Some(limits.io_timeout));
+    if stream.set_read_timeout(Some(limits.io_timeout)).is_err()
+        || stream.set_write_timeout(Some(limits.io_timeout)).is_err()
+    {
+        // Resource bounds are part of the listener contract. If the OS refuses
+        // to install them, do not serve this socket without those bounds.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return;
+    }
     let mut reader = BufReader::new(stream);
 
     for _ in 0..limits.max_requests_per_connection {
@@ -329,9 +335,13 @@ fn handle_connection(
                     break;
                 }
                 // Shorter timeout while waiting for the next request on a live socket.
-                let _ = reader
+                if reader
                     .get_mut()
-                    .set_read_timeout(Some(limits.keep_alive_timeout));
+                    .set_read_timeout(Some(limits.keep_alive_timeout))
+                    .is_err()
+                {
+                    break;
+                }
             }
             Err(ParseError::Closed) => break,
             Err(ParseError::Io) => break,
@@ -353,28 +363,77 @@ fn wants_keep_alive(request: &Request) -> bool {
     }
 }
 
-fn read_request(
-    reader: &mut BufReader<TcpStream>,
+fn read_bounded_line<R: Read>(
+    reader: &mut R,
+    limit: usize,
+    status: u16,
+    code: &str,
+) -> std::result::Result<Option<String>, ParseError> {
+    let mut bytes = Vec::with_capacity(limit.min(256));
+    loop {
+        let mut byte = [0u8; 1];
+        match reader.read(&mut byte) {
+            Ok(0) if bytes.is_empty() => return Ok(None),
+            Ok(0) => return Err(ParseError::Io),
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    if bytes.last() != Some(&b'\r') {
+                        return Err(ParseError::Bad(Response::error(
+                            400,
+                            "invalid_http_line",
+                            "HTTP lines must end with CRLF",
+                        )));
+                    }
+                } else if bytes.last() == Some(&b'\r') {
+                    return Err(ParseError::Bad(Response::error(
+                        400,
+                        "invalid_http_line",
+                        "carriage return must be followed by line feed",
+                    )));
+                }
+                if bytes.len() >= limit {
+                    return Err(ParseError::Bad(Response::error(
+                        status,
+                        code,
+                        "HTTP line exceeds configured limit",
+                    )));
+                }
+                bytes.push(byte[0]);
+                if byte[0] == b'\n' {
+                    return String::from_utf8(bytes).map(Some).map_err(|_| {
+                        ParseError::Bad(Response::error(
+                            400,
+                            "invalid_request",
+                            "invalid UTF-8 in HTTP line",
+                        ))
+                    });
+                }
+            }
+            Err(_) => return Err(ParseError::Io),
+        }
+    }
+}
+
+fn read_request<R: Read>(
+    reader: &mut R,
     limits: &HttpLimits,
     peer: &str,
 ) -> std::result::Result<Request, ParseError> {
     // ---- request line ------------------------------------------------------
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) => return Err(ParseError::Closed),
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Err(ParseError::Io),
-        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => return Err(ParseError::Io),
-        Err(_) => return Err(ParseError::Io),
-    }
-    if line.len() > limits.max_request_line {
-        return Err(ParseError::Bad(Response::error(
-            414,
-            "request_line_too_long",
-            "request line exceeds the configured limit",
-        )));
-    }
-    let trimmed = line.trim_end_matches(['\r', '\n']);
+    let line = read_bounded_line(
+        reader,
+        limits.max_request_line,
+        414,
+        "request_line_too_long",
+    )?
+    .ok_or(ParseError::Closed)?;
+    let trimmed = line.strip_suffix("\r\n").ok_or_else(|| {
+        ParseError::Bad(Response::error(
+            400,
+            "invalid_http_line",
+            "HTTP lines must end with CRLF",
+        ))
+    })?;
     if trimmed.is_empty() {
         return Err(ParseError::Bad(Response::error(
             400,
@@ -382,15 +441,24 @@ fn read_request(
             "empty request line",
         )));
     }
-    let mut parts = trimmed.split(' ');
-    let method = parts.next().unwrap_or("").to_ascii_uppercase();
-    let target = parts.next().unwrap_or("");
-    let version = parts.next().unwrap_or("");
-    if method.is_empty() || target.is_empty() || !version.starts_with("HTTP/1.") {
+    let parts: Vec<_> = trimmed.split(' ').collect();
+    let [method, target, version] = parts.as_slice() else {
         return Err(ParseError::Bad(Response::error(
             400,
             "invalid_request",
             "malformed request line",
+        )));
+    };
+    let method = method.to_ascii_uppercase();
+    if target.is_empty()
+        || !target.starts_with('/')
+        || target.bytes().any(|b| b.is_ascii_control() || b == b' ')
+        || !matches!(*version, "HTTP/1.0" | "HTTP/1.1")
+    {
+        return Err(ParseError::Bad(Response::error(
+            400,
+            "invalid_request",
+            "malformed request target or HTTP version",
         )));
     }
     if !matches!(
@@ -409,12 +477,9 @@ fn read_request(
     let mut header_bytes = 0usize;
     let mut count = 0usize;
     loop {
-        let mut header_line = String::new();
-        match reader.read_line(&mut header_line) {
-            Ok(0) => return Err(ParseError::Io),
-            Ok(_) => {}
-            Err(_) => return Err(ParseError::Io),
-        }
+        let remaining = limits.max_header_bytes.saturating_sub(header_bytes);
+        let header_line = read_bounded_line(reader, remaining, 431, "headers_too_large")?
+            .ok_or(ParseError::Io)?;
         header_bytes += header_line.len();
         if header_bytes > limits.max_header_bytes {
             return Err(ParseError::Bad(Response::error(
@@ -423,7 +488,13 @@ fn read_request(
                 "request headers exceed the configured limit",
             )));
         }
-        let text = header_line.trim_end_matches(['\r', '\n']);
+        let text = header_line.strip_suffix("\r\n").ok_or_else(|| {
+            ParseError::Bad(Response::error(
+                400,
+                "invalid_http_line",
+                "HTTP lines must end with CRLF",
+            ))
+        })?;
         if text.is_empty() {
             break;
         }
@@ -436,7 +507,7 @@ fn read_request(
             )));
         }
         let (name, value) = match text.split_once(':') {
-            Some((name, value)) => (name.trim(), value.trim()),
+            Some((name, value)) => (name, value.trim_matches([' ', '\t'])),
             None => {
                 return Err(ParseError::Bad(Response::error(
                     400,
@@ -445,19 +516,56 @@ fn read_request(
                 )))
             }
         };
-        if name.is_empty() || name.len() > 64 {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+            || value.bytes().any(|b| b.is_ascii_control() && b != b'\t')
+        {
             return Err(ParseError::Bad(Response::error(
                 400,
                 "invalid_headers",
                 "invalid header name",
             )));
         }
-        headers.insert(name.to_ascii_lowercase(), value.to_string());
+        if headers
+            .insert(name.to_ascii_lowercase(), value.to_string())
+            .is_some()
+        {
+            return Err(ParseError::Bad(Response::error(
+                400,
+                "invalid_headers",
+                "duplicate header",
+            )));
+        }
+    }
+
+    if *version == "HTTP/1.1" && !headers.contains_key("host") {
+        return Err(ParseError::Bad(Response::error(
+            400,
+            "invalid_headers",
+            "Host is required for HTTP/1.1 requests",
+        )));
     }
 
     // ---- body --------------------------------------------------------------
     let mut body = Vec::new();
+    if headers.contains_key("transfer-encoding") && headers.contains_key("content-length") {
+        return Err(ParseError::Bad(Response::error(
+            400,
+            "invalid_framing",
+            "Content-Length and Transfer-Encoding cannot be combined",
+        )));
+    }
     if let Some(length) = headers.get("content-length") {
+        if length.is_empty() || !length.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ParseError::Bad(Response::error(
+                400,
+                "invalid_content_length",
+                "Content-Length must contain decimal digits only",
+            )));
+        }
         let length: usize = length.parse().map_err(|_| {
             ParseError::Bad(Response::error(
                 400,
@@ -596,6 +704,17 @@ fn write_response(
     response: &Response,
     keep_alive: bool,
 ) -> std::io::Result<()> {
+    if !valid_header_value(&response.content_type)
+        || response
+            .headers
+            .iter()
+            .any(|(name, value)| !valid_header_name(name) || !valid_header_value(value))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "response contains an invalid HTTP header",
+        ));
+    }
     let mut head = String::new();
     head.push_str(&format!(
         "HTTP/1.1 {} {}\r\n",
@@ -622,9 +741,153 @@ fn write_response(
     stream.flush()
 }
 
+fn valid_header_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+fn valid_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b == b'\t' || (b >= b' ' && b != 0x7f))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoopHandler;
+
+    impl Handler for NoopHandler {
+        fn handle(&self, _request: &Request) -> Response {
+            Response::empty(204)
+        }
+    }
+
+    #[test]
+    fn slow_partial_request_is_closed_by_connection_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let limits = HttpLimits {
+            workers: 1,
+            io_timeout: Duration::from_millis(150),
+            keep_alive_timeout: Duration::from_millis(100),
+            ..HttpLimits::default()
+        };
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                Arc::new(NoopHandler),
+                limits,
+                thread_shutdown,
+                Arc::new(ServerCounters::default()),
+            )
+            .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost:").unwrap();
+        let mut response = Vec::new();
+        let read_result = client.read_to_end(&mut response);
+        assert!(read_result.is_ok(), "server did not close timed-out socket");
+        assert!(
+            response.is_empty(),
+            "partial request was unexpectedly served"
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(address);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn response_writer_rejects_header_injection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        for response in [
+            Response::empty(200).with_header("X-Safe\r\nInjected", "value"),
+            Response::empty(200).with_header("X-Safe", "value\r\nInjected: yes"),
+            Response::new(200, "text/plain\r\nInjected: yes", Vec::new()),
+        ] {
+            let error = write_response(&mut server, &response, false).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        drop(client);
+    }
+
+    #[test]
+    fn rejects_ambiguous_framing_control_bytes_and_unbounded_lines() {
+        let limits = HttpLimits {
+            max_request_line: 32,
+            max_header_bytes: 80,
+            ..HttpLimits::default()
+        };
+        for bytes in [
+            b"POST / HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n",
+            b"GET / HTTP/1.1\r\nOrigin: safe\rInjected: x\r\n\r\n",
+            b"GET /abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+            b"GET / HTTP/1.1\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let mut reader = std::io::Cursor::new(bytes);
+            assert!(matches!(read_request(&mut reader, &limits, "127.0.0.1"), Err(ParseError::Bad(_))));
+        }
+    }
+
+    #[test]
+    fn request_line_requires_exact_http11_origin_form() {
+        for request in [
+            b"GET / HTTP/1.1 extra\r\nHost: x\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.2\r\nHost: x\r\n\r\n".as_slice(),
+            b"GET http://example/ HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+            b"GET /bad\x01path HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+        ] {
+            let error =
+                read_request(&mut &request[..], &HttpLimits::default(), "127.0.0.1").unwrap_err();
+            assert!(matches!(error, ParseError::Bad(_)));
+        }
+        assert!(read_request(
+            &mut &b"GET /ok?q=1 HTTP/1.1\r\nHost: x\r\n\r\n"[..],
+            &HttpLimits::default(),
+            "127.0.0.1"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_noncanonical_line_endings_header_whitespace_and_content_length() {
+        for request in [
+            b"GET / HTTP/1.1\nHost: x\n\n".as_slice(),
+            b"GET / HTTP/1.1\r\r\nHost: x\r\n\r\n",
+            b"GET / HTTP/1.1\r\n Host: x\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost : x\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: +1\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1, 1\r\n\r\n",
+            b"GET / HTTP/1.1\r\n\r\n",
+        ] {
+            let error =
+                read_request(&mut &request[..], &HttpLimits::default(), "127.0.0.1").unwrap_err();
+            assert!(matches!(error, ParseError::Bad(_)), "request: {request:?}");
+        }
+
+        // HTTP/1.0 does not require Host, but still uses CRLF framing.
+        assert!(read_request(
+            &mut &b"GET / HTTP/1.0\r\n\r\n"[..],
+            &HttpLimits::default(),
+            "127.0.0.1"
+        )
+        .is_ok());
+    }
 
     #[test]
     fn percent_decoding() {

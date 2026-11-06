@@ -11,7 +11,10 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod http;
+pub mod lua_engine;
+pub mod query_plan;
 pub mod ratelimit;
+pub mod ruby_planner;
 
 pub use api::{ApiState, API_VERSION};
 pub use auth::{AuthStore, Principal, Role};

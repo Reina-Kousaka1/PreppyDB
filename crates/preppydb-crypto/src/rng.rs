@@ -211,12 +211,14 @@ mod tests {
         ];
         rng.counter = 1;
         rng.refill();
-        let expected = "10f1e7e4d13bcae0b07b6f4d5e7b1c1e84bb52c0c1d0e1f0b1a2c3d4e5f60718";
-        let actual = crate::hex_encode(&rng.buffer[..32]);
-        // The RFC vector is derived from the full state; verify a stable prefix instead
-        // of trusting a single literal (see `determinism` test below).
-        assert_eq!(actual.len(), expected.len());
-        assert_ne!(&actual[..16], "0000000000000000");
+        // RFC 8439, section 2.3.2, serialized 64-byte block.
+        let expected = concat!(
+            "10f1e7e4d13b5915500fdd1fa32071c4",
+            "c7d1f4c733c068030422aa9ac3d46c4e",
+            "d2826446079faa0914c2d705d98b02a2",
+            "b5129cd1de164eb9cbd083e8a2503c4e"
+        );
+        assert_eq!(crate::hex_encode(&rng.buffer), expected);
     }
 
     #[test]

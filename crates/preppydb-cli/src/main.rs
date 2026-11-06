@@ -328,7 +328,12 @@ fn cmd_init(flags: &Flags) -> Result<(), String> {
         .with("last_seq", Json::uint(engine.last_seq()))
         .with(
             "collections",
-            Json::uint(engine.list_collections().len() as u64),
+            Json::uint(
+                engine
+                    .try_list_collections()
+                    .map_err(|err| err.to_string())?
+                    .len() as u64,
+            ),
         );
     if flags.has("bootstrap-model") {
         let bootstrap = preppydb_model::bootstrap(&engine).map_err(|err| err.to_string())?;
@@ -451,14 +456,15 @@ fn cmd_user(args: &[String]) -> Result<(), String> {
 
 fn cmd_stats(flags: &Flags) -> Result<(), String> {
     let engine = open_engine(flags)?;
-    print_json(engine.stats().to_json());
+    print_json(engine.try_stats().map_err(|err| err.to_string())?.to_json());
     Ok(())
 }
 
 fn cmd_collections(flags: &Flags) -> Result<(), String> {
     let engine = open_engine(flags)?;
     let collections: Vec<Json> = engine
-        .list_collections()
+        .try_list_collections()
+        .map_err(|err| err.to_string())?
         .iter()
         .map(|meta| {
             Json::obj()
@@ -737,7 +743,7 @@ fn cmd_wal(flags: &Flags) -> Result<(), String> {
     let wal_dir = dir.join("wal");
     let mut segments = Vec::new();
     for segment in wal::list_segments(&wal_dir).map_err(|err| err.to_string())? {
-        let scan = wal::scan_segment(&segment).map_err(|err| err.to_string())?;
+        let scan = wal::summarize_segment(&segment).map_err(|err| err.to_string())?;
         segments.push(
             Json::obj()
                 .with(
@@ -749,7 +755,7 @@ fn cmd_wal(flags: &Flags) -> Result<(), String> {
                             .unwrap_or_default(),
                     ),
                 )
-                .with("records", Json::uint(scan.records.len() as u64))
+                .with("records", Json::uint(scan.record_count))
                 .with("valid_bytes", Json::uint(scan.valid_len))
                 .with(
                     "torn_tail",
@@ -761,17 +767,11 @@ fn cmd_wal(flags: &Flags) -> Result<(), String> {
                 )
                 .with(
                     "first_seq",
-                    scan.records
-                        .first()
-                        .map(|record| Json::uint(record.seq))
-                        .unwrap_or(Json::Null),
+                    scan.first_seq.map(Json::uint).unwrap_or(Json::Null),
                 )
                 .with(
                     "last_seq",
-                    scan.records
-                        .last()
-                        .map(|record| Json::uint(record.seq))
-                        .unwrap_or(Json::Null),
+                    scan.last_seq.map(Json::uint).unwrap_or(Json::Null),
                 ),
         );
     }
@@ -940,7 +940,7 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
                 Json::obj()
                     .with("file", Json::str(path.display().to_string()))
                     .with("ok", Json::Bool(true))
-                    .with("entries", Json::uint(log.entries().len() as u64)),
+                    .with("entries", Json::uint(log.entry_count())),
             );
             Ok(())
         }

@@ -457,7 +457,7 @@ pub fn bootstrap(engine: &Engine) -> Result<BootstrapReport> {
     let mut skipped = Vec::new();
     let now = preppydb_storage::clock::now_ms();
     let existing: Vec<String> = engine
-        .list_collections()
+        .try_list_collections()?
         .iter()
         .map(|m| m.name.clone())
         .collect();

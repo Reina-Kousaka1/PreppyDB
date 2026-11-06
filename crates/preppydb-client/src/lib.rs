@@ -85,6 +85,40 @@ impl ClientError {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+const MAX_RESPONSE_HEADERS: usize = 16 * 1024;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+fn bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1) as u64)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|err| ClientError::Transport(format!("reading response header: {err}")))?;
+    if bytes.len() > limit || !bytes.ends_with(b"\n") {
+        return Err(ClientError::Protocol(
+            "response header too large or incomplete".into(),
+        ));
+    }
+    if !bytes.ends_with(b"\r\n")
+        || bytes[..bytes.len() - 2]
+            .iter()
+            .any(|byte| *byte == b'\r' || *byte == b'\n')
+    {
+        return Err(ClientError::Protocol(
+            "response headers must use canonical CRLF lines".into(),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| ClientError::Protocol("response header is not UTF-8".into()))
+}
+
+fn valid_header_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 /// A blocking HTTP client for one PreppyDB server.
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -94,6 +128,7 @@ pub struct Client {
     prefix: String,
     token: Option<String>,
     timeout: Duration,
+    max_response_bytes: usize,
 }
 
 impl Client {
@@ -145,11 +180,18 @@ impl Client {
             prefix,
             token: None,
             timeout: Duration::from_secs(10),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         })
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Client {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set the maximum accepted response body size in bytes.
+    pub fn with_max_response_bytes(mut self, limit: usize) -> Client {
+        self.max_response_bytes = limit;
         self
     }
 
@@ -201,49 +243,80 @@ impl Client {
             .map_err(|err| ClientError::Transport(format!("sending request: {err}")))?;
 
         let mut reader = BufReader::new(stream);
-        let mut status_line = String::new();
-        reader
-            .read_line(&mut status_line)
-            .map_err(|err| ClientError::Transport(format!("reading status line: {err}")))?;
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .ok_or_else(|| {
-                ClientError::Protocol(format!("malformed status line: {:?}", status_line.trim()))
-            })?;
+        let status_line = bounded_line(&mut reader, MAX_RESPONSE_HEADERS)?;
+        let status_text = status_line
+            .strip_suffix("\r\n")
+            .ok_or_else(|| ClientError::Protocol("malformed response status line".into()))?;
+        let mut status_parts = status_text.splitn(3, ' ');
+        let version = status_parts.next().unwrap_or_default();
+        let status_code = status_parts.next().unwrap_or_default();
+        if !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+            || status_code.len() != 3
+            || !status_code.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(ClientError::Protocol(
+                "malformed response status line".into(),
+            ));
+        }
+        let status: u16 = status_code
+            .parse()
+            .map_err(|_| ClientError::Protocol("invalid response status".into()))?;
 
         let mut content_length: Option<usize> = None;
-        let mut chunked = false;
+        let mut header_bytes = status_line.len();
         loop {
-            let mut line = String::new();
-            let read = reader
-                .read_line(&mut line)
-                .map_err(|err| ClientError::Transport(format!("reading headers: {err}")))?;
-            if read == 0 {
-                return Err(ClientError::Protocol("connection closed in headers".into()));
-            }
-            let text = line.trim_end_matches(['\r', '\n']);
+            let line = bounded_line(
+                &mut reader,
+                MAX_RESPONSE_HEADERS.saturating_sub(header_bytes),
+            )?;
+            header_bytes += line.len();
+            let text = line
+                .strip_suffix("\r\n")
+                .ok_or_else(|| ClientError::Protocol("malformed response header".into()))?;
             if text.is_empty() {
                 break;
             }
-            if let Some((name, value)) = text.split_once(':') {
-                let name = name.trim().to_ascii_lowercase();
-                let value = value.trim();
-                if name == "content-length" {
-                    content_length = value.parse().ok();
-                } else if name == "transfer-encoding" && value.eq_ignore_ascii_case("chunked") {
-                    chunked = true;
-                }
+            let (name, value) = text
+                .split_once(':')
+                .ok_or_else(|| ClientError::Protocol("malformed response header".into()))?;
+            if !valid_header_name(name) {
+                return Err(ClientError::Protocol("invalid response header name".into()));
             }
-        }
-        if chunked {
-            return Err(ClientError::Protocol(
-                "server used chunked encoding, which this client does not implement".into(),
-            ));
+            if value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\t')
+            {
+                return Err(ClientError::Protocol(
+                    "invalid response header value".into(),
+                ));
+            }
+            let name = name.to_ascii_lowercase();
+            let value = value.trim_matches([' ', '\t']);
+            if name == "content-length" {
+                if content_length.is_some() {
+                    return Err(ClientError::Protocol("duplicate Content-Length".into()));
+                }
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(ClientError::Protocol("invalid Content-Length".into()));
+                }
+                content_length = Some(
+                    value
+                        .parse()
+                        .map_err(|_| ClientError::Protocol("invalid Content-Length".into()))?,
+                );
+            } else if name == "transfer-encoding" {
+                return Err(ClientError::Protocol(
+                    "Transfer-Encoding is unsupported".into(),
+                ));
+            }
         }
         let length = content_length
             .ok_or_else(|| ClientError::Protocol("response has no Content-Length".into()))?;
+        if length > self.max_response_bytes {
+            return Err(ClientError::Protocol(
+                "response body exceeds configured limit".into(),
+            ));
+        }
         let mut raw = vec![0u8; length];
         reader
             .read_exact(&mut raw)
@@ -616,6 +689,52 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn response_from_local_server(response: Vec<u8>, limit: usize) -> Result<Json> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(&response);
+        });
+        let result = Client::anonymous(&format!("http://{address}"))
+            .unwrap()
+            .with_max_response_bytes(limit)
+            .request("GET", "/", None);
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn rejects_unbounded_or_ambiguous_server_responses() {
+        let mut oversized_header = b"HTTP/1.1 200 OK\r\nX: ".to_vec();
+        oversized_header.extend(vec![b'a'; MAX_RESPONSE_HEADERS + 1]);
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999999999\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nX: incomplete".to_vec(),
+            b"HTTP/1.1 200 OK\nContent-Length: 0\n\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length : 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: +0\r\n\r\n".to_vec(),
+            b"HTTP/9.9 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nX: bad\x01value\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            oversized_header,
+        ] {
+            assert!(matches!(
+                response_from_local_server(response, 16),
+                Err(ClientError::Protocol(_))
+            ));
+        }
+        assert!(response_from_local_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            2
+        )
+        .is_ok());
+    }
 
     #[test]
     fn url_parsing() {

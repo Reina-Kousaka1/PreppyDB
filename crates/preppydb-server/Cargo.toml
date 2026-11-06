@@ -12,6 +12,9 @@ authors.workspace = true
 name = "preppydb_server"
 path = "src/lib.rs"
 
+[features]
+ruby-integration-tests = []
+
 [[bin]]
 name = "preppydb-server"
 path = "src/main.rs"
@@ -23,6 +26,7 @@ preppydb-crypto.workspace = true
 preppydb-storage.workspace = true
 preppydb-pricing.workspace = true
 preppydb-model.workspace = true
+mlua = { version = "=0.11.4", features = ["lua54", "vendored"] }
 
 [dev-dependencies]
 preppydb-client.workspace = true

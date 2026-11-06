@@ -431,30 +431,57 @@ local function luvit_transport()
   local ok, http = pcall(require, "http")
   if not ok then
     return nil, "the luvit 'http' module is not available; pass options.transport "
-      .. "(see clients/luvit/README.md)"
+      .. "(see clients/luvit/README.md): " .. tostring(http)
   end
   return function(request, callback)
+    local finished = false
+    local function finish(status, body, headers)
+      if finished then return end
+      finished = true
+      callback(status, body, headers or {})
+    end
     -- request = { method, url, headers, body, timeout }
-    http.request(request.url, {
-      method = request.method,
-      headers = request.headers,
-      body = request.body,
-      timeout = request.timeout_ms and (request.timeout_ms / 1000) or nil,
-    }, function(response)
+    local http_options = http.parseUrl(request.url)
+    http_options.method = request.method
+    http_options.headers = request.headers
+    local outgoing = http.request(http_options, function(response)
       local status = tonumber(response.statusCode) or 0
       local chunks = {}
-      response.on("data", function(chunk) chunks[#chunks + 1] = chunk end)
-      local finished = false
-      local function finish()
-        if finished then return end
-        finished = true
-        callback(status, table.concat(chunks), response.headers or {})
+      local size = 0
+      local limit = request.max_response_bytes
+      local headers = response.headers or {}
+      local declared = headers["content-length"] or headers["Content-Length"]
+      local function reject(message)
+        chunks = {}
+        finish(nil, message, {})
+        if type(response.destroy) == "function" then pcall(response.destroy, response) end
       end
-      response.on("end", finish)
-      response.on("error", function() finish() end)
-    end):on("error", function(err)
-      callback(nil, tostring(err), {})
+      if declared ~= nil and (type(declared) ~= "string" or not declared:match("^%d+$") or not tonumber(declared) or tonumber(declared) > limit) then
+        reject("invalid or oversized response Content-Length")
+        return
+      end
+      response:on("data", function(chunk)
+        if finished then return end
+        size = size + #chunk
+        if size > limit then reject("response body exceeds configured limit"); return end
+        chunks[#chunks + 1] = chunk
+      end)
+      response:on("end", function()
+        if declared and size ~= tonumber(declared) then reject("response Content-Length mismatch"); return end
+        finish(status, table.concat(chunks), headers)
+      end)
+      response:on("error", function(err) reject("response stream error: " .. tostring(err)) end)
     end)
+    outgoing:on("error", function(err)
+      finish(nil, tostring(err), {})
+    end)
+    if request.timeout_ms then
+      outgoing:setTimeout(request.timeout_ms, function()
+        finish(nil, "request timed out", {})
+        outgoing:destroy()
+      end)
+    end
+    outgoing:done(request.body)
     return nil
   end
 end
@@ -476,6 +503,10 @@ function preppydb.new(options)
   if type(options) ~= "table" then
     error("preppydb.new expects an options table", 2)
   end
+  local response_limit = options.max_response_bytes or 16 * 1024 * 1024
+  if type(response_limit) ~= "number" or response_limit < 0 or response_limit ~= math.floor(response_limit) or response_limit > 2147483647 then
+    return nil, "max_response_bytes must be an integer between 0 and 2147483647"
+  end
   local parsed, err = parse_url(options.url or "http://127.0.0.1:7077")
   if not parsed then
     return nil, err
@@ -493,7 +524,9 @@ function preppydb.new(options)
     prefix = (options.prefix or "") .. parsed.prefix,
     token = options.token,
     timeout_ms = options.timeout or 10000,
+    max_response_bytes = response_limit,
     retries = options.retries or 0,
+    wait = options.wait,
     transport = transport,
   }, Client)
   return self
@@ -541,6 +574,7 @@ function Client:call(method, path, body, options)
     headers = headers,
     body = payload,
     timeout_ms = (options and options.timeout) or self.timeout_ms,
+    max_response_bytes = self.max_response_bytes,
   }
   local attempts = 1 + (options and options.retries or self.retries or 0)
   local last_error
@@ -558,9 +592,10 @@ function Client:call(method, path, body, options)
     end)
     -- A synchronous transport may already have called the callback; wait for the
     -- asynchronous ones by draining the loop, if the platform offers one.
-    if not finished and options and options.wait then
+    local wait = (options and options.wait) or self.wait
+    if not finished and wait then
       while not finished do
-        options.wait()
+        wait()
       end
     end
     if not finished then
@@ -570,6 +605,9 @@ function Client:call(method, path, body, options)
           .. "for asynchronous transports",
         retryable = true,
       }
+    end
+    if status ~= nil and (type(response_body) ~= "string" or #response_body > self.max_response_bytes) then
+      return nil, { code = "invalid_response", message = "response body exceeds configured limit", retryable = false }
     end
     if status == nil then
       last_error = { code = "transport_error", message = tostring(response_body), retryable = true }
@@ -630,9 +668,14 @@ function Client:call_async(method, path, body, callback)
     headers = headers,
     body = payload,
     timeout_ms = self.timeout_ms,
+    max_response_bytes = self.max_response_bytes,
   }, function(status, response_body, response_headers)
     if status == nil then
       callback(nil, { code = "transport_error", message = tostring(response_body), retryable = true })
+      return
+    end
+    if type(response_body or "") ~= "string" or #(response_body or "") > self.max_response_bytes then
+      callback(nil, { code = "invalid_response", message = "response body exceeds configured limit", retryable = false })
       return
     end
     if status >= 200 and status < 300 then

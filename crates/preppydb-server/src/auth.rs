@@ -13,8 +13,8 @@ use preppydb_crypto::rng::os_random;
 use preppydb_crypto::{constant_time_eq, hex_decode, hex_encode, sha256};
 use preppydb_json::Json;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 /// Roles, in increasing order of privilege.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -190,14 +190,22 @@ impl UserRecord {
             .with("disabled", Json::Bool(self.disabled))
     }
 
-    fn from_json(value: &Json) -> UserRecord {
-        UserRecord {
+    fn from_json(value: &Json) -> Result<UserRecord> {
+        let iterations = match value.get("iterations") {
+            None => DEFAULT_ITERATIONS as u64,
+            Some(value) => value.as_u64().ok_or_else(|| {
+                AuthError("auth file contains invalid PBKDF2 iteration count".into())
+            })?,
+        };
+        if !(10_000..=1_000_000).contains(&iterations) {
+            return Err(AuthError(
+                "auth file contains unsupported PBKDF2 iteration count".into(),
+            ));
+        }
+        Ok(UserRecord {
             username: value.get_str("username").unwrap_or_default().to_string(),
             salt_hex: value.get_str("salt").unwrap_or_default().to_string(),
-            iterations: value
-                .get("iterations")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(DEFAULT_ITERATIONS as u64) as u32,
+            iterations: iterations as u32,
             hash_hex: value.get_str("hash").unwrap_or_default().to_string(),
             roles: value
                 .get("roles")
@@ -214,7 +222,7 @@ impl UserRecord {
                 .get("disabled")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
-        }
+        })
     }
 }
 
@@ -244,6 +252,43 @@ type Result<T> = std::result::Result<T, AuthError>;
 pub const SESSION_TTL_MS: i64 = 8 * 60 * 60 * 1000;
 /// Minimum password length accepted for a login user.
 pub const MIN_PASSWORD_LEN: usize = 12;
+/// Upper bound for credential file reads, including files that grow during reading.
+pub const MAX_AUTH_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_credentials(path: &Path) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_AUTH_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_AUTH_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "credential file exceeds size limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "credential file is not valid UTF-8",
+        )
+    })
+}
+
+fn parse_credentials(text: &str) -> Result<(Vec<UserRecord>, Vec<TokenRecord>)> {
+    let value = preppydb_json::parse(text)
+        .map_err(|err| AuthError(format!("auth file is not valid JSON: {err}")))?;
+    let users = value
+        .get("users")
+        .and_then(|v| v.as_array())
+        .map(|items| items.iter().map(UserRecord::from_json).collect())
+        .transpose()?
+        .unwrap_or_default();
+    let tokens = value
+        .get("tokens")
+        .and_then(|v| v.as_array())
+        .map(|items| items.iter().map(TokenRecord::from_json).collect())
+        .unwrap_or_default();
+    Ok((users, tokens))
+}
 
 /// Persistent credential store.
 #[derive(Debug)]
@@ -252,8 +297,7 @@ pub struct AuthStore {
     users: Vec<UserRecord>,
     tokens: Vec<TokenRecord>,
     sessions: BTreeMap<String, Session>,
-    loaded_mtime: Option<SystemTime>,
-    loaded_len: Option<u64>,
+    loaded_digest: Option<[u8; 32]>,
 }
 
 impl AuthStore {
@@ -265,8 +309,7 @@ impl AuthStore {
             users: Vec::new(),
             tokens: Vec::new(),
             sessions: BTreeMap::new(),
-            loaded_mtime: None,
-            loaded_len: None,
+            loaded_digest: None,
         };
         store.load()?;
         Ok(store)
@@ -277,50 +320,40 @@ impl AuthStore {
     }
 
     fn load(&mut self) -> Result<()> {
-        match std::fs::read_to_string(&self.path) {
+        match read_credentials(&self.path) {
             Ok(text) => {
-                let value = preppydb_json::parse(&text)
-                    .map_err(|err| AuthError(format!("auth file is not valid JSON: {err}")))?;
-                self.users = value
-                    .get("users")
-                    .and_then(|v| v.as_array())
-                    .map(|items| items.iter().map(UserRecord::from_json).collect())
-                    .unwrap_or_default();
-                self.tokens = value
-                    .get("tokens")
-                    .and_then(|v| v.as_array())
-                    .map(|items| items.iter().map(TokenRecord::from_json).collect())
-                    .unwrap_or_default();
+                let (users, tokens) = parse_credentials(&text)?;
+                self.users = users;
+                self.tokens = tokens;
+                self.loaded_digest = Some(sha256(text.as_bytes()));
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 self.users.clear();
                 self.tokens.clear();
+                self.loaded_digest = None;
             }
             Err(err) => return Err(AuthError(format!("reading {}: {err}", self.path.display()))),
         }
-        self.loaded_len = std::fs::metadata(&self.path).ok().map(|m| m.len());
-        self.loaded_mtime = std::fs::metadata(&self.path)
-            .ok()
-            .and_then(|m| m.modified().ok());
         Ok(())
     }
 
-    /// Re-read the file when another process (the CLI) changed it.
-    /// Reload the credential file if it changed on disk.
-    ///
-    /// Timestamps are not enough: several filesystems (and some container/overlay
-    /// setups, including emulated test runs) only carry whole-second mtime resolution,
-    /// so a rewrite within the same second would be missed. The length is compared as
-    /// well, which catches every realistic edit (adding or removing a user or token
-    /// changes the file length).
-    pub fn reload_if_changed(&mut self) {
-        let metadata = std::fs::metadata(&self.path).ok();
-        let mtime = metadata.as_ref().and_then(|m| m.modified().ok());
-        let len = metadata.as_ref().map(|m| m.len());
-        let changed = metadata.is_some() && (mtime != self.loaded_mtime || len != self.loaded_len);
-        if changed {
-            let _ = self.load();
+    /// Reload changed credentials and invalidate sessions carrying old roles.
+    /// Any read or parse error must be surfaced so callers can fail closed.
+    pub fn reload_if_changed(&mut self) -> Result<()> {
+        let text = read_credentials(&self.path)
+            .map_err(|err| AuthError(format!("reading credential file: {err}")))?;
+        let digest = sha256(text.as_bytes());
+        if Some(digest) != self.loaded_digest {
+            // Parse the exact bytes whose digest was compared. A second file read here
+            // could race an atomic replacement and install content that did not match
+            // the change decision made above.
+            let (users, tokens) = parse_credentials(&text)?;
+            self.sessions.clear();
+            self.users = users;
+            self.tokens = tokens;
+            self.loaded_digest = Some(digest);
         }
+        Ok(())
     }
 
     fn save(&self) -> Result<()> {
@@ -335,6 +368,9 @@ impl AuthStore {
                 Json::Array(self.tokens.iter().map(|token| token.to_json()).collect()),
             );
         let text = preppydb_json::to_string_pretty(&payload);
+        if text.len() as u64 > MAX_AUTH_FILE_BYTES {
+            return Err(AuthError("credential file exceeds size limit".into()));
+        }
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -727,6 +763,62 @@ mod tests {
     }
 
     #[test]
+    fn reload_detects_same_length_role_change_and_rejects_corruption() {
+        let (mut store, dir) = store("reload-role");
+        store
+            .create_user("admin", "correct horse battery", vec![Role::Admin])
+            .unwrap();
+        store.reload_if_changed().unwrap();
+        let (session, _) = store.login("admin", "correct horse battery").unwrap();
+        let original = std::fs::read_to_string(store.path()).unwrap();
+        let changed = original.replace("\"admin\"", "\"write\"");
+        assert_eq!(original.len(), changed.len());
+        assert_ne!(original, changed);
+        std::fs::write(store.path(), changed).unwrap();
+        store.reload_if_changed().unwrap();
+        assert!(store.authenticate_session(&session).is_none());
+        std::fs::write(store.path(), "{invalid").unwrap();
+        assert!(store.reload_if_changed().is_err());
+        std::fs::remove_file(store.path()).unwrap();
+        assert!(store.reload_if_changed().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_reload_does_not_partially_replace_active_credentials() {
+        let (mut store, dir) = store("reload-atomic-failure");
+        store
+            .create_user("admin", "correct horse battery", vec![Role::Admin])
+            .unwrap();
+        store.reload_if_changed().unwrap();
+        let (session, _) = store.login("admin", "correct horse battery").unwrap();
+        let original = std::fs::read(store.path()).unwrap();
+
+        std::fs::write(store.path(), b"{malformed").unwrap();
+        assert!(store.reload_if_changed().is_err());
+        // The API rejects requests while reload fails. Internally, a failed parse
+        // must not install a partial/empty credential set or invalidate sessions.
+        assert_eq!(store.users.len(), 1);
+        assert!(store.authenticate_session(&session).is_some());
+
+        std::fs::write(store.path(), original).unwrap();
+        store.reload_if_changed().unwrap();
+        assert!(store.authenticate_session(&session).is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_credentials_fail_closed_on_open_and_reload() {
+        let (mut store, dir) = store("oversized-credentials");
+        let file = std::fs::File::create(store.path()).unwrap();
+        file.set_len(MAX_AUTH_FILE_BYTES + 1).unwrap();
+        drop(file);
+        assert!(store.reload_if_changed().is_err());
+        assert!(AuthStore::open(store.path()).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn no_default_credentials() {
         let (store, dir) = store("defaults");
         assert_eq!(store.user_count(), 0);
@@ -748,5 +840,26 @@ mod tests {
             .create_user("good.name", "correct horse battery", vec![Role::Read])
             .is_ok());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn imported_password_iterations_are_bounded_without_integer_wraparound() {
+        for invalid in [
+            Json::Null,
+            Json::Bool(true),
+            Json::str("120000"),
+            Json::int(-1),
+        ] {
+            let value = Json::obj().with("iterations", invalid);
+            assert!(UserRecord::from_json(&value).is_err());
+        }
+        for count in [0, 1, 9_999, 1_000_001, u32::MAX as u64 + 1] {
+            let value = Json::obj().with("iterations", Json::uint(count));
+            assert!(UserRecord::from_json(&value).is_err(), "accepted {count}");
+        }
+        for count in [10_000, DEFAULT_ITERATIONS, 1_000_000] {
+            let value = Json::obj().with("iterations", Json::uint(count as u64));
+            assert_eq!(UserRecord::from_json(&value).unwrap().iterations, count);
+        }
     }
 }

@@ -38,6 +38,7 @@ pub struct ApiState {
     login_limiter: Mutex<RateLimiter>,
     pub counters: Arc<ServerCounters>,
     pub pricing: Mutex<PricingState>,
+    pricing_operations: Mutex<()>,
     pub started_at: i64,
     requests: AtomicU64,
     pricing_collections_ready: AtomicBool,
@@ -71,6 +72,7 @@ impl ApiState {
                 engine: pricing_engine,
                 audit,
             }),
+            pricing_operations: Mutex::new(()),
             started_at: preppydb_storage::clock::now_ms(),
             requests: AtomicU64::new(0),
             pricing_collections_ready: AtomicBool::new(false),
@@ -136,7 +138,14 @@ impl ApiState {
             ));
         }
         let mut auth = self.auth.write().unwrap_or_else(|err| err.into_inner());
-        auth.reload_if_changed();
+        auth.reload_if_changed().map_err(|_| {
+            eprintln!("credential reload failed");
+            Response::error(
+                503,
+                "authentication_unavailable",
+                "authentication temporarily unavailable",
+            )
+        })?;
         if let Some(principal) = auth.authenticate_token(token) {
             return Ok(principal);
         }
@@ -175,7 +184,7 @@ impl ApiState {
         }
         let existing: Vec<String> = self
             .engine
-            .list_collections()
+            .try_list_collections()?
             .into_iter()
             .map(|meta| meta.name)
             .collect();
@@ -220,11 +229,40 @@ impl ApiState {
         Ok(())
     }
 
-    fn audit_append(&self, kind: &str, detail: Json) {
+    fn audit_append(&self, kind: &str, detail: Json) -> Result<(), Response> {
         let mut pricing = self.pricing.lock().unwrap_or_else(|err| err.into_inner());
-        if let Some(audit) = pricing.audit.as_mut() {
-            let _ = audit.append(kind, preppydb_storage::clock::now_ms(), detail);
+        let result = match pricing.audit.as_mut() {
+            Some(audit) => audit.append(kind, preppydb_storage::clock::now_ms(), detail),
+            None => return Err(Response::error(503, "audit_unavailable", "audit unavailable; the pricing operation may already have committed; inspect its state before retrying")),
+        };
+        if result.is_err() {
+            // A partial append or failed sync leaves the on-disk chain uncertain.
+            pricing.audit = None;
+            return Err(Response::error(503, "audit_unavailable", "audit append failed; the pricing operation may already have committed; inspect its state before retrying"));
         }
+        Ok(())
+    }
+
+    fn require_audit(&self) -> Result<(), Response> {
+        let pricing = self.pricing.lock().unwrap_or_else(|err| err.into_inner());
+        if pricing.audit.is_none() {
+            return Err(Response::error(
+                503,
+                "audit_unavailable",
+                "pricing audit is unavailable",
+            ));
+        }
+        Ok(())
+    }
+
+    fn serialize_pricing_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, Response> {
+        self.pricing_operations.lock().map_err(|_| {
+            Response::error(
+                503,
+                "pricing_unavailable",
+                "pricing operation state is unavailable",
+            )
+        })
     }
 
     /// Load a stored price rule plus its current price.
@@ -308,10 +346,7 @@ impl ApiState {
             ("GET", ["readyz"]) => {
                 // Readiness means "can serve reads": the storage engine is open and its
                 // state is queryable. It deliberately reveals no data.
-                let storage_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _ = self.engine.stats();
-                }))
-                .is_ok();
+                let storage_ok = self.engine.try_stats().is_ok();
                 Response::json(
                     if storage_ok { 200 } else { 503 },
                     Json::obj()
@@ -356,27 +391,39 @@ impl ApiState {
 
             // ---- stats -------------------------------------------------------
             ("GET", ["v1", "stats"]) => self.with_role(principal, Role::Read, "stats", || {
-                let mut stats = self.engine.stats().to_json();
+                let mut stats = match self.engine.try_stats() {
+                    Ok(stats) => stats.to_json(),
+                    Err(error) => return db_error(error),
+                };
                 stats.set("server", self.server_stats());
                 ok_data(stats)
             }),
             ("GET", ["v1", "metrics"]) => self.with_role(principal, Role::Read, "metrics", || {
+                let storage = match self.engine.try_stats() {
+                    Ok(stats) => stats.metrics,
+                    Err(error) => return db_error(error),
+                };
                 ok_data(
                     Json::obj()
                         .with("server", self.counters.snapshot())
-                        .with("storage", self.engine.stats().metrics.clone()),
+                        .with("storage", storage),
                 )
             }),
 
             // ---- collections -------------------------------------------------
             ("GET", ["v1", "collections"]) => {
                 self.with_role(principal, Role::Read, "listing collections", || {
-                    let collections: Vec<Json> = self
-                        .engine
-                        .list_collections()
-                        .iter()
-                        .map(|meta| {
-                            let count = self.engine.count(&meta.name).unwrap_or(0);
+                    let metadata = match self.engine.try_list_collections() {
+                        Ok(metadata) => metadata,
+                        Err(error) => return db_error(error),
+                    };
+                    let mut collections = Vec::with_capacity(metadata.len());
+                    for meta in metadata {
+                        let count = match self.engine.count(&meta.name) {
+                            Ok(count) => count,
+                            Err(error) => return db_error(error),
+                        };
+                        collections.push(
                             Json::obj()
                                 .with("name", Json::str(meta.name.clone()))
                                 .with("documents", Json::uint(count as u64))
@@ -398,9 +445,9 @@ impl ApiState {
                                 .with(
                                     "immutable",
                                     Json::Bool(preppydb_model::is_immutable_collection(&meta.name)),
-                                )
-                        })
-                        .collect();
+                                ),
+                        );
+                    }
                     ok_data(Json::obj().with("collections", Json::Array(collections)))
                 })
             }
@@ -505,6 +552,74 @@ impl ApiState {
             }
 
             // ---- documents ---------------------------------------------------
+            ("POST", ["v1", "collections", name, "query"]) => {
+                self.with_role(principal, Role::Read, "querying documents", || {
+                    let ruby = match &self.config.ruby_planner_path {
+                        Some(path) => path,
+                        None => {
+                            return Response::error(
+                                503,
+                                "query_planner_unavailable",
+                                "Ruby query planner is not enabled",
+                            )
+                        }
+                    };
+                    let mut query = match request.json_body() {
+                        Ok(value) if value.as_object().is_some() => value,
+                        Ok(_) => {
+                            return Response::error(400, "invalid_query", "query must be an object")
+                        }
+                        Err(response) => return response,
+                    };
+                    if query
+                        .get("collection")
+                        .is_some_and(|value| value.as_str() != Some(*name))
+                    {
+                        return Response::error(
+                            400,
+                            "invalid_query",
+                            "collection does not match URL",
+                        );
+                    }
+                    query.set("collection", Json::str(*name));
+                    let metadata = match self.engine.collection_meta(name) {
+                        Ok(metadata) => metadata,
+                        Err(err) => return db_error(err),
+                    };
+                    let plan = match crate::ruby_planner::plan_with_ruby(
+                        ruby,
+                        &query,
+                        &metadata,
+                        std::time::Duration::from_secs(5),
+                    ) {
+                        Ok(plan) => plan,
+                        Err(_) => {
+                            return Response::error(
+                                400,
+                                "query_planning_failed",
+                                "query could not be planned",
+                            )
+                        }
+                    };
+                    match crate::query_plan::execute_plan(&self.engine, &plan, &query) {
+                        Ok(docs) => {
+                            let documents: Vec<Json> =
+                                docs.iter().map(|(key, doc)| doc_json(key, doc)).collect();
+                            ok_data(
+                                Json::obj()
+                                    .with("collection", Json::str(*name))
+                                    .with("count", Json::uint(documents.len() as u64))
+                                    .with("documents", Json::Array(documents)),
+                            )
+                        }
+                        Err(_) => Response::error(
+                            409,
+                            "query_plan_invalid",
+                            "query plan is no longer valid",
+                        ),
+                    }
+                })
+            }
             ("GET", ["v1", "collections", name, "documents"]) => {
                 self.with_role(principal, Role::Read, "scanning documents", || {
                     let options = ScanOptions {
@@ -582,6 +697,11 @@ impl ApiState {
             ("POST", ["v1", "transactions"]) => {
                 self.with_role(principal, Role::Write, "committing transactions", || {
                     self.handle_batch(request, None)
+                })
+            }
+            ("POST", ["v1", "lua", "execute"]) => {
+                self.with_role(principal, Role::Admin, "executing Lua mutations", || {
+                    self.handle_lua_execution(request)
                 })
             }
 
@@ -863,8 +983,9 @@ impl ApiState {
                                 Json::obj().with(
                                     "entries",
                                     Json::Array(
-                                        entries[start..]
+                                        entries
                                             .iter()
+                                            .skip(start)
                                             .map(|entry| entry.to_json())
                                             .collect(),
                                     ),
@@ -883,7 +1004,7 @@ impl ApiState {
                             Ok(()) => ok_data(
                                 Json::obj()
                                     .with("ok", Json::Bool(true))
-                                    .with("entries", Json::uint(audit.entries().len() as u64)),
+                                    .with("entries", Json::uint(audit.entry_count())),
                             ),
                             Err(err) => Response::json(
                                 409,
@@ -925,6 +1046,120 @@ impl ApiState {
         match Self::require(principal, role, what) {
             Ok(()) => action(),
             Err(response) => response,
+        }
+    }
+
+    fn handle_lua_execution(&self, request: &Request) -> Response {
+        if !self.config.lua_execution_enabled {
+            return Response::error(
+                503,
+                "lua_execution_unavailable",
+                "server-side Lua execution is disabled",
+            );
+        }
+        if self.config.read_only {
+            return Response::error(
+                409,
+                "read_only",
+                "Lua mutations are unavailable in read-only mode",
+            );
+        }
+        let body = match request.json_body() {
+            Ok(body @ Json::Object(_)) => body,
+            Ok(_) => return Response::error(400, "invalid_request", "body must be an object"),
+            Err(response) => return response,
+        };
+        let source = match body.get_str("script") {
+            Some(source) => source,
+            None => return Response::error(400, "invalid_request", "'script' is required"),
+        };
+        let input = body.get("input").cloned().unwrap_or_else(Json::obj);
+        let output = match crate::lua_engine::execute(source, &input) {
+            Ok(output) => output,
+            Err(_) => {
+                return Response::error(
+                    422,
+                    "lua_execution_failed",
+                    "Lua script failed validation or exceeded a runtime limit",
+                )
+            }
+        };
+        let mut operations = Vec::with_capacity(output.operations.len());
+        for operation in output.operations {
+            let Some(fields) = operation.as_object() else {
+                return Response::error(
+                    422,
+                    "lua_plan_invalid",
+                    "each operation must be an object",
+                );
+            };
+            let kind = operation.get_str("op");
+            let collection = operation.get_str("collection");
+            let key = operation.get_str("key");
+            let (Some(kind), Some(collection), Some(key)) = (kind, collection, key) else {
+                return Response::error(
+                    422,
+                    "lua_plan_invalid",
+                    "each operation needs string op, collection, and key fields",
+                );
+            };
+            if preppydb_model::is_forbidden_collection(collection) {
+                return Response::error(403, "forbidden_collection", "collection is not writable");
+            }
+            let expected_version = operation.get("expected_version").and_then(Json::as_u64);
+            let Some(expected_version) = expected_version else {
+                return Response::error(
+                    422,
+                    "lua_plan_invalid",
+                    "each mutation needs an expected_version (0 means the document must not exist)",
+                );
+            };
+            match kind {
+                "put" if fields.len() == 5 => {
+                    let Some(value) = operation.get("value") else {
+                        return Response::error(422, "lua_plan_invalid", "put needs a value");
+                    };
+                    if let Err(response) = self.check_collection_mutable(collection, false) {
+                        return response;
+                    }
+                    operations.push(CheckedOp {
+                        op: Op::Put {
+                            collection: collection.to_owned(),
+                            key: key.to_owned(),
+                            value: value.clone(),
+                            expires_at: None,
+                        },
+                        expected_version: Some(expected_version),
+                    });
+                }
+                "delete" if fields.len() == 4 => {
+                    if let Err(response) = self.check_collection_mutable(collection, true) {
+                        return response;
+                    }
+                    operations.push(CheckedOp {
+                        op: Op::Delete {
+                            collection: collection.to_owned(),
+                            key: key.to_owned(),
+                        },
+                        expected_version: Some(expected_version),
+                    });
+                }
+                _ => {
+                    return Response::error(
+                        422,
+                        "lua_plan_invalid",
+                        "only put and delete operations with exact fields and a version check are supported",
+                    )
+                }
+            }
+        }
+        match self.engine.batch_checked(operations) {
+            Ok(applied) => ok_data(
+                Json::obj()
+                    .with("result", output.result)
+                    .with("applied_operations", Json::uint(applied as u64)),
+            ),
+            Err(err) => db_error(err),
         }
     }
 
@@ -989,7 +1224,14 @@ impl ApiState {
             None => return Response::error(400, "invalid_request", "'password' is required"),
         };
         let mut auth = self.auth.write().unwrap_or_else(|err| err.into_inner());
-        auth.reload_if_changed();
+        if auth.reload_if_changed().is_err() {
+            eprintln!("credential reload failed");
+            return Response::error(
+                503,
+                "authentication_unavailable",
+                "authentication temporarily unavailable",
+            );
+        }
         match auth.login(&username, &password) {
             Ok((token, principal)) => ok_data(
                 Json::obj()
@@ -1015,7 +1257,14 @@ impl ApiState {
             .map(|value| value.trim().to_string());
         if let Some(token) = token {
             let mut auth = self.auth.write().unwrap_or_else(|err| err.into_inner());
-            auth.reload_if_changed();
+            if auth.reload_if_changed().is_err() {
+                eprintln!("credential reload failed");
+                return Response::error(
+                    503,
+                    "authentication_unavailable",
+                    "authentication temporarily unavailable",
+                );
+            }
             let was_session = auth.logout(&token);
             // Also allow revoking an API token by presenting it (self-service).
             if !was_session {
@@ -1314,6 +1563,13 @@ impl ApiState {
     // ---------------------------------------------------------------- pricing
 
     fn handle_put_rule(&self, request: &Request, item: &str) -> Response {
+        let _operation = match self.serialize_pricing_operation() {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
+        if let Err(response) = self.require_audit() {
+            return response;
+        }
         if let Err(err) = self.ensure_pricing_collections() {
             return db_error(err);
         }
@@ -1354,19 +1610,28 @@ impl ApiState {
         if let Err(response) = self.store_rule(&rule, current) {
             return response;
         }
-        self.audit_append(
+        if let Err(response) = self.audit_append(
             "rule_updated",
             Json::obj()
                 .with("item_id", Json::str(item))
                 .with("version", Json::uint(rule.version))
                 .with("rule", rule.to_json()),
-        );
+        ) {
+            return response;
+        }
         let mut value = rule.to_json();
         value.set("current_price_cents", Json::int(current));
         ok_data(value)
     }
 
     fn handle_tick(&self, request: &Request, item: &str) -> Response {
+        let _operation = match self.serialize_pricing_operation() {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
+        if let Err(response) = self.require_audit() {
+            return response;
+        }
         if let Err(err) = self.ensure_pricing_collections() {
             return db_error(err);
         }
@@ -1404,7 +1669,9 @@ impl ApiState {
             ) {
                 return response;
             }
-            self.audit_append("price_change", change.to_json());
+            if let Err(response) = self.audit_append("price_change", change.to_json()) {
+                return response;
+            }
             changes.push(change.to_json());
         }
         if let Err(response) = self.store_rule(&rule, current) {
@@ -1421,6 +1688,13 @@ impl ApiState {
     }
 
     fn handle_create_offer(&self, request: &Request) -> Response {
+        let _operation = match self.serialize_pricing_operation() {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
+        if let Err(response) = self.require_audit() {
+            return response;
+        }
         if let Err(err) = self.ensure_pricing_collections() {
             return db_error(err);
         }
@@ -1463,7 +1737,9 @@ impl ApiState {
             PutOptions::default(),
         ) {
             Ok(_) => {
-                self.audit_append("offer_created", offer.to_json());
+                if let Err(response) = self.audit_append("offer_created", offer.to_json()) {
+                    return response;
+                }
                 Response::json(
                     201,
                     Json::obj()
@@ -1476,6 +1752,13 @@ impl ApiState {
     }
 
     fn handle_purchase(&self, request: &Request) -> Response {
+        let _operation = match self.serialize_pricing_operation() {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
+        if let Err(response) = self.require_audit() {
+            return response;
+        }
         if let Err(err) = self.ensure_pricing_collections() {
             return db_error(err);
         }
@@ -1569,7 +1852,9 @@ impl ApiState {
         }
         match txn.commit() {
             Ok(outcome) => {
-                self.audit_append("purchase", purchase.to_json());
+                if let Err(response) = self.audit_append("purchase", purchase.to_json()) {
+                    return response;
+                }
                 Response::json(
                     201,
                     Json::obj().with("ok", Json::Bool(true)).with(
