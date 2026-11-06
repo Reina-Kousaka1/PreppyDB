@@ -215,9 +215,7 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
     let mut reader = BufReader::new(file);
 
     let mut magic = [0u8; 9];
-    reader
-        .read_exact(&mut magic)
-        .map_err(|err| DbError::io("reading snapshot magic", err))?;
+    read_snapshot_exact(&mut reader, &mut magic, path, "magic")?;
     if &magic != SNAPSHOT_MAGIC {
         return Err(DbError::corrupt(
             path.display().to_string(),
@@ -225,9 +223,7 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
         ));
     }
     let mut len_buf = [0u8; 4];
-    reader
-        .read_exact(&mut len_buf)
-        .map_err(|err| DbError::io("reading snapshot header length", err))?;
+    read_snapshot_exact(&mut reader, &mut len_buf, path, "header length")?;
     let header_len = u32::from_le_bytes(len_buf);
     if header_len > 1 << 20 {
         return Err(DbError::corrupt(
@@ -236,9 +232,7 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
         ));
     }
     let mut header_bytes = vec![0u8; header_len as usize];
-    reader
-        .read_exact(&mut header_bytes)
-        .map_err(|err| DbError::io("reading snapshot header", err))?;
+    read_snapshot_exact(&mut reader, &mut header_bytes, path, "header")?;
     let header_text = std::str::from_utf8(&header_bytes)
         .map_err(|err| DbError::corrupt("snapshot header", format!("not UTF-8: {err}")))?;
     let header_json = preppydb_json::parse(header_text)
@@ -258,15 +252,11 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
     let mut collections: Vec<(CollectionMeta, Vec<(String, Doc)>)> = Vec::new();
     loop {
         let mut len_buf = [0u8; 4];
-        reader
-            .read_exact(&mut len_buf)
-            .map_err(|err| DbError::io("reading snapshot frame length", err))?;
+        read_snapshot_exact(&mut reader, &mut len_buf, path, "frame length or footer")?;
         let len = u32::from_le_bytes(len_buf);
         if len == FOOTER_MARKER {
             let mut digest = [0u8; 32];
-            reader
-                .read_exact(&mut digest)
-                .map_err(|err| DbError::io("reading snapshot digest", err))?;
+            read_snapshot_exact(&mut reader, &mut digest, path, "footer digest")?;
             let actual = hasher.finish();
             if actual != digest {
                 return Err(DbError::corrupt(
@@ -309,15 +299,11 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
         }
         hasher.update(&len_buf);
         let mut crc_buf = [0u8; 4];
-        reader
-            .read_exact(&mut crc_buf)
-            .map_err(|err| DbError::io("reading snapshot frame checksum", err))?;
+        read_snapshot_exact(&mut reader, &mut crc_buf, path, "frame checksum")?;
         let crc = u32::from_le_bytes(crc_buf);
         hasher.update(&crc_buf);
         let mut payload = vec![0u8; len as usize];
-        reader
-            .read_exact(&mut payload)
-            .map_err(|err| DbError::io("reading snapshot frame", err))?;
+        read_snapshot_exact(&mut reader, &mut payload, path, "frame payload")?;
         hasher.update(&payload);
         let actual_crc = crc32c(&payload, 0);
         if actual_crc != crc {
@@ -370,6 +356,24 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
             }
         }
     }
+}
+
+fn read_snapshot_exact(
+    reader: &mut impl Read,
+    buffer: &mut [u8],
+    path: &Path,
+    part: &str,
+) -> Result<()> {
+    reader.read_exact(buffer).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            DbError::corrupt(
+                path.display().to_string(),
+                format!("truncated snapshot {part}"),
+            )
+        } else {
+            DbError::io(format!("reading snapshot {part}"), error)
+        }
+    })
 }
 
 /// `fsync` a directory so that a rename is durable.
@@ -477,6 +481,38 @@ mod tests {
             err.to_string().contains("checksum") || err.to_string().contains("SHA-256"),
             "{err}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn truncated_snapshot_components_are_reported_as_corruption() {
+        let dir = tempdir("truncated");
+        let path = dir.join("snap-1.pdb");
+        write_snapshot(&path, 1, 1, 0, &sample()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let header_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let first_frame = 13 + header_len;
+        let payload_start = first_frame + 8;
+        let payload_len =
+            u32::from_le_bytes(bytes[first_frame..first_frame + 4].try_into().unwrap()) as usize;
+        let truncated = [
+            &bytes[..11],
+            &bytes[..13 + header_len - 1],
+            &bytes[..first_frame + 2],
+            &bytes[..first_frame + 6],
+            &bytes[..payload_start + payload_len - 1],
+            &bytes[..bytes.len() - 1],
+        ];
+
+        for (index, contents) in truncated.iter().enumerate() {
+            std::fs::write(&path, contents).unwrap();
+            let error = read_snapshot(&path).unwrap_err();
+            assert_eq!(
+                error.code(),
+                crate::error::codes::CORRUPT_DATA,
+                "truncation case {index} was misclassified: {error}"
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
