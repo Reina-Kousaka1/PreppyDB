@@ -505,6 +505,25 @@ local Client = {}
 Client.__index = Client
 local MAX_RETRIES = 10
 
+local function invalid_response(message)
+  return nil, { code = "invalid_response", message = message, retryable = false }
+end
+
+local function required_array(data, field)
+  if type(data) == "table" and preppydb.is_array(data[field]) then
+    return data[field]
+  end
+  return invalid_response("server response is missing a valid '" .. field .. "' array")
+end
+
+local function required_version(data)
+  local version = type(data) == "table" and data.version or nil
+  if type(version) == "number" and version >= 1 and version == math.floor(version) then
+    return version
+  end
+  return invalid_response("server response is missing a valid document version")
+end
+
 local function valid_bearer_token(token)
   return type(token) == "string" and #token > 0 and #token <= 512
     and token:match("^[A-Za-z0-9._~+/%-]+=*$") ~= nil
@@ -696,7 +715,7 @@ function Client:call(method, path, body, options)
       last_error = { code = "transport_error", message = tostring(response_body), retryable = false }
     elseif status >= 200 and status < 300 then
       if response_body == "" then
-        return {}, nil
+        return invalid_response("server returned an empty success response")
       end
       local ok, decoded = pcall(preppydb.decode, response_body)
       if not ok then
@@ -707,13 +726,16 @@ function Client:call(method, path, body, options)
           retryable = false,
         }
       end
-      -- Data endpoints wrap their payload in {"data": ...}; hand callers the payload
-      -- so they do not have to know about the envelope. Public endpoints (/healthz,
-      -- /v1/version) answer flat and are returned as-is.
-      if type(decoded) == "table" and type(decoded.data) == "table" then
-        return decoded.data, nil
+      -- Data endpoints use the success envelope; only the health endpoints return
+      -- their status object directly.
+      if path == "/healthz" or path == "/readyz" then
+        return decoded, nil
       end
-      return decoded, nil
+      if type(decoded) ~= "table" or type(decoded.data) ~= "table"
+          or (decoded.ok ~= nil and decoded.ok ~= true) then
+        return invalid_response("server returned a malformed success envelope")
+      end
+      return decoded.data, nil
     else
       last_error = error_from(status, response_body)
       last_error.headers = response_headers
@@ -775,6 +797,10 @@ function Client:call_async(method, path, body, callback)
       return
     end
     if status >= 200 and status < 300 then
+      if response_body == "" then
+        callback(invalid_response("server returned an empty success response"))
+        return
+      end
       local decoded_ok, decoded = pcall(preppydb.decode, response_body or "")
       if not decoded_ok then
         callback(nil, {
@@ -785,11 +811,16 @@ function Client:call_async(method, path, body, callback)
         })
         return
       end
-      if type(decoded) == "table" and type(decoded.data) == "table" then
-        callback(decoded.data, nil)
-      else
+      if path == "/healthz" or path == "/readyz" then
         callback(decoded, nil)
+        return
       end
+      if type(decoded) ~= "table" or type(decoded.data) ~= "table"
+          or (decoded.ok ~= nil and decoded.ok ~= true) then
+        callback(invalid_response("server returned a malformed success envelope"))
+        return
+      end
+      callback(decoded.data, nil)
       return
     end
     local err = error_from(status, response_body or "")
@@ -814,13 +845,12 @@ end
 
 function Client:login(username, password)
   local data, err = self:call("POST", "/v1/auth/login", { username = username, password = password })
-  if data and data.token then
-    if not valid_bearer_token(data.token) then
-      return nil, { code = "invalid_response", message = "server returned an invalid bearer token", retryable = false }
-    end
-    self.token = data.token
+  if not data then return nil, err end
+  if type(data) ~= "table" or not valid_bearer_token(data.token) then
+    return invalid_response("server returned an invalid or missing bearer token")
   end
-  return data, err
+  self.token = data.token
+  return data, nil
 end
 
 function Client:whoami()
@@ -839,8 +869,13 @@ function Client:collections()
   local data, err = self:call("GET", "/v1/collections")
   if not data then return nil, err end
   local names = preppydb.array({})
-  for _, entry in ipairs(data.collections or {}) do
-    names[#names + 1] = type(entry) == "table" and entry.name or entry
+  local collections, array_err = required_array(data, "collections")
+  if not collections then return nil, array_err end
+  for _, entry in ipairs(collections) do
+    if type(entry) ~= "table" or type(entry.name) ~= "string" or entry.name == "" then
+      return invalid_response("server returned a collection without a valid name")
+    end
+    names[#names + 1] = entry.name
   end
   return names
 end
@@ -876,7 +911,7 @@ function Client:put(collection, key, value, expected_version)
     value = value,
   })
   if not data then return nil, err end
-  return data.version
+  return required_version(data)
 end
 
 function Client:put_checked(collection, key, value, expected_version)
@@ -888,7 +923,7 @@ function Client:put_checked(collection, key, value, expected_version)
     body
   )
   if not data then return nil, err end
-  return data.version
+  return required_version(data)
 end
 
 function Client:get(collection, key)
@@ -901,6 +936,9 @@ function Client:get(collection, key)
       return nil
     end
     return nil, err
+  end
+  if type(data) ~= "table" or data.value == nil then
+    return invalid_response("server returned a document without a value")
   end
   return data.value
 end
@@ -934,12 +972,15 @@ function Client:scan(collection, options)
     "/v1/collections/" .. encode_path(collection) .. "/documents?" .. table.concat(query, "&")
   )
   if not data then return nil, err end
-  return data.documents or preppydb.array({})
+  return required_array(data, "documents")
 end
 
 function Client:count(collection)
   local info, err = self:collection(collection)
   if not info then return nil, err end
+  if type(info.documents) ~= "number" or info.documents < 0 or info.documents ~= math.floor(info.documents) then
+    return invalid_response("server response is missing a valid document count")
+  end
   return info.documents
 end
 
@@ -959,7 +1000,7 @@ function Client:find(collection, index, value)
       .. "?value=" .. percent_encode(preppydb.encode(value))
   )
   if not data then return nil, err end
-  return data.documents or preppydb.array({})
+  return required_array(data, "documents")
 end
 
 function Client:range(collection, index, from_value, to_value)
@@ -972,7 +1013,8 @@ function Client:range(collection, index, from_value, to_value)
       .. "?" .. table.concat(query, "&")
   )
   if not data then return nil, err end
-  return data.rows or data.documents or preppydb.array({})
+  if data.rows ~= nil then return required_array(data, "rows") end
+  return required_array(data, "documents")
 end
 
 function Client:checkpoint()
@@ -1010,13 +1052,13 @@ end
 function Client:personality_profiles()
   local data, err = self:call("GET", "/v1/personality/profiles")
   if not data then return nil, err end
-  return data.profiles or preppydb.array({})
+  return required_array(data, "profiles")
 end
 
 function Client:price_rules()
   local data, err = self:call("GET", "/v1/pricing/rules")
   if not data then return nil, err end
-  return data.rules or preppydb.array({})
+  return required_array(data, "rules")
 end
 
 function Client:put_price_rule(rule)
@@ -1048,7 +1090,7 @@ end
 function Client:price_history(item)
   local data, err = self:call("GET", "/v1/pricing/history/" .. encode_path(item))
   if not data then return nil, err end
-  return data.history or preppydb.array({})
+  return required_array(data, "history")
 end
 
 function Client:simulate(rule, steps, seed)

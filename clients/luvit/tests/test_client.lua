@@ -121,7 +121,7 @@ end
 do
   local client, calls = new_client({
     json_response(200, { status = "ok", checks = {} }),
-    json_response(200, { engine = "preppydb", api = "v1" }),
+    json_response(200, { ok = true, data = { engine = "preppydb", api = "v1" } }),
     json_response(200, { data = { version = 3 } }),
   })
   local health, err = client:health()
@@ -294,6 +294,40 @@ do
   local client = new_client({ { status = 200, body = "{oops" } })
   local _, err = client:stats()
   t:equal(err.code, "invalid_response", "malformed JSON is an invalid_response error")
+end
+
+do
+  local empty = new_client({ { status = 200, body = "" } })
+  local _, empty_err = empty:stats()
+  t:equal(empty_err.code, "invalid_response", "empty successful response is rejected")
+
+  local missing_data = new_client({ json_response(200, { ok = true }) })
+  local _, envelope_err = missing_data:stats()
+  t:equal(envelope_err.code, "invalid_response", "missing data envelope is rejected")
+
+  local collections = new_client({ json_response(200, { ok = true, data = {} }) })
+  local _, collections_err = collections:collections()
+  t:equal(collections_err.code, "invalid_response", "missing collections array is rejected")
+
+  local malformed_name = new_client({
+    json_response(200, { ok = true, data = { collections = { { id = "without-name" } } } }),
+  })
+  local _, name_err = malformed_name:collections()
+  t:equal(name_err.code, "invalid_response", "malformed collection entry is rejected")
+
+  local missing_version = new_client({ json_response(200, { ok = true, data = {} }) })
+  local version, version_err = missing_version:put("items", "key", { value = 1 })
+  t:equal(version, nil, "put does not synthesize a missing version")
+  t:equal(version_err.code, "invalid_response", "missing document version is rejected")
+
+  local missing_documents = new_client({ json_response(200, { ok = true, data = {} }) })
+  local _, documents_err = missing_documents:scan("items")
+  t:equal(documents_err.code, "invalid_response", "missing documents array is rejected")
+
+  local no_token = new_client({ json_response(200, { ok = true, data = {} }) }, { token = nil })
+  local _, login_err = no_token:login("admin", "correct horse battery")
+  t:equal(login_err.code, "invalid_response", "successful login without token is rejected")
+  t:equal(no_token.token, nil, "malformed login never changes credentials")
 end
 
 do
