@@ -1214,6 +1214,88 @@ fn read_only_open_rejects_corrupt_wal_without_mutating_any_segment() {
 }
 
 #[test]
+fn read_only_open_preserves_later_segments_after_middle_segment_corruption() {
+    let dir = tempdir("readonly-middle-corrupt-wal");
+    let mut config = EngineConfig::new(&dir);
+    config.sync_mode = SyncMode::Always;
+    config.max_segment_bytes = wal::WAL_HEADER_LEN + 1;
+    {
+        let engine = Engine::open(config.clone()).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "baseline", Json::int(0), PutOptions::default())
+            .unwrap();
+        engine.checkpoint().unwrap();
+        for (key, value) in [("before", 1), ("damaged", 2), ("after", 3)] {
+            engine
+                .put("c", key, Json::int(value), PutOptions::default())
+                .unwrap();
+        }
+    }
+
+    let wal_dir = dir.join("wal");
+    let segments = wal::list_segments(&wal_dir).unwrap();
+    assert!(
+        segments.len() >= 3,
+        "expected rotated post-checkpoint segments: {segments:?}"
+    );
+    let damaged_segment = &segments[1];
+    let mut bytes = std::fs::read(damaged_segment).unwrap();
+    *bytes.last_mut().unwrap() ^= 0x80;
+    std::fs::write(damaged_segment, bytes).unwrap();
+
+    let wal_before: Vec<_> = wal::list_segments(&wal_dir)
+        .unwrap()
+        .into_iter()
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect();
+    let read_manifests = || {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with("manifest")
+                    && entry.file_type().unwrap().is_file()
+            })
+            .map(|entry| (entry.path(), std::fs::read(entry.path()).unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let manifests_before = read_manifests();
+
+    config.read_only = true;
+    // Read-only inspection must not truncate the bad segment or remove its suffix.
+    config.repair = RepairPolicy::TruncateCorruptTail;
+    assert!(matches!(Engine::open(config), Err(DbError::Corrupt { .. })));
+
+    let wal_after = wal::list_segments(&wal_dir)
+        .unwrap()
+        .into_iter()
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wal_after, wal_before,
+        "read-only recovery changed or removed WAL segments"
+    );
+    assert_eq!(
+        read_manifests(),
+        manifests_before,
+        "read-only recovery changed manifest files"
+    );
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("recovery-report-")),
+        "read-only recovery must not publish a recovery report"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn recovery_rejects_noncanonical_wal_name_instead_of_missing_commits() {
     let dir = tempdir("noncanonical-wal-recovery");
     {
