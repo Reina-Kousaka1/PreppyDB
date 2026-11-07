@@ -93,7 +93,7 @@ local version2 = client:put_checked(collection, "first", { name = "Molly v2" }, 
 t:equal(version2, 2, "compare-and-set bumps the version")
 local _, conflict = client:put_checked(collection, "first", { name = "stale" }, version1)
 t:equal(conflict and conflict.code, "conflict", "stale compare-and-set is a conflict")
-t:equal(conflict and conflict.retryable, true, "conflicts are retryable")
+t:equal(conflict and conflict.retryable, false, "conflicts require caller reconciliation")
 
 local _, validation = client:put(collection, "bad", { age = 3 })
 t:equal(validation and validation.code, "validation_failed", "schema violations are rejected")
