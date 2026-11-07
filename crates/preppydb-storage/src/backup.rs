@@ -1082,12 +1082,20 @@ impl RestoreIntent {
     }
 
     fn complete(self) -> Result<()> {
+        self.complete_with_retirement_hook(|| {})
+    }
+
+    fn complete_with_retirement_hook<F>(self, after_retirement: F) -> Result<()>
+    where
+        F: FnOnce(),
+    {
         let completed_path = append_sibling_suffix(
             &self.path,
             &format!(".completed-{}-{}", std::process::id(), now_ms()),
         )?;
         crate::fsutil::move_path(&self.path, &completed_path)
             .map_err(|err| DbError::io("retiring completed restore intent", err))?;
+        after_retirement();
         fsync_dir(&self.parent)?;
         // The durable rename above removes the blocking marker. A leftover tombstone
         // is harmless and can be cleaned up later if deletion itself is interrupted.
@@ -1669,15 +1677,42 @@ mod tests {
             "before_publish",
             "after_old_target_move",
             "after_new_target_move",
+            "after_intent_retirement",
         ] {
             let root = tempdir(&format!("restore-process-crash-{phase}"));
             let target = root.join("database");
             let staged = root.join("staged");
             let aside = root.join("aside");
-            std::fs::create_dir(&target).unwrap();
-            std::fs::write(target.join("old"), b"old-state").unwrap();
-            std::fs::create_dir(&staged).unwrap();
-            std::fs::write(staged.join("new"), b"new-state").unwrap();
+            if phase == "after_intent_retirement" {
+                let old = Engine::open(crate::engine::EngineConfig::new(&target)).unwrap();
+                old.create_collection(crate::catalog::CollectionMeta::new("c", 0))
+                    .unwrap();
+                old.put(
+                    "c",
+                    "old",
+                    Json::str("old-state"),
+                    crate::engine::PutOptions::default(),
+                )
+                .unwrap();
+                drop(old);
+
+                let new = Engine::open(crate::engine::EngineConfig::new(&staged)).unwrap();
+                new.create_collection(crate::catalog::CollectionMeta::new("c", 0))
+                    .unwrap();
+                new.put(
+                    "c",
+                    "new",
+                    Json::str("new-state"),
+                    crate::engine::PutOptions::default(),
+                )
+                .unwrap();
+                drop(new);
+            } else {
+                std::fs::create_dir(&target).unwrap();
+                std::fs::write(target.join("old"), b"old-state").unwrap();
+                std::fs::create_dir(&staged).unwrap();
+                std::fs::write(staged.join("new"), b"new-state").unwrap();
+            }
 
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -1698,6 +1733,35 @@ mod tests {
             );
 
             let intent_path = restore_intent_path(&target).unwrap().0;
+            if phase == "after_intent_retirement" {
+                assert!(!intent_path.exists(), "retired marker still blocks open");
+                let opened = Engine::open(crate::engine::EngineConfig::new(&target)).unwrap();
+                assert_eq!(opened.count("c").unwrap(), 1);
+                assert_eq!(
+                    opened.get("c", "new").unwrap().value.as_str(),
+                    Some("new-state")
+                );
+                assert!(opened.get_opt("c", "old").unwrap().is_none());
+                drop(opened);
+
+                let previous =
+                    Engine::open(crate::engine::EngineConfig::new(aside.join("previous"))).unwrap();
+                assert_eq!(
+                    previous.get("c", "old").unwrap().value.as_str(),
+                    Some("old-state")
+                );
+                drop(previous);
+                assert!(std::fs::read_dir(&root).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".database.restore-intent.completed-")
+                }));
+                std::fs::remove_dir_all(root).unwrap();
+                continue;
+            }
+
             assert!(
                 intent_path.exists(),
                 "missing recovery marker at {phase}; child stdout: {}; stderr: {}",
@@ -1750,10 +1814,18 @@ mod tests {
         let target = root.join("database");
         let staged = root.join("staged");
         let aside = root.join("aside");
-        let _intent = RestoreIntent::create(&target, &staged, &aside).unwrap();
+        let intent = RestoreIntent::create(&target, &staged, &aside).unwrap();
         if phase == "before_publish" {
             std::process::abort();
         }
+        if phase == "after_intent_retirement" {
+            publish_restore(&staged, &target, &aside, true).unwrap();
+            intent
+                .complete_with_retirement_hook(|| std::process::abort())
+                .unwrap();
+            panic!("restore intent retirement hook was not reached");
+        }
+        let _intent = intent;
         let mut sync_calls = 0;
         let _ = publish_restore_with(&staged, &target, &aside, true, |parent| {
             sync_calls += 1;
