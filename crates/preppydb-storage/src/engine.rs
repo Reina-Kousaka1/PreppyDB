@@ -2274,7 +2274,7 @@ fn repair_corrupt_wal_suffix(
             file.sync_all()
                 .map_err(|err| DbError::io("syncing repaired WAL segment", err))
         },
-        std::fs::remove_file,
+        |path| std::fs::remove_file(path),
         crate::snapshot::fsync_dir,
     )
 }
