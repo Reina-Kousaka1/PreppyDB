@@ -329,7 +329,11 @@ do
   local _, documents_err = missing_documents:scan("items")
   t:equal(documents_err.code, "invalid_response", "missing documents array is rejected")
 
-  local no_token = new_client({ json_response(200, { ok = true, data = {} }) }, { token = nil })
+  local no_token_transport = recorder({ json_response(200, { ok = true, data = {} }) })
+  local no_token = assert(preppydb.new({
+    url = "http://127.0.0.1:7077",
+    transport = no_token_transport,
+  }))
   local _, login_err = no_token:login("admin", "correct horse battery")
   t:equal(login_err.code, "invalid_response", "successful login without token is rejected")
   t:equal(no_token.token, nil, "malformed login never changes credentials")
