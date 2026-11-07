@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PreppyDB administration</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">PreppyDB <span class="version" id="version">…</span></div>
+  <div class="session">
+    <span id="who" class="who">not signed in</span>
+    <button id="signout" class="ghost" hidden>Sign out</button>
+  </div>
+</header>
+
+<main>
+  <section id="login-view" class="panel">
+    <h1>Sign in</h1>
+    <p class="muted">Use an admin token or a username/password account. Sessions are kept in
+    memory only and expire after 8 hours. Nothing is stored in cookies.</p>
+    <form id="login-form" autocomplete="off">
+      <label>Token
+        <input type="password" id="token" name="token" placeholder="paste an API token" autocomplete="off">
+      </label>
+      <div class="or">or</div>
+      <label>Username
+        <input type="text" id="username" name="username" autocomplete="username">
+      </label>
+      <label>Password
+        <input type="password" id="password" name="password" autocomplete="current-password">
+      </label>
+      <div class="actions">
+        <button type="submit" class="primary">Sign in</button>
+        <button type="button" id="use-token" class="ghost">Use token only</button>
+      </div>
+    </form>
+    <p id="login-error" class="error" hidden></p>
+  </section>
+
+  <section id="app-view" hidden>
+    <nav class="tabs">
+      <button data-tab="overview" class="tab active">Overview</button>
+      <button data-tab="collections" class="tab">Collections</button>
+      <button data-tab="pricing" class="tab">Pricing</button>
+      <button data-tab="personality" class="tab">Personality</button>
+      <button data-tab="maintenance" class="tab">Maintenance</button>
+    </nav>
+
+    <div id="tab-overview" class="tab-panel">
+      <h2>Database state</h2>
+      <div class="actions">
+        <button id="refresh-overview">Refresh</button>
+      </div>
+      <div id="overview" class="grid"></div>
+      <h2>Collections</h2>
+      <table id="overview-collections" class="table">
+        <thead><tr><th>Name</th><th>Documents</th><th>Live</th><th>Expired</th><th>Indexes</th><th>Schema</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div id="tab-collections" class="tab-panel" hidden>
+      <h2>Collections</h2>
+      <div class="row">
+        <label>New collection
+          <input id="new-collection" placeholder="name" autocomplete="off">
+        </label>
+        <button id="create-collection">Create</button>
+      </div>
+      <div class="row">
+        <label>Optional schema (JSON)
+          <textarea id="new-schema" rows="4" placeholder='{"type":"object","required":["name"]}'></textarea>
+        </label>
+      </div>
+      <ul id="collection-list" class="list"></ul>
+
+      <h2>Documents <span id="current-collection" class="muted"></span></h2>
+      <div class="row">
+        <input id="doc-prefix" placeholder="key prefix (optional)">
+        <button id="scan-docs">Scan</button>
+        <button id="new-doc">New document</button>
+      </div>
+      <div id="doc-editor" class="editor" hidden>
+        <label>Key <input id="doc-key"></label>
+        <label>Document (JSON)
+          <textarea id="doc-body" rows="10"></textarea>
+        </label>
+        <label>Expected version (optional, for compare-and-set)
+          <input id="doc-expected" type="number" min="0">
+        </label>
+        <div class="actions">
+          <button id="save-doc" class="primary">Save</button>
+          <button id="cancel-doc" class="ghost">Cancel</button>
+        </div>
+      </div>
+      <table id="documents" class="table">
+        <thead><tr><th>Key</th><th>Version</th><th>Value</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div id="tab-pricing" class="tab-panel" hidden>
+      <h2>Price rules</h2>
+      <p class="muted">Rule versions change only when a rule definition is edited, so
+      outstanding offers stay valid until the rule itself changes.</p>
+      <div class="row">
+        <button id="refresh-rules">Refresh</button>
+        <input id="rule-item" placeholder="item id">
+        <input id="rule-min" type="number" placeholder="min cents" min="1">
+        <input id="rule-max" type="number" placeholder="max cents" min="1">
+        <input id="rule-anchor" type="number" placeholder="anchor cents" min="1">
+        <button id="save-rule">Save rule</button>
+      </div>
+      <table id="rules" class="table">
+        <thead><tr><th>Item</th><th>Current</th><th>Min</th><th>Max</th><th>Version</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <h2>Price history</h2>
+      <div class="row">
+        <input id="history-item" placeholder="item id">
+        <button id="load-history">Load</button>
+      </div>
+      <table id="history" class="table">
+        <thead><tr><th>Item</th><th>Price</th><th>Previous</th><th>Rule version</th><th>At</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <h2>Audit log</h2>
+      <div class="row">
+        <button id="verify-audit">Verify integrity</button>
+        <button id="load-audit">Load entries</button>
+      </div>
+      <pre id="audit-out" class="output"></pre>
+    </div>
+
+    <div id="tab-personality" class="tab-panel" hidden>
+      <h2>Personality model</h2>
+      <p class="muted">Creates the documented collections (profiles, memories, diary, items,
+      themes, shop, pricing history) if they do not exist. Existing collections are never
+      overwritten.</p>
+      <div class="actions">
+        <button id="bootstrap">Create missing collections</button>
+        <button id="personality-overview">Overview</button>
+      </div>
+      <pre id="personality-out" class="output"></pre>
+    </div>
+
+    <div id="tab-maintenance" class="tab-panel" hidden>
+      <h2>Maintenance</h2>
+      <p class="muted">Destructive operations require confirmation and are recorded in the
+      server log. Backups are written inside the sandbox of the server process.</p>
+      <div class="actions">
+        <button id="checkpoint">Checkpoint</button>
+        <button id="compact">Compact</button>
+        <button id="sweep">Sweep expired</button>
+        <button id="verify">Verify (fsck)</button>
+      </div>
+      <div class="row">
+        <input id="backup-path" placeholder="/path/to/backup.bak">
+        <button id="backup">Create backup</button>
+      </div>
+      <pre id="maintenance-out" class="output"></pre>
+      <h2>Recovery notes</h2>
+      <pre id="recovery-out" class="output"></pre>
+    </div>
+  </section>
+</main>
+<script src="/assets/app.js"></script>
+</body>
+</html>

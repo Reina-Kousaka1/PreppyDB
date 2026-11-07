@@ -1,0 +1,369 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Treat compiler warnings as errors so the tree stays clean.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ------------------------------------------------------------------ Linux x86-64
+  linux-x86_64:
+    name: Linux x86-64 (fmt, clippy, tests)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-x86_64
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Formatting
+        run: |
+          set -o pipefail
+          cargo fmt --all --check 2>&1 | tee fmt.log || {
+            awk '/^Diff in / {print; n=4; next} n>0 {print; n--}' fmt.log | head -12 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          }
+
+      - name: Clippy
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee clippy.log || {
+            awk '/^error(\[|:)|^warning: / {print; n=4; next} n>0 {print; n--}' clippy.log | head -12 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          }
+
+      - name: Unit and integration tests
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked 2>&1 | tee tests.log || {
+            awk '/^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^---- / {print; n=2; next} n>0 {print; n--}' tests.log | head -12 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          }
+
+      - name: Ruby planner and Rust bridge
+        run: |
+          ruby engines/ruby/test_planner.rb
+          cargo test -p preppydb-server --features ruby-integration-tests --test ruby_planner_integration --locked
+          cargo test -p preppydb-server --features ruby-integration-tests --test api_integration ruby_query_endpoint --locked
+
+      - name: Build the binaries used by the end-to-end scripts
+        run: cargo build --locked --bin preppydb-server --bin preppydb
+
+      - name: Crash recovery (kill -9 a live server, restart, verify)
+        run: bash scripts/crash-recovery-test.sh
+
+      - name: Release build
+        run: cargo build --workspace --release --locked
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-linux-x86_64
+          path: |
+            target/release/preppydb-server
+            target/release/preppydb
+          if-no-files-found: error
+          retention-days: 14
+
+  # ----------------------------------------------------------------- Windows x86-64
+  windows-x86_64:
+    name: Windows x86-64 (build + tests)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x86_64
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Tests
+        shell: pwsh
+        run: |
+          cargo test --workspace --locked 2>&1 | Tee-Object -FilePath tests.log
+          if ($LASTEXITCODE -ne 0) {
+            $lines = Get-Content tests.log
+            $hits = @()
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^---- ') {
+                $hits += $lines[$i]
+                for ($j = 1; $j -le 2 -and ($i + $j) -lt $lines.Count; $j++) { $hits += $lines[$i + $j] }
+              }
+            }
+            $hits | Select-Object -First 12 | ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
+
+      - name: Ruby planner and Rust bridge
+        shell: pwsh
+        run: |
+          ruby engines/ruby/test_planner.rb
+          cargo test -p preppydb-server --features ruby-integration-tests --test ruby_planner_integration --locked
+          cargo test -p preppydb-server --features ruby-integration-tests --test api_integration ruby_query_endpoint --locked
+
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-log
+          path: |
+            tests.log
+            ${{ runner.temp }}/smoke-server.out
+            ${{ runner.temp }}/smoke-server.err
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Release build
+        run: cargo build --workspace --release --locked
+
+      # A short smoke test proves the server actually starts on Windows and serves HTTP.
+      - name: Smoke test (PowerShell)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $data = Join-Path $env:RUNNER_TEMP "preppydb-smoke"
+          $out = Join-Path $env:RUNNER_TEMP "smoke-server.out"
+          $err = Join-Path $env:RUNNER_TEMP "smoke-server.err"
+          $server = $null
+          $stage = "initialization"
+          try {
+            $init = & .\target\release\preppydb-server.exe --data-dir $data --bootstrap-token ci --init-only 2>&1
+            # Pick the token by shape (32 random bytes, base64url) rather than by line number.
+            $token = ($init | Where-Object { $_ -match '^[A-Za-z0-9_-]{40,}$' } | Select-Object -First 1)
+            if (-not $token) { throw "no bootstrap token was printed" }
+            # Mask before writing any initialization output: init includes the one-time secret.
+            Write-Host "::add-mask::$token"
+            $init | Where-Object { $_ -notmatch '^[A-Za-z0-9_-]{40,}$' } | ForEach-Object { Write-Host "init: $_" }
+            $server = Start-Process -FilePath .\target\release\preppydb-server.exe `
+                -ArgumentList "--data-dir", $data, "--listen", "127.0.0.1:7070" `
+                -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+            $healthy = $false
+            $closeHeaders = @{ Connection = "close" }
+            $stage = "health check"
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Milliseconds 500
+              if ($server.HasExited) {
+                throw "server exited with code $($server.ExitCode) before becoming healthy"
+              }
+              try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:7070/healthz" -Headers $closeHeaders -TimeoutSec 2
+                if ($health.status -eq "ok") { $healthy = $true; break }
+              } catch { }
+            }
+            if (-not $healthy) { throw "server did not become healthy" }
+            $headers = @{ Authorization = "Bearer $token"; Connection = "close" }
+            $stage = "create collection"
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections" `
+                -Headers $headers -ContentType "application/json" -Body '{"name":"windows_smoke"}' | Out-Null
+            $stage = "insert document"
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents" `
+                -Headers $headers -ContentType "application/json" -Body '{"key":"k","value":{"ok":true}}' | Out-Null
+            $stage = "read document"
+            $doc = Invoke-RestMethod -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents/k" -Headers $headers
+            if ($doc.data.value.ok -ne $true) { throw "document did not round-trip" }
+            Write-Host "smoke test passed"
+          } catch {
+            Write-Host "::error::Smoke test failed during $stage`: $($_.Exception.ToString())"
+            if ($server -and $server.HasExited) { Write-Host "server-exit-code: $($server.ExitCode)" }
+            if (Test-Path $out) { Get-Content $out -Tail 30 | ForEach-Object { Write-Host "server-out: $_" } }
+            if (Test-Path $err) { Get-Content $err -Tail 30 | ForEach-Object { Write-Host "server-err: $_" } }
+            exit 1
+          } finally {
+            if ($server -and -not $server.HasExited) {
+              Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+  # -------------------------------------------------- Linux ARM64 (build + emulated tests)
+  linux-arm64:
+    name: Linux ARM64 (build, emulated tests)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-arm64
+
+      - name: Cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
+
+      - name: Build for aarch64
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: cargo build --workspace --locked --target aarch64-unknown-linux-gnu
+
+      # These tests run under qemu-user, i.e. emulated ARM64 — not on a Raspberry Pi.
+      # Real-hardware validation is listed as an open item in docs/TESTING.md.
+      - name: Tests under qemu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
+          # The crash test re-executes the test binary; qemu-user cannot do that without
+          # binfmt_misc. It runs on the native x86-64 and Windows jobs instead.
+          PREPPYDB_SKIP_CHILD_CRASH: "1"
+        run: |
+          set -o pipefail
+          if ! cargo test --workspace --locked --target aarch64-unknown-linux-gnu 2>&1 | tee qemu-test.log; then
+            # GitHub keeps only a handful of annotations per step, so print the failing
+            # test names, compiler errors and panic messages (plus two lines of context).
+            awk '/^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^---- |Exec format/ {print; n=2; next} n>0 {print; n--}' \
+              qemu-test.log | head -12 | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
+
+      - name: Upload qemu test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-test-log
+          path: qemu-test.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ------------------------------------------------------------------- Lua client
+  lua-client:
+    name: Lua/Luvit client (offline + live)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lua-client
+
+      - name: Install lupa and luvit
+        run: |
+          set -o pipefail
+          python3 -m pip install --user lupa
+          RUNTIME=$(mktemp -d "$RUNNER_TEMP/preppydb-lua.XXXXXXXX")
+          curl -fLsS https://github.com/luvit/luvi/releases/download/v2.14.0/luvi-regular-Linux_x86_64 -o "$RUNTIME/luvi"
+          echo "f79614b208f7999030a13fca22ffeb91c3d880487be2b5b7e2425ab42ec7a1d0  $RUNTIME/luvi" | sha256sum -c -
+          chmod +x "$RUNTIME/luvi"
+          git clone --no-checkout https://github.com/luvit/lit.git "$RUNTIME/lit-src"
+          git -C "$RUNTIME/lit-src" checkout --detach 84fc5d729f1088b3b93bc9a55d1f7a245bca861d
+          git -C "$RUNTIME/lit-src" submodule update --init --recursive
+          test "$(git -C "$RUNTIME/lit-src" rev-parse HEAD)" = 84fc5d729f1088b3b93bc9a55d1f7a245bca861d
+          (cd "$RUNTIME/lit-src" && "$RUNTIME/luvi" . -- make . "$RUNTIME/lit" "$RUNTIME/luvi")
+          git clone --no-checkout https://github.com/luvit/luvit.git "$RUNTIME/luvit-src"
+          git -C "$RUNTIME/luvit-src" checkout --detach 8e5a6aca15b1e5bec2398a4dadc622aea4ead7ec
+          git -C "$RUNTIME/luvit-src" submodule update --init --recursive
+          test "$(git -C "$RUNTIME/luvit-src" rev-parse HEAD)" = 8e5a6aca15b1e5bec2398a4dadc622aea4ead7ec
+          (cd "$RUNTIME/luvit-src" && "$RUNTIME/lit" make . "$RUNTIME/luvit" "$RUNTIME/luvi")
+          "$RUNTIME/luvit" --version
+          echo "$RUNTIME" >> "$GITHUB_PATH"
+
+      - name: Real Luvit transport against local test server
+        run: luvit clients/luvit/tests/test_transport_live.lua
+
+      - name: Build server
+        run: cargo build --locked -p preppydb-server
+
+      - name: Start server and run the Lua suites
+        run: |
+          DATA=$(mktemp -d)
+          ./target/debug/preppydb-server --data-dir "$DATA" --bootstrap-token ci --init-only > /tmp/init.txt
+          TOKEN=$(sed -n '2p' /tmp/init.txt)
+          ./target/debug/preppydb-server --data-dir "$DATA" --listen 127.0.0.1:7077 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:7077/healthz > /dev/null; then break; fi
+            sleep 0.5
+          done
+          PREPPYDB_URL=http://127.0.0.1:7077 PREPPYDB_TOKEN="$TOKEN" \
+            python3 clients/luvit/tests/run_with_lupa.py --live
+
+      - name: Luvit transport against PreppyDB
+        run: bash clients/luvit/tests/run_live_server.sh
+
+  # --------------------------------------------------------------------- Docker
+  docker-images:
+    name: Docker images (amd64 + arm64, never pushed)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      # push: false is deliberate. Publishing images needs an explicit maintainer
+      # decision; this workflow only proves that both architectures build.
+      - name: Build multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  docker-persistence:
+    name: Docker persistence (restart + recreate)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build amd64 image
+        run: docker build -f docker/Dockerfile -t preppydb:ci .
+      - name: Persistence test
+        env:
+          IMAGE: preppydb:ci
+        run: |
+          set -o pipefail
+          if ! bash -x scripts/docker-persistence-test.sh 2>&1 | tee persistence.log; then
+            grep -nE 'FAIL:|exit=|writable|refusing|preppydb:|Error|error' persistence.log \
+              | head -10 | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
+
+      - name: Upload persistence log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-persistence-log
+          path: persistence.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # --------------------------------------------------------------------- summary
+  ci-status:
+    name: CI status
+    runs-on: ubuntu-22.04
+    needs: [linux-x86_64, windows-x86_64, linux-arm64, lua-client, docker-images, docker-persistence]
+    if: always()
+    steps:
+      - name: Fail if any job failed
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "one or more jobs failed"
+            exit 1
+          fi
+          echo "all jobs passed"

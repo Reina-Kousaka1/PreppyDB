@@ -1,0 +1,22 @@
+[package]
+name = "preppydb-cli"
+description = "Administration and diagnostics CLI for PreppyDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "preppydb"
+path = "src/main.rs"
+
+[dependencies]
+preppydb-json.workspace = true
+preppydb-crypto.workspace = true
+preppydb-storage.workspace = true
+preppydb-pricing.workspace = true
+preppydb-model.workspace = true
+preppydb-client.workspace = true
+preppydb-server.workspace = true

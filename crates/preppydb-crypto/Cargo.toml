@@ -1,0 +1,12 @@
+[package]
+name = "preppydb-crypto"
+description = "Auditable crypto/checksum primitives and OS entropy source for PreppyDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+getrandom = "0.4.3"
