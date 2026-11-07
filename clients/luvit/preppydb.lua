@@ -500,10 +500,16 @@ end
 
 local Client = {}
 Client.__index = Client
+local MAX_RETRIES = 10
 
 local function valid_bearer_token(token)
   return type(token) == "string" and #token > 0 and #token <= 512
     and token:match("^[A-Za-z0-9._~+/%-]+=*$") ~= nil
+end
+
+local function valid_retry_count(retries)
+  return type(retries) == "number" and retries == retries
+    and retries >= 0 and retries <= MAX_RETRIES and retries == math.floor(retries)
 end
 
 --- Create a client.
@@ -520,6 +526,11 @@ function preppydb.new(options)
   end
   if options.token ~= nil and not valid_bearer_token(options.token) then
     return nil, "token must contain 1–512 permitted ASCII bytes"
+  end
+  local retries = options.retries
+  if retries == nil then retries = 0 end
+  if not valid_retry_count(retries) then
+    return nil, "retries must be an integer between 0 and " .. MAX_RETRIES
   end
   local response_limit = options.max_response_bytes or 16 * 1024 * 1024
   if type(response_limit) ~= "number" or response_limit < 0 or response_limit ~= math.floor(response_limit) or response_limit > 2147483647 then
@@ -543,7 +554,7 @@ function preppydb.new(options)
     token = options.token,
     timeout_ms = options.timeout or 10000,
     max_response_bytes = response_limit,
-    retries = options.retries or 0,
+    retries = retries,
     wait = options.wait,
     transport = transport,
   }, Client)
@@ -597,7 +608,18 @@ function Client:call(method, path, body, options)
     timeout_ms = (options and options.timeout) or self.timeout_ms,
     max_response_bytes = self.max_response_bytes,
   }
-  local attempts = 1 + (options and options.retries or self.retries or 0)
+  local retries = self.retries
+  if options and options.retries ~= nil then
+    retries = options.retries
+  end
+  if not valid_retry_count(retries) then
+    return nil, {
+      code = "invalid_argument",
+      message = "retries must be an integer between 0 and " .. MAX_RETRIES,
+      retryable = false,
+    }
+  end
+  local attempts = 1 + retries
   local last_error
   for attempt = 1, attempts do
     if options and options.on_request then

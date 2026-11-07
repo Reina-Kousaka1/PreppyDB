@@ -74,6 +74,25 @@ do
   end
 end
 
+do
+  for _, retries in ipairs({ -1, 1.5, 11, math.huge, 0 / 0, "2" }) do
+    local transport, calls = recorder({})
+    local rejected, err = preppydb.new({
+      url = "http://127.0.0.1:7077",
+      retries = retries,
+      transport = transport,
+    })
+    t:equal(rejected, nil, "constructor rejects invalid retry count")
+    t:truthy(type(err) == "string", "invalid retry count returns configuration error")
+    t:equal(#calls, 0, "invalid retry count is rejected before transport")
+  end
+
+  local client, calls = new_client({})
+  local _, err = client:call("GET", "/healthz", nil, { retries = math.huge })
+  t:equal(err and err.code, "invalid_argument", "per-call retry override is bounded")
+  t:equal(#calls, 0, "invalid retry override does not issue a request")
+end
+
 -- ------------------------------------------------------------- happy paths
 do
   local client, calls = new_client({

@@ -121,7 +121,8 @@ end)
 
 ## Retries
 
-`db:retries = N` (or `{ retries = N }`) retries only explicit `429` rate-limit responses.
+`db:retries = N` (or `{ retries = N }`) accepts an integer from 0 to 10 and retries only
+explicit `429` rate-limit responses. Per-call overrides use the same bound.
 Transport errors and `5xx` responses are not retried automatically because the server may
 have applied a write before the response was lost or failed. A `409` conflict also needs
 caller reconciliation. Retry those cases only after checking the operation's outcome or
