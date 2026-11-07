@@ -2,7 +2,8 @@
 //!
 //! The storage crate keeps `unsafe` forbidden. This crate confines the Win32 FFI to
 //! two path operations and uses `MOVEFILE_WRITE_THROUGH` so the call does not return
-//! before Windows reports that the rename has reached disk.
+//! before Windows reports that the rename has reached disk. This does not claim that
+//! every parent or ancestor directory entry is durable across sudden power loss.
 
 #![cfg(windows)]
 #![allow(unsafe_code)]
@@ -47,4 +48,78 @@ fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
     }
     encoded.push(0);
     Ok(encoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "preppydb-winfs-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn move_path_does_not_replace_an_existing_destination() {
+        let dir = temp_dir("no-replace");
+        let source = dir.join("source");
+        let destination = dir.join("destination");
+        std::fs::write(&source, b"source bytes").unwrap();
+        std::fs::write(&destination, b"destination bytes").unwrap();
+
+        assert!(move_path(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"destination bytes");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replace_file_publishes_the_complete_source_and_removes_its_old_name() {
+        let dir = temp_dir("replace");
+        let source = dir.join("manifest.tmp");
+        let destination = dir.join("manifest.json");
+        std::fs::write(&source, b"complete new manifest").unwrap();
+        std::fs::write(&destination, b"old manifest").unwrap();
+
+        replace_file(&source, &destination).unwrap();
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"complete new manifest"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn move_path_publishes_a_directory_tree_as_one_path_operation() {
+        let dir = temp_dir("directory");
+        let source = dir.join("staged");
+        let destination = dir.join("live");
+        std::fs::create_dir_all(source.join("wal")).unwrap();
+        std::fs::write(source.join("wal").join("000000000001.wal"), b"wal bytes").unwrap();
+
+        move_path(&source, &destination).unwrap();
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(destination.join("wal").join("000000000001.wal")).unwrap(),
+            b"wal bytes"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn win32_paths_with_nul_are_rejected_before_ffi() {
+        let error = wide_path(Path::new("invalid\0path")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
 }
