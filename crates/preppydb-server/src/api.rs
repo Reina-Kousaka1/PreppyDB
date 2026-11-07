@@ -535,15 +535,20 @@ impl ApiState {
                 })
             }
             ("GET", ["v1", "collections", name]) => {
-                self.with_role(principal, Role::Read, "reading a collection", || match self
-                    .engine
-                    .collection_meta(name)
-                {
-                    Ok(meta) => ok_data(Json::obj().with("collection", meta.to_json()).with(
-                        "documents",
-                        Json::uint(self.engine.count(name).unwrap_or(0) as u64),
-                    )),
-                    Err(err) => db_error(err),
+                self.with_role(principal, Role::Read, "reading a collection", || {
+                    let meta = match self.engine.collection_meta(name) {
+                        Ok(meta) => meta,
+                        Err(err) => return db_error(err),
+                    };
+                    let count = match self.engine.count(name) {
+                        Ok(count) => count,
+                        Err(err) => return db_error(err),
+                    };
+                    ok_data(
+                        Json::obj()
+                            .with("collection", meta.to_json())
+                            .with("documents", Json::uint(count as u64)),
+                    )
                 })
             }
             ("DELETE", ["v1", "collections", name]) => {
