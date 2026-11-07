@@ -555,9 +555,9 @@ local function error_from(status, body)
     code = parsed.error.code or code
     message = parsed.error.message or message
   end
-  -- 408, 409, 425 and 429 are safe to retry: nothing was half-applied.
-  local retryable = status == 408 or status == 409 or status == 425 or status == 429
-    or (status and status >= 500)
+  -- A 5xx can follow a committed side effect, and a conflict needs caller
+  -- reconciliation. Only the server's explicit rate-limit response is safe to retry.
+  local retryable = status == 429
   return { status = status, code = code, message = message, retryable = retryable }
 end
 
@@ -618,14 +618,15 @@ function Client:call(method, path, body, options)
         code = "transport_incomplete",
         message = "the transport did not deliver a response; pass options.wait "
           .. "for asynchronous transports",
-        retryable = true,
+        retryable = false,
       }
     end
     if status ~= nil and (type(response_body) ~= "string" or #response_body > self.max_response_bytes) then
       return nil, { code = "invalid_response", message = "response body exceeds configured limit", retryable = false }
     end
     if status == nil then
-      last_error = { code = "transport_error", message = tostring(response_body), retryable = true }
+      -- The request may have reached the server even when its response did not.
+      last_error = { code = "transport_error", message = tostring(response_body), retryable = false }
     elseif status >= 200 and status < 300 then
       if response_body == "" then
         return {}, nil
@@ -690,7 +691,8 @@ function Client:call_async(method, path, body, callback)
     max_response_bytes = self.max_response_bytes,
   }, function(status, response_body, response_headers)
     if status == nil then
-      callback(nil, { code = "transport_error", message = tostring(response_body), retryable = true })
+      -- The request may have reached the server even when its response did not.
+      callback(nil, { code = "transport_error", message = tostring(response_body), retryable = false })
       return
     end
     if type(response_body or "") ~= "string" or #(response_body or "") > self.max_response_bytes then

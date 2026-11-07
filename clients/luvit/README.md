@@ -51,7 +51,7 @@ Everything returns `result, err`:
 * `result` — the unwrapped `data` payload of the response (`/healthz` and `/v1/version`
   answer flat and are returned as they come);
 * `err` — `{ status, code, message, retryable }`, or a transport error such as
-  `{ code = "transport_error", message = "...", retryable = true }`.
+  `{ code = "transport_error", message = "...", retryable = false }`.
 
 Only `get` is special: a `404` means "no such document" and returns `nil, nil`.
 
@@ -121,9 +121,11 @@ end)
 
 ## Retries
 
-`db:retries = N` (or `{ retries = N }`) retries only errors marked `retryable`
-(`409 conflict`, `408`, `425`, `429`, `5xx`, transport failures). Non-retryable errors
-such as `401` are returned immediately.
+`db:retries = N` (or `{ retries = N }`) retries only explicit `429` rate-limit responses.
+Transport errors and `5xx` responses are not retried automatically because the server may
+have applied a write before the response was lost or failed. A `409` conflict also needs
+caller reconciliation. Retry those cases only after checking the operation's outcome or
+proving the operation is idempotent.
 
 ## Tests
 

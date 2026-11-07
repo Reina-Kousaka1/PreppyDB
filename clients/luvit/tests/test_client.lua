@@ -199,7 +199,7 @@ do
   })
   local _, err = client:put("c", "k", { a = 1 }, 7)
   t:equal(err.code, "conflict", "conflict code")
-  t:equal(err.retryable, true, "conflicts are retryable")
+  t:equal(err.retryable, false, "conflicts require caller reconciliation")
   t:equal(err.status, 409, "conflict status")
 end
 
@@ -211,17 +211,18 @@ do
 end
 
 do
-  -- Non-JSON error pages must not raise.
+  -- Non-JSON 5xx pages are returned without assuming the operation is safe to retry.
   local client = new_client({ { status = 502, body = "<html>bad gateway</html>" } })
   local _, err = client:stats()
   t:equal(err.message, "<html>bad gateway</html>", "raw body is used as the message")
+  t:equal(err.retryable, false, "5xx errors may follow a side effect")
 end
 
 do
-  -- Retries: two failures then success.
+  -- Explicit rate-limit responses can be retried, then eventually succeed.
   local client, calls = new_client({
-    { status = 503, body = "unavailable" },
-    { status = 503, body = "unavailable" },
+    { status = 429, body = "rate limited" },
+    { status = 429, body = "rate limited" },
     json_response(200, { data = { ok = true } }),
   }, { retries = 2 })
   local stats = client:stats()
@@ -237,11 +238,12 @@ do
 end
 
 do
-  -- Transport failures are reported as transport_error and are retryable.
-  local client = new_client({ { transport_error = "connection refused" } }, { retries = 0 })
+  -- A transport failure may happen after a write was committed; never auto-retry it.
+  local client, calls = new_client({ { transport_error = "connection reset" } }, { retries = 5 })
   local _, err = client:stats()
   t:equal(err.code, "transport_error", "transport failures have their own code")
-  t:equal(err.retryable, true, "transport failures are retryable")
+  t:equal(err.retryable, false, "transport outcomes may be unknown")
+  t:equal(#calls, 1, "transport failure is not automatically repeated")
 end
 
 do

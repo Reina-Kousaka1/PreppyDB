@@ -60,10 +60,12 @@ impl ClientError {
     /// Whether the same request could succeed later.
     pub fn is_retryable(&self) -> bool {
         match self {
-            ClientError::Api { status, code, .. } => {
-                *status == 429 || *status == 503 || code == "conflict"
-            }
-            ClientError::Transport(_) => true,
+            // A transport error can happen after the server committed a write and
+            // before its response reached us. Likewise, some 5xx responses are
+            // emitted after a side effect (for example, an audit append failure).
+            // Only an explicit rate-limit response is known to precede the request.
+            ClientError::Api { status, .. } => *status == 429,
+            ClientError::Transport(_) => false,
             _ => false,
         }
     }
@@ -857,11 +859,23 @@ mod tests {
             code: "conflict".into(),
             message: "stale".into(),
         };
-        assert!(error.is_retryable());
+        assert!(!error.is_retryable());
         assert_eq!(error.status(), Some(409));
         assert_eq!(error.code(), Some("conflict"));
+        let unavailable = ClientError::Api {
+            status: 503,
+            code: "audit_unavailable".into(),
+            message: "write may already be committed".into(),
+        };
+        assert!(!unavailable.is_retryable());
+        let rate_limited = ClientError::Api {
+            status: 429,
+            code: "rate_limited".into(),
+            message: "try later".into(),
+        };
+        assert!(rate_limited.is_retryable());
         let transport = ClientError::Transport("down".into());
-        assert!(transport.is_retryable());
+        assert!(!transport.is_retryable());
         assert_eq!(transport.status(), None);
     }
 }
