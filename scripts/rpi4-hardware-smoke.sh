@@ -113,7 +113,7 @@ run_limited() {
     local result=0
     check_resources
     prlimit --as="$AS_BYTES" --cpu="$CPU_LIMIT_SECONDS" \
-        --fsize="$FILE_BYTES" --nofile=128 -- "$@" &
+        --fsize="$FILE_BYTES" --core=0 --nofile=128 -- "$@" &
     LIMITED_PID=$!
     monitor_server "$LIMITED_PID" &
     MONITOR_PID=$!
@@ -186,7 +186,7 @@ monitor_server() {
 start_server() {
     : > "$SERVER_LOG"
     prlimit --as="$AS_BYTES" --cpu="$CPU_LIMIT_SECONDS" \
-        --fsize="$FILE_BYTES" --nofile=128 -- \
+        --fsize="$FILE_BYTES" --core=0 --nofile=128 -- \
         "$SERVER" --data-dir "$1" --listen 127.0.0.1:0 >> "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
     monitor_server "$SERVER_PID" &

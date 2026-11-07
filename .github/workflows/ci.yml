@@ -35,8 +35,10 @@ jobs:
         with:
           ruby-version: '3.3'
 
-      - name: Raspberry Pi smoke script syntax
-        run: bash -n scripts/rpi4-hardware-smoke.sh
+      - name: Raspberry Pi smoke script syntax and resource limits
+        run: |
+          bash -n scripts/rpi4-hardware-smoke.sh
+          prlimit --as=536870912 --cpu=30 --fsize=33554432 --core=0 --nofile=128 -- true
 
       - name: Formatting
         run: |
