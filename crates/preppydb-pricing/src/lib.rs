@@ -56,6 +56,7 @@ pub type Result<T> = std::result::Result<T, PricingError>;
 pub mod codes {
     pub const INVALID_RULE: &str = "invalid_price_rule";
     pub const OUT_OF_BOUNDS: &str = "price_out_of_bounds";
+    pub const INVALID_OFFER: &str = "invalid_price_offer";
     pub const OFFER_STALE: &str = "offer_stale";
     pub const OFFER_EXPIRED: &str = "offer_expired";
     pub const OFFER_UNKNOWN: &str = "offer_unknown";
@@ -363,6 +364,53 @@ pub struct PriceOffer {
 }
 
 impl PriceOffer {
+    pub fn from_json(value: &Json) -> Result<PriceOffer> {
+        let invalid = |field: &str| {
+            PricingError::new(
+                codes::INVALID_OFFER,
+                format!("stored offer is missing a valid '{field}'"),
+            )
+        };
+        let offer_id = value
+            .get_str("offer_id")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid("offer_id"))?
+            .to_string();
+        let item_id = value
+            .get_str("item_id")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| invalid("item_id"))?
+            .to_string();
+        let price_cents = value
+            .get_i64("price_cents")
+            .ok_or_else(|| invalid("price_cents"))?;
+        let rule_version = value
+            .get("rule_version")
+            .and_then(Json::as_u64)
+            .ok_or_else(|| invalid("rule_version"))?;
+        let created_at = value
+            .get_i64("created_at")
+            .ok_or_else(|| invalid("created_at"))?;
+        let expires_at = match value.get("expires_at") {
+            Some(Json::Null) => None,
+            Some(expiry) => Some(expiry.as_i64().ok_or_else(|| invalid("expires_at"))?),
+            None => return Err(invalid("expires_at")),
+        };
+        let redeemed = value
+            .get("redeemed")
+            .and_then(Json::as_bool)
+            .ok_or_else(|| invalid("redeemed"))?;
+        Ok(PriceOffer {
+            offer_id,
+            item_id,
+            price_cents,
+            rule_version,
+            created_at,
+            expires_at,
+            redeemed,
+        })
+    }
+
     pub fn to_json(&self) -> Json {
         Json::obj()
             .with("offer_id", Json::str(self.offer_id.clone()))
@@ -1314,6 +1362,23 @@ mod tests {
         redeemed.redeemed = true;
         let err = engine.redeem_offer(&rule, &redeemed, 1, 2000).unwrap_err();
         assert_eq!(err.code, codes::OFFER_REDEEMED);
+    }
+
+    #[test]
+    fn stored_offers_require_all_state_fields() {
+        let mut engine = PricingEngine::with_seed(b"stored-offer");
+        let offer = engine.create_offer(&rule(), 1000, None).unwrap();
+        assert_eq!(PriceOffer::from_json(&offer.to_json()).unwrap(), offer);
+
+        let mut missing_redeemed = offer.to_json();
+        missing_redeemed.as_object_mut().unwrap().remove("redeemed");
+        let err = PriceOffer::from_json(&missing_redeemed).unwrap_err();
+        assert_eq!(err.code, codes::INVALID_OFFER);
+
+        let mut missing_expiry = offer.to_json();
+        missing_expiry.as_object_mut().unwrap().remove("expires_at");
+        let err = PriceOffer::from_json(&missing_expiry).unwrap_err();
+        assert_eq!(err.code, codes::INVALID_OFFER);
     }
 
     #[test]

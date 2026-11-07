@@ -2009,30 +2009,14 @@ impl ApiState {
             }
             Err(err) => return db_error(err),
         };
-        let item = match offer_doc.value.get_str("item_id") {
-            Some(item) => item.to_string(),
-            None => return Response::error(500, "internal", "stored offer is malformed"),
+        let offer = match preppydb_pricing::PriceOffer::from_json(&offer_doc.value) {
+            Ok(offer) if offer.offer_id == offer_id => offer,
+            _ => return Response::error(500, "internal", "stored offer is malformed"),
         };
+        let item = offer.item_id.clone();
         let (rule, _current) = match self.load_rule(&item) {
             Ok(loaded) => loaded,
             Err(response) => return response,
-        };
-        let offer = preppydb_pricing::PriceOffer {
-            offer_id: offer_id.clone(),
-            item_id: item.clone(),
-            price_cents: offer_doc.value.get_i64("price_cents").unwrap_or(0),
-            rule_version: offer_doc
-                .value
-                .get("rule_version")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0),
-            created_at: offer_doc.value.get_i64("created_at").unwrap_or(0),
-            expires_at: offer_doc.value.get("expires_at").and_then(|v| v.as_i64()),
-            redeemed: offer_doc
-                .value
-                .get("redeemed")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
         };
         let purchase = {
             let mut pricing = self.pricing.lock().unwrap_or_else(|err| err.into_inner());
