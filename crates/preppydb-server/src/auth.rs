@@ -12,7 +12,7 @@ use preppydb_crypto::pbkdf2::{pbkdf2_hmac_sha256, DEFAULT_ITERATIONS};
 use preppydb_crypto::rng::os_random;
 use preppydb_crypto::{constant_time_eq, hex_decode, hex_encode, sha256};
 use preppydb_json::Json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -372,6 +372,28 @@ fn parse_credentials(text: &str) -> Result<(Vec<UserRecord>, Vec<TokenRecord>)> 
         })
         .transpose()?
         .unwrap_or_default();
+
+    let mut usernames = BTreeSet::new();
+    if users
+        .iter()
+        .any(|user| !usernames.insert(user.username.as_str()))
+    {
+        return Err(AuthError("auth file contains duplicate usernames".into()));
+    }
+    let mut token_ids = BTreeSet::new();
+    let mut token_hashes = BTreeSet::new();
+    for token in &tokens {
+        if !token_ids.insert(token.id.as_str()) {
+            return Err(AuthError("auth file contains duplicate token ids".into()));
+        }
+        let hash = hex_decode(&token.hash_hex)
+            .map_err(|_| AuthError("auth file contains an invalid token hash".into()))?;
+        if !token_hashes.insert(hash) {
+            return Err(AuthError(
+                "auth file contains duplicate token hashes".into(),
+            ));
+        }
+    }
     Ok((users, tokens))
 }
 
@@ -1198,6 +1220,31 @@ mod tests {
 
         let mut value = preppydb_json::parse(&original).unwrap();
         value.set("format_version", Json::int(2));
+        assert!(parse_credentials(&value.to_string()).is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_credential_identities_fail_closed() {
+        let (mut store, dir) = store("duplicate-identities");
+        store
+            .create_user("admin", "correct horse battery", vec![Role::Admin])
+            .unwrap();
+        store
+            .create_token("service", vec![Role::Write], None)
+            .unwrap();
+
+        let mut value =
+            preppydb_json::parse(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
+        let user = value.get("users").unwrap().as_array().unwrap()[0].clone();
+        value.set("users", Json::array(vec![user.clone(), user]));
+        assert!(parse_credentials(&value.to_string()).is_err());
+
+        let mut value =
+            preppydb_json::parse(&std::fs::read_to_string(store.path()).unwrap()).unwrap();
+        let token = value.get("tokens").unwrap().as_array().unwrap()[0].clone();
+        value.set("tokens", Json::array(vec![token.clone(), token]));
         assert!(parse_credentials(&value.to_string()).is_err());
 
         std::fs::remove_dir_all(dir).unwrap();
