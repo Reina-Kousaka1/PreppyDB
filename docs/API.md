@@ -363,6 +363,7 @@ See [DYNAMIC-PRICING.md](DYNAMIC-PRICING.md) for invariants.
 | `conflict` | 409 | **yes** | version/commit conflict or duplicate name |
 | `collection_exists` / `index_exists` | 409 | no | name already taken |
 | `offer_stale` / `offer_expired` / `offer_already_redeemed` | 409 | no | pricing state changed |
+| `offer_id_collision` | 409 | no | generated offer id is already present; no write occurred |
 | `invalid_request` / `invalid_json` / `invalid_query` | 400 | no | malformed request |
 | `validation_failed` | 400 | no | schema or field validation failed |
 | `body_too_large` | 413 | no | body over `max_body_bytes` |

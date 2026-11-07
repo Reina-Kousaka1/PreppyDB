@@ -83,10 +83,10 @@ On success a `Purchase` is written **and** the offer is marked redeemed inside o
 transaction, so a crash cannot produce a redeemed offer without a purchase or a purchase
 without the offer being consumed.
 
-Purchases live in the immutable `purchases` collection: the API refuses to overwrite an
-existing purchase key (`409 immutable_collection`) and refuses deletes
-(`403 immutable_collection`). The recorded `price_cents` is exactly what the customer was
-quoted, forever.
+Purchases live in the managed, append-only `purchases` collection. Generic collection
+write, batch, Lua, create and drop routes reject all pricing collections; pricing changes
+must go through the pricing API so they receive an audit intent. The recorded
+`price_cents` is exactly what the customer was quoted, forever.
 
 ## Audit log
 
@@ -106,12 +106,16 @@ AuditEntry { seq, kind, at, detail, previous_hash, hash }
 entry breaks it and is reported instead of being ignored. The log is append-only from the
 server's point of view — there is no rotate/truncate endpoint.
 
-If the process stops after a start record but before its terminal record, the outcome
-is unresolved. On restart, the admin recovery report lists that intent and pricing
-mutations are blocked with `503 audit_outcome_unknown` until an operator inspects the
-database and audit state. The system does not infer success, invent a terminal record,
-or retry the operation. If writing the start record fails, the database mutation does
-not begin.
+If the process stops after a start record but before its terminal record, the server
+compares the complete expected documents and their before-images with the recovered
+database state. It records `committed` only when every expected document matches and the
+after-image differs from the before-image; it records `aborted` only when every before-
+image still matches. It never replays a pricing mutation. A mismatch, unavailable
+document, ambiguous no-op, or legacy intent without a recovery descriptor stays pending,
+appears in the admin recovery report, and blocks further pricing writes with
+`503 audit_outcome_unknown`. If writing the start record fails, the database mutation
+does not begin. The database and audit log remain separate files, so unclassifiable
+outcomes are deliberately left for operator investigation.
 
 Audit records are streamed and verified one at a time on open and explicit verify; a
 record is limited to 1 MiB and parsed with bounded JSON depth/item limits. The in-memory

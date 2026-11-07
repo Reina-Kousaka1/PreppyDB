@@ -1932,6 +1932,13 @@ impl ApiState {
             Ok(doc) => doc.map(|doc| doc.value),
             Err(error) => return db_error(error),
         };
+        if previous_offer.is_some() {
+            return Response::error(
+                409,
+                "offer_id_collision",
+                "generated offer identifier already exists; no offer was changed",
+            );
+        }
         if let Err(response) = self.audit_transition_with_recovery(
             &operation_id,
             "started",
@@ -2601,6 +2608,149 @@ mod tests {
         assert!(outcomes.contains(&("pricing_operation_aborted", "abort")));
 
         drop(reopened);
+        drop(audit);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn purchase_recovery_requires_both_transaction_documents() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "preppydb-purchase-recovery-{}-{}",
+            std::process::id(),
+            preppydb_storage::clock::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Engine::open(preppydb_storage::engine::EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("purchases", 1))
+            .unwrap();
+        engine
+            .create_collection(CollectionMeta::new("price_offers", 1))
+            .unwrap();
+
+        let redeemed_offer = Json::obj()
+            .with("offer_id", Json::str("offer-committed"))
+            .with("redeemed", Json::Bool(true))
+            .with("purchase_id", Json::str("purchase-committed"));
+        let committed_purchase = Json::obj().with("purchase_id", Json::str("purchase-committed"));
+        engine
+            .put(
+                "price_offers",
+                "offer-committed",
+                redeemed_offer.clone(),
+                PutOptions::default(),
+            )
+            .unwrap();
+
+        let open_aborted = Json::obj()
+            .with("offer_id", Json::str("offer-aborted"))
+            .with("redeemed", Json::Bool(false));
+        let redeemed_aborted = open_aborted
+            .clone()
+            .with("redeemed", Json::Bool(true))
+            .with("purchase_id", Json::str("purchase-aborted"));
+        engine
+            .put(
+                "price_offers",
+                "offer-aborted",
+                open_aborted.clone(),
+                PutOptions::default(),
+            )
+            .unwrap();
+
+        let open_mixed = Json::obj()
+            .with("offer_id", Json::str("offer-mixed"))
+            .with("redeemed", Json::Bool(false));
+        let redeemed_mixed = open_mixed
+            .clone()
+            .with("redeemed", Json::Bool(true))
+            .with("purchase_id", Json::str("purchase-mixed"));
+        let mixed_purchase = Json::obj().with("purchase_id", Json::str("purchase-mixed"));
+        engine
+            .put(
+                "price_offers",
+                "offer-mixed",
+                open_mixed.clone(),
+                PutOptions::default(),
+            )
+            .unwrap();
+
+        let audit_path = dir.join("pricing-audit.log");
+        let mut audit = AuditLog::open(&audit_path).unwrap();
+        for (operation_id, purchase_id, purchase_value, offer_id, offer_after, offer_before) in [
+            (
+                "purchase-commit",
+                "purchase-committed",
+                committed_purchase.clone(),
+                "offer-committed",
+                redeemed_offer.clone(),
+                None,
+            ),
+            (
+                "purchase-abort",
+                "purchase-aborted",
+                Json::obj().with("purchase_id", Json::str("purchase-aborted")),
+                "offer-aborted",
+                redeemed_aborted,
+                Some(open_aborted),
+            ),
+            (
+                "purchase-mixed",
+                "purchase-mixed",
+                mixed_purchase.clone(),
+                "offer-mixed",
+                redeemed_mixed,
+                Some(open_mixed),
+            ),
+        ] {
+            audit
+                .append_pricing_transition_with_recovery(
+                    operation_id,
+                    "started",
+                    2,
+                    "purchase",
+                    Json::obj().with("purchase_id", Json::str(purchase_id)),
+                    Some(pricing_transaction_recovery(vec![
+                        ("purchases", purchase_id, purchase_value, None),
+                        ("price_offers", offer_id, offer_after, offer_before),
+                    ])),
+                )
+                .unwrap();
+        }
+        engine
+            .put(
+                "purchases",
+                "purchase-committed",
+                committed_purchase,
+                PutOptions::default(),
+            )
+            .unwrap();
+        engine
+            .put(
+                "purchases",
+                "purchase-mixed",
+                mixed_purchase,
+                PutOptions::default(),
+            )
+            .unwrap();
+
+        reconcile_pricing_intents(&engine, &mut audit).unwrap();
+        assert_eq!(audit.pending_operations().len(), 1);
+        assert!(audit.pending_operations().contains_key("purchase-mixed"));
+        assert_eq!(audit.entry_count(), 5);
+        let aborted_offer = engine
+            .get_opt("price_offers", "offer-aborted")
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(
+            aborted_offer.get("redeemed").and_then(Json::as_bool),
+            Some(false)
+        );
+        assert!(aborted_offer.get("purchase_id").is_none());
+
         drop(audit);
         drop(engine);
         std::fs::remove_dir_all(dir).unwrap();
