@@ -917,31 +917,10 @@ impl ApiState {
             }
             ("GET", ["v1", "personality", "overview"]) => {
                 self.with_role(principal, Role::Read, "the model overview", || {
-                    let mut summary = Json::obj();
-                    let mut total = 0u64;
-                    for spec in preppydb_model::collections() {
-                        let count = self.engine.count(spec.name).unwrap_or(0) as u64;
-                        total += count;
-                        summary.set(
-                            spec.name,
-                            Json::obj()
-                                .with("documents", Json::uint(count))
-                                .with(
-                                    "exists",
-                                    Json::Bool(self.engine.collection_meta(spec.name).is_ok()),
-                                )
-                                .with(
-                                    "immutable",
-                                    Json::Bool(preppydb_model::is_immutable_collection(spec.name)),
-                                ),
-                        );
+                    match personality_overview(|name| self.engine.count(name)) {
+                        Ok(overview) => ok_data(overview),
+                        Err(err) => db_error(err),
                     }
-                    ok_data(
-                        Json::obj()
-                            .with("model_version", Json::str(preppydb_model::MODEL_VERSION))
-                            .with("total_documents", Json::uint(total))
-                            .with("collections", summary),
-                    )
                 })
             }
             ("GET", ["v1", "personality", "profiles"]) => {
@@ -2224,6 +2203,36 @@ fn is_managed_pricing_collection(name: &str) -> bool {
     )
 }
 
+fn personality_overview<F>(mut count_collection: F) -> Result<Json, DbError>
+where
+    F: FnMut(&str) -> std::result::Result<usize, DbError>,
+{
+    let mut summary = Json::obj();
+    let mut total = 0u64;
+    for spec in preppydb_model::collections() {
+        let (count, exists) = match count_collection(spec.name) {
+            Ok(count) => (count as u64, true),
+            Err(DbError::CollectionNotFound(_)) => (0, false),
+            Err(err) => return Err(err),
+        };
+        total += count;
+        summary.set(
+            spec.name,
+            Json::obj()
+                .with("documents", Json::uint(count))
+                .with("exists", Json::Bool(exists))
+                .with(
+                    "immutable",
+                    Json::Bool(preppydb_model::is_immutable_collection(spec.name)),
+                ),
+        );
+    }
+    Ok(Json::obj()
+        .with("model_version", Json::str(preppydb_model::MODEL_VERSION))
+        .with("total_documents", Json::uint(total))
+        .with("collections", summary))
+}
+
 /// An empty audit chain cannot explain preexisting managed pricing records. Fail
 /// closed in that case instead of treating a missing or truncated-to-empty log as
 /// a fresh database. This only detects the empty-chain case; a valid non-empty
@@ -2548,6 +2557,40 @@ mod tests {
         assert_eq!(response.status, 503);
         let response = db_error(DbError::ReadOnly("x".into()));
         assert_eq!(response.status, 403);
+    }
+
+    #[test]
+    fn personality_overview_preserves_missing_collection_semantics() {
+        let overview =
+            personality_overview(|name| Err(DbError::CollectionNotFound(name.into()))).unwrap();
+        assert_eq!(
+            overview.get("total_documents").and_then(Json::as_u64),
+            Some(0)
+        );
+        for spec in preppydb_model::collections() {
+            assert_eq!(
+                overview
+                    .get("collections")
+                    .and_then(|collections| collections.get(spec.name))
+                    .and_then(|collection| collection.get("exists"))
+                    .and_then(Json::as_bool),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn personality_overview_propagates_engine_health_errors() {
+        let error =
+            personality_overview(|_| Err(DbError::CommitOutcomeUnknown("reopen required".into())))
+                .unwrap_err();
+        let response = db_error(error);
+        assert_eq!(response.status, 503);
+        let body = preppydb_json::parse(std::str::from_utf8(&response.body).unwrap()).unwrap();
+        assert_eq!(
+            body.get_path("error.code").and_then(Json::as_str),
+            Some("commit_outcome_unknown")
+        );
     }
 
     #[test]
