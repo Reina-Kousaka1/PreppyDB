@@ -129,11 +129,32 @@ impl DiscountRule {
             .and_then(|value| value.as_u64())
             .and_then(|percent| u32::try_from(percent).ok())
             .ok_or_else(|| PricingError::new(codes::INVALID_RULE, "discount percent is invalid"))?;
+        let label = match value.get("label") {
+            None => "discount".to_string(),
+            Some(Json::String(label)) => label.clone(),
+            Some(_) => {
+                return Err(PricingError::new(
+                    codes::INVALID_RULE,
+                    "discount label is invalid",
+                ));
+            }
+        };
+        let optional_timestamp = |field: &str| -> Result<Option<i64>> {
+            match value.get(field) {
+                None | Some(Json::Null) => Ok(None),
+                Some(timestamp) => timestamp.as_i64().map(Some).ok_or_else(|| {
+                    PricingError::new(
+                        codes::INVALID_RULE,
+                        format!("discount {field} timestamp is invalid"),
+                    )
+                }),
+            }
+        };
         Ok(DiscountRule {
-            label: value.get_str("label").unwrap_or("discount").to_string(),
+            label,
             percent,
-            starts_at: value.get("starts_at").and_then(|v| v.as_i64()),
-            ends_at: value.get("ends_at").and_then(|v| v.as_i64()),
+            starts_at: optional_timestamp("starts_at")?,
+            ends_at: optional_timestamp("ends_at")?,
         })
     }
 }
@@ -268,6 +289,51 @@ impl PriceRule {
     }
 
     pub fn from_json(value: &Json) -> Result<PriceRule> {
+        let optional_integer = |field: &str, default: i64| -> Result<i64> {
+            match value.get(field) {
+                None => Ok(default),
+                Some(number) => number.as_i64().ok_or_else(|| {
+                    PricingError::new(
+                        codes::INVALID_RULE,
+                        format!("{field} must be an integer when present"),
+                    )
+                }),
+            }
+        };
+        let step_cents = optional_integer("step_cents", 1)?;
+        let floor_price_cents = optional_integer("floor_price_cents", 1)?;
+        let updated_at = optional_integer("updated_at", 0)?;
+        let discounts = match value.get("discounts") {
+            None => Vec::new(),
+            Some(Json::Array(items)) => items
+                .iter()
+                .map(DiscountRule::from_json)
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => {
+                return Err(PricingError::new(
+                    codes::INVALID_RULE,
+                    "discounts must be an array when present",
+                ));
+            }
+        };
+        let version = match value.get("version") {
+            None => 1,
+            Some(version) => version.as_u64().ok_or_else(|| {
+                PricingError::new(
+                    codes::INVALID_RULE,
+                    "version must be an unsigned integer when present",
+                )
+            })?,
+        };
+        let enabled = match value.get("enabled") {
+            None => true,
+            Some(enabled) => enabled.as_bool().ok_or_else(|| {
+                PricingError::new(
+                    codes::INVALID_RULE,
+                    "enabled must be a boolean when present",
+                )
+            })?,
+        };
         let rule = PriceRule {
             item_id: value
                 .get_str("item_id")
@@ -279,28 +345,15 @@ impl PriceRule {
             max_price_cents: value.get_i64("max_price_cents").ok_or_else(|| {
                 PricingError::new(codes::INVALID_RULE, "max_price_cents is required")
             })?,
-            step_cents: value.get_i64("step_cents").unwrap_or(1),
+            step_cents,
             anchor_price_cents: value.get_i64("anchor_price_cents").ok_or_else(|| {
                 PricingError::new(codes::INVALID_RULE, "anchor_price_cents is required")
             })?,
-            floor_price_cents: value.get_i64("floor_price_cents").unwrap_or(1),
-            discounts: value
-                .get("discounts")
-                .and_then(|v| v.as_array())
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(DiscountRule::from_json)
-                        .collect::<Result<Vec<_>>>()
-                })
-                .transpose()?
-                .unwrap_or_default(),
-            version: value.get("version").and_then(|v| v.as_u64()).unwrap_or(1),
-            updated_at: value.get_i64("updated_at").unwrap_or(0),
-            enabled: value
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
+            floor_price_cents,
+            discounts,
+            version,
+            updated_at,
+            enabled,
         };
         rule.validate()?;
         Ok(rule)
@@ -1865,6 +1918,46 @@ mod tests {
         let encoded = rule.to_json();
         let decoded = PriceRule::from_json(&encoded).unwrap();
         assert_eq!(rule, decoded);
+        let mut disabled = rule.clone();
+        disabled.enabled = false;
+        assert_eq!(PriceRule::from_json(&disabled.to_json()).unwrap(), disabled);
+
+        let legacy = preppydb_json::parse(
+            r#"{"item_id":"legacy","min_price_cents":10,"max_price_cents":100,"anchor_price_cents":50}"#,
+        )
+        .unwrap();
+        let legacy = PriceRule::from_json(&legacy).unwrap();
+        assert_eq!(legacy.step_cents, 1);
+        assert_eq!(legacy.floor_price_cents, 1);
+        assert!(legacy.discounts.is_empty());
+        assert_eq!(legacy.version, 1);
+        assert_eq!(legacy.updated_at, 0);
+        assert!(legacy.enabled);
+
+        for (field, invalid) in [
+            ("step_cents", Json::str("1")),
+            ("floor_price_cents", Json::str("1")),
+            ("updated_at", Json::str("0")),
+            ("discounts", Json::str("none")),
+            ("version", Json::str("1")),
+            ("enabled", Json::str("false")),
+        ] {
+            let mut malformed = rule.to_json();
+            malformed.set(field, invalid);
+            assert!(PriceRule::from_json(&malformed).is_err(), "field {field}");
+        }
+
+        for field in ["label", "starts_at", "ends_at"] {
+            let mut malformed = Json::obj()
+                .with("label", Json::str("discount"))
+                .with("percent", Json::uint(10));
+            malformed.set(field, Json::Bool(true));
+            assert!(
+                DiscountRule::from_json(&malformed).is_err(),
+                "field {field}"
+            );
+        }
+
         let bad = preppydb_json::parse(
             r#"{"item_id":"x","min_price_cents":-5,"max_price_cents":10,"anchor_price_cents":5}"#,
         )
