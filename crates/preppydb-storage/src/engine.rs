@@ -750,30 +750,11 @@ impl Engine {
                     kind: "corruption_truncated".into(),
                     detail: detail.clone(),
                 });
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(segment)
-                    .map_err(|err| DbError::io("opening corrupt WAL segment for repair", err))?;
-                file.set_len(scan.valid_len)
-                    .map_err(|err| DbError::io("truncating corrupt WAL suffix", err))?;
-                file.sync_all()
-                    .map_err(|err| DbError::io("syncing repaired WAL segment", err))?;
-                for later_segment in segments.iter().skip(segment_position + 1) {
-                    match std::fs::remove_file(later_segment) {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => {
-                            return Err(DbError::io(
-                                format!(
-                                    "removing WAL segment {} after corruption",
-                                    later_segment.display()
-                                ),
-                                err,
-                            ));
-                        }
-                    }
-                }
-                crate::snapshot::fsync_dir(&paths.wal_dir)?;
+                repair_corrupt_wal_suffix(
+                    segment,
+                    &segments[segment_position + 1..],
+                    scan.valid_len,
+                )?;
                 last_segment_index = index;
                 break 'segments;
             }
@@ -2274,6 +2255,62 @@ impl Engine {
     }
 }
 
+fn repair_corrupt_wal_suffix(
+    segment: &Path,
+    later_segments: &[PathBuf],
+    valid_len: u64,
+) -> Result<()> {
+    repair_corrupt_wal_suffix_with(
+        segment,
+        later_segments,
+        valid_len,
+        |segment, valid_len| {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(segment)
+                .map_err(|err| DbError::io("opening corrupt WAL segment for repair", err))?;
+            file.set_len(valid_len)
+                .map_err(|err| DbError::io("truncating corrupt WAL suffix", err))?;
+            file.sync_all()
+                .map_err(|err| DbError::io("syncing repaired WAL segment", err))
+        },
+        std::fs::remove_file,
+        crate::snapshot::fsync_dir,
+    )
+}
+
+fn repair_corrupt_wal_suffix_with<T, R, D>(
+    segment: &Path,
+    later_segments: &[PathBuf],
+    valid_len: u64,
+    truncate_and_sync: T,
+    mut remove_segment: R,
+    sync_directory: D,
+) -> Result<()>
+where
+    T: FnOnce(&Path, u64) -> Result<()>,
+    R: FnMut(&Path) -> std::io::Result<()>,
+    D: FnOnce(&Path) -> Result<()>,
+{
+    truncate_and_sync(segment, valid_len)?;
+    for later_segment in later_segments {
+        match remove_segment(later_segment) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(DbError::io(
+                    format!(
+                        "removing WAL segment {} after corruption",
+                        later_segment.display()
+                    ),
+                    err,
+                ));
+            }
+        }
+    }
+    sync_directory(segment.parent().unwrap_or_else(|| Path::new(".")))
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         let worker = self
@@ -3112,5 +3149,116 @@ mod document_undo_tests {
             drop(reopened);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod wal_repair_tests {
+    use super::*;
+
+    #[test]
+    fn failed_suffix_removal_leaves_repair_state_rejected_until_repaired_again() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-wal-repair-fault-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut config = EngineConfig::new(&dir);
+        config.sync_mode = SyncMode::Always;
+        config.max_segment_bytes = wal::WAL_HEADER_LEN + 1;
+        {
+            let engine = Engine::open(config.clone()).unwrap();
+            engine
+                .create_collection(CollectionMeta::new("c", 0))
+                .unwrap();
+            engine
+                .put("c", "baseline", Json::int(0), PutOptions::default())
+                .unwrap();
+            engine.checkpoint().unwrap();
+            for index in 0..4 {
+                engine
+                    .put(
+                        "c",
+                        &format!("post-checkpoint-{index}"),
+                        Json::int(index),
+                        PutOptions::default(),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let segments = wal::list_segments(&dir.join("wal")).unwrap();
+        assert!(
+            segments.len() >= 4,
+            "expected rotated segments: {segments:?}"
+        );
+        let damaged_segment = &segments[0];
+        let mut bytes = std::fs::read(damaged_segment).unwrap();
+        bytes[wal::WAL_HEADER_LEN as usize + 4] ^= 0x80;
+        std::fs::write(damaged_segment, bytes).unwrap();
+        let scan = wal::scan_segment(damaged_segment).unwrap();
+        assert!(scan.corruption.is_some());
+        assert_eq!(scan.valid_len, wal::WAL_HEADER_LEN);
+
+        let mut directory_synced = false;
+        let error = repair_corrupt_wal_suffix_with(
+            damaged_segment,
+            &segments[1..],
+            scan.valid_len,
+            |segment, valid_len| {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(segment)
+                    .map_err(|err| DbError::io("opening corrupt WAL segment for repair", err))?;
+                file.set_len(valid_len)
+                    .map_err(|err| DbError::io("truncating corrupt WAL suffix", err))?;
+                file.sync_all()
+                    .map_err(|err| DbError::io("syncing repaired WAL segment", err))
+            },
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |_| {
+                directory_synced = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("after corruption"));
+        assert_eq!(
+            std::fs::metadata(damaged_segment).unwrap().len(),
+            scan.valid_len
+        );
+        assert!(segments[1..].iter().all(|segment| segment.exists()));
+        assert!(!directory_synced, "failed repair must not sync as complete");
+        assert!(matches!(
+            Engine::open(config.clone()),
+            Err(DbError::Corrupt { .. })
+        ));
+
+        config.repair = RepairPolicy::TruncateCorruptTail;
+        let repaired = Engine::open(config.clone()).unwrap();
+        assert_eq!(repaired.count("c").unwrap(), 1);
+        assert_eq!(
+            repaired.get("c", "baseline").unwrap().value.as_i64(),
+            Some(0)
+        );
+        assert!(repaired
+            .recovery_notes()
+            .iter()
+            .any(|note| note.kind == "corruption_truncated"));
+        repaired
+            .put("c", "after-repair", Json::int(9), PutOptions::default())
+            .unwrap();
+        drop(repaired);
+
+        config.repair = RepairPolicy::Strict;
+        let reopened = Engine::open(config).unwrap();
+        assert_eq!(reopened.count("c").unwrap(), 2);
+        assert_eq!(
+            reopened.get("c", "after-repair").unwrap().value.as_i64(),
+            Some(9)
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
