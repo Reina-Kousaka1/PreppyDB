@@ -305,6 +305,11 @@ do
   local _, envelope_err = missing_data:stats()
   t:equal(envelope_err.code, "invalid_response", "missing data envelope is rejected")
 
+  local custom_route = new_client({ json_response(200, { status = "raw" }) })
+  local custom, custom_err = custom_route:call("GET", "/probe")
+  t:equal(custom.status, "raw", "custom non-API routes keep flat responses")
+  t:equal(custom_err, nil, "custom flat response has no error")
+
   local collections = new_client({ json_response(200, { ok = true, data = {} }) })
   local _, collections_err = collections:collections()
   t:equal(collections_err.code, "invalid_response", "missing collections array is rejected")

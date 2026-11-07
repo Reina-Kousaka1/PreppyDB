@@ -48,8 +48,8 @@ before decoding but cannot prevent allocations inside a custom transport.
 
 Everything returns `result, err`:
 
-* `result` — the unwrapped `data` payload of API responses; `/healthz` and `/readyz`
-  return their flat status objects as-is;
+* `result` — the unwrapped `data` payload of `/v1/*` API responses; `/healthz`,
+  `/readyz`, and custom non-API routes return their flat bodies as-is;
 * `err` — `{ status, code, message, retryable }`, or a transport error such as
   `{ code = "transport_error", message = "...", retryable = false }`.
 

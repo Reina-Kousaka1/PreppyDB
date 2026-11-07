@@ -726,16 +726,21 @@ function Client:call(method, path, body, options)
           retryable = false,
         }
       end
-      -- Data endpoints use the success envelope; only the health endpoints return
-      -- their status object directly.
+      -- The API uses the success envelope; health and custom transport endpoints
+      -- may return their flat payload directly.
       if path == "/healthz" or path == "/readyz" then
         return decoded, nil
       end
-      if type(decoded) ~= "table" or type(decoded.data) ~= "table"
-          or (decoded.ok ~= nil and decoded.ok ~= true) then
+      if type(decoded) == "table" and decoded.data ~= nil then
+        if type(decoded.data) ~= "table" or (decoded.ok ~= nil and decoded.ok ~= true) then
+          return invalid_response("server returned a malformed success envelope")
+        end
+        return decoded.data, nil
+      end
+      if path:sub(1, 4) == "/v1/" then
         return invalid_response("server returned a malformed success envelope")
       end
-      return decoded.data, nil
+      return decoded, nil
     else
       last_error = error_from(status, response_body)
       last_error.headers = response_headers
@@ -815,12 +820,19 @@ function Client:call_async(method, path, body, callback)
         callback(decoded, nil)
         return
       end
-      if type(decoded) ~= "table" or type(decoded.data) ~= "table"
-          or (decoded.ok ~= nil and decoded.ok ~= true) then
+      if type(decoded) == "table" and decoded.data ~= nil then
+        if type(decoded.data) ~= "table" or (decoded.ok ~= nil and decoded.ok ~= true) then
+          callback(invalid_response("server returned a malformed success envelope"))
+          return
+        end
+        callback(decoded.data, nil)
+        return
+      end
+      if path:sub(1, 4) == "/v1/" then
         callback(invalid_response("server returned a malformed success envelope"))
         return
       end
-      callback(decoded.data, nil)
+      callback(decoded, nil)
       return
     end
     local err = error_from(status, response_body or "")
