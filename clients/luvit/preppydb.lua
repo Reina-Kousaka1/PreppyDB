@@ -405,6 +405,9 @@ local function parse_url(url)
   if url:find("[%c%s]") then
     return nil, "url contains whitespace or control characters"
   end
+  if url:find("[?#]") then
+    return nil, "url must not contain a query or fragment"
+  end
   local scheme, rest = url:match("^(%w+)://(.*)$")
   if not scheme then
     return nil, "url must start with http:// (got '" .. url .. "')"
@@ -512,6 +515,30 @@ local function valid_retry_count(retries)
     and retries >= 0 and retries <= MAX_RETRIES and retries == math.floor(retries)
 end
 
+local function valid_http_method(method)
+  if type(method) ~= "string" or method == "" then return false end
+  local separators = "!#$%&'*+-.^_`|~"
+  for index = 1, #method do
+    local byte = method:byte(index)
+    if not ((byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90)
+        or (byte >= 97 and byte <= 122) or separators:find(string.char(byte), 1, true)) then
+      return false
+    end
+  end
+  return true
+end
+
+local function valid_request_target(path)
+  return type(path) == "string" and path:sub(1, 1) == "/"
+    and not path:find("[%c%s#\\]")
+end
+
+local function valid_prefix(prefix)
+  return type(prefix) == "string"
+    and (prefix == "" or prefix:sub(1, 1) == "/")
+    and not prefix:find("[%c%s?#\\]")
+end
+
 --- Create a client.
 -- options.url          base url, e.g. "http://127.0.0.1:7077"
 -- options.token        bearer token (optional; required for non-public endpoints)
@@ -532,6 +559,11 @@ function preppydb.new(options)
   if not valid_retry_count(retries) then
     return nil, "retries must be an integer between 0 and " .. MAX_RETRIES
   end
+  local prefix = options.prefix
+  if prefix == nil then prefix = "" end
+  if not valid_prefix(prefix) then
+    return nil, "prefix must be an origin-relative path without whitespace, controls, query, or fragment"
+  end
   local response_limit = options.max_response_bytes or 16 * 1024 * 1024
   if type(response_limit) ~= "number" or response_limit < 0 or response_limit ~= math.floor(response_limit) or response_limit > 2147483647 then
     return nil, "max_response_bytes must be an integer between 0 and 2147483647"
@@ -550,7 +582,7 @@ function preppydb.new(options)
   local self = setmetatable({
     host = parsed.host,
     port = parsed.port,
-    prefix = (options.prefix or "") .. parsed.prefix,
+    prefix = prefix .. parsed.prefix,
     token = options.token,
     timeout_ms = options.timeout or 10000,
     max_response_bytes = response_limit,
@@ -581,6 +613,13 @@ end
 --- Issue one request synchronously.
 -- Returns decoded body, or nil plus an error table.
 function Client:call(method, path, body, options)
+  if not valid_http_method(method) or not valid_request_target(path) then
+    return nil, {
+      code = "invalid_argument",
+      message = "method must be an HTTP token and path must be a safe origin-form request target",
+      retryable = false,
+    }
+  end
   if self.token ~= nil and not valid_bearer_token(self.token) then
     return nil, { code = "invalid_token", message = "invalid bearer token", retryable = false }
   end
@@ -689,6 +728,14 @@ end
 --- Asynchronous variant for event-loop code (luvit).
 -- `callback(result, err)` receives what the synchronous methods return.
 function Client:call_async(method, path, body, callback)
+  if not valid_http_method(method) or not valid_request_target(path) then
+    callback(nil, {
+      code = "invalid_argument",
+      message = "method must be an HTTP token and path must be a safe origin-form request target",
+      retryable = false,
+    })
+    return
+  end
   if self.token ~= nil and not valid_bearer_token(self.token) then
     callback(nil, { code = "invalid_token", message = "invalid bearer token", retryable = false })
     return

@@ -65,6 +65,8 @@ do
   for _, bad_url in ipairs({
     "http://127.0.0.1:7077/base\r\nX-Injected: yes",
     "http://127.0.0.1:7077/has space",
+    "http://127.0.0.1:7077/base?query=1",
+    "http://127.0.0.1:7077/base#fragment",
   }) do
     local transport, calls = recorder({})
     local rejected, err = preppydb.new({ url = bad_url, transport = transport })
@@ -72,6 +74,28 @@ do
     t:truthy(type(err) == "string", "invalid URL returns a configuration error")
     t:equal(#calls, 0, "invalid URL is rejected before transport")
   end
+end
+
+do
+  local transport, calls = recorder({})
+  local rejected, err = preppydb.new({
+    url = "http://127.0.0.1:7077",
+    prefix = "/db\r\nX-Injected: yes",
+    transport = transport,
+  })
+  t:equal(rejected, nil, "constructor rejects header-injecting prefixes")
+  t:truthy(type(err) == "string", "invalid prefix returns a configuration error")
+  t:equal(#calls, 0, "invalid prefix is rejected before transport")
+
+  local client, calls = new_client({})
+  local _, method_error = client:call("GET\r\nX-Injected: yes", "/v1/stats")
+  t:equal(method_error and method_error.code, "invalid_argument", "sync call rejects unsafe methods")
+  local _, path_error = client:call("GET", "/v1/stats\r\nX-Injected: yes")
+  t:equal(path_error and path_error.code, "invalid_argument", "sync call rejects unsafe targets")
+  client:call_async("GET", "/v1/stats\r\nX-Injected: yes", nil, function(_, async_error)
+    t:equal(async_error and async_error.code, "invalid_argument", "async call rejects unsafe targets")
+  end)
+  t:equal(#calls, 0, "invalid request arguments do not reach transport")
 end
 
 do

@@ -79,6 +79,10 @@ Only `get` is special: a `404` means "no such document" and returns `nil, nil`.
 | `db:offer(item, ttl_ms)`, `db:purchase(offer_id, quantity)`, `db:price_history(item)` | |
 | `db:simulate(rule, steps, seed)`, `db:audit_verify()` | |
 
+Base URLs cannot include a query or fragment; `prefix` must be an origin-relative path.
+The low-level `db:call` and `db:call_async` methods reject invalid HTTP methods and unsafe
+request targets before invoking the transport.
+
 ### JSON helpers
 
 * `preppydb.encode(value)` / `preppydb.decode(text)` — a self-contained codec with sorted

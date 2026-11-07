@@ -190,6 +190,11 @@ impl Client {
                 "base URL contains whitespace or control characters".into(),
             ));
         }
+        if base_url.bytes().any(|byte| matches!(byte, b'?' | b'#')) {
+            return Err(ClientError::Configuration(
+                "base URL must not contain a query or fragment".into(),
+            ));
+        }
         let trimmed = base_url.trim_end_matches('/');
         if trimmed.starts_with("https://") {
             return Err(ClientError::Configuration(
@@ -825,6 +830,8 @@ mod tests {
         assert!(Client::anonymous("http://").is_err());
         assert!(Client::anonymous("http://host:notaport").is_err());
         assert!(Client::anonymous("http://host/\r\nX-Injected: yes").is_err());
+        assert!(Client::anonymous("http://host/api?query=1").is_err());
+        assert!(Client::anonymous("http://host/api#fragment").is_err());
     }
 
     #[test]
