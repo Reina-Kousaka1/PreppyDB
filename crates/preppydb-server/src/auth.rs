@@ -350,7 +350,7 @@ fn parse_credentials(text: &str) -> Result<(Vec<UserRecord>, Vec<TokenRecord>)> 
             "auth file has an unsupported format version".into(),
         ));
     }
-    let users = value
+    let users: Vec<UserRecord> = value
         .get("users")
         .map(|v| {
             v.as_array()
