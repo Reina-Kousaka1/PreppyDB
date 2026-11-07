@@ -1019,17 +1019,56 @@ impl AuditLog {
 }
 
 fn persist_audit_line(path: &Path, line: &[u8]) -> std::io::Result<()> {
+    persist_audit_line_with_directory_sync(path, line, sync_audit_parent_directory)
+}
+
+fn persist_audit_line_with_directory_sync<F>(
+    path: &Path,
+    line: &[u8],
+    sync_parent: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
     use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
+    let mut create = std::fs::OpenOptions::new();
+    create.write(true).append(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        create.mode(0o600);
     }
-    let mut file = options.open(path)?;
+    let (mut file, created) = match create.open(path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut append = std::fs::OpenOptions::new();
+            append.write(true).append(true);
+            (append.open(path)?, false)
+        }
+        Err(error) => return Err(error),
+    };
     file.write_all(line)?;
-    file.sync_data()
+    file.sync_data()?;
+    if created {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_parent(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_audit_parent_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 // --------------------------------------------------------------------------- engine
@@ -1574,6 +1613,67 @@ mod tests {
             AuditLog::open(&path).unwrap_err().code,
             codes::AUDIT_INTEGRITY
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_audit_file_syncs_its_parent_after_file_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-parent-sync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let mut sync_calls = 0;
+        persist_audit_line_with_directory_sync(&path, b"first\n", |parent| {
+            sync_calls += 1;
+            assert_eq!(parent, dir.as_path());
+            assert_eq!(std::fs::read(&path).unwrap(), b"first\n");
+            Ok(())
+        })
+        .unwrap();
+        persist_audit_line_with_directory_sync(&path, b"second\n", |_| {
+            sync_calls += 1;
+            Err(std::io::Error::other(
+                "existing audit file must not resync its parent",
+            ))
+        })
+        .unwrap();
+        assert_eq!(sync_calls, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_audit_file_parent_sync_failure_poisons_the_append_handle() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-parent-sync-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let mut log = AuditLog::open(&path).unwrap();
+        let error = log
+            .append_with_persist("first", 1, Json::Null, |path, line| {
+                persist_audit_line_with_directory_sync(path, line, |_| {
+                    Err(std::io::Error::other("injected parent sync failure"))
+                })
+            })
+            .unwrap_err();
+        assert_eq!(error.code, codes::AUDIT_INTEGRITY);
+        assert_eq!(log.entry_count(), 0);
+        assert_eq!(log.verify().unwrap_err().code, codes::AUDIT_INTEGRITY);
+        let reopened = AuditLog::open(&path).unwrap();
+        assert_eq!(reopened.entry_count(), 1);
+        reopened.verify().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
