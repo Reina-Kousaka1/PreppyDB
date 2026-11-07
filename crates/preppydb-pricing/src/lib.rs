@@ -1139,7 +1139,7 @@ impl PricingEngine {
             ));
         }
         let price = offer.price_cents;
-        if price < 1 || price > rule.max_price_cents.max(price) {
+        if price < rule.floor_price_cents.max(1) || price > rule.max_price_cents {
             return Err(PricingError::new(
                 codes::OUT_OF_BOUNDS,
                 format!("offer price {price} is outside the rule bounds"),
@@ -1314,6 +1314,21 @@ mod tests {
         redeemed.redeemed = true;
         let err = engine.redeem_offer(&rule, &redeemed, 1, 2000).unwrap_err();
         assert_eq!(err.code, codes::OFFER_REDEEMED);
+    }
+
+    #[test]
+    fn offers_outside_price_bounds_cannot_be_redeemed() {
+        let mut engine = PricingEngine::with_seed(b"offer-price-bounds");
+        let rule = rule();
+        let mut offer = engine.create_offer(&rule, 1000, None).unwrap();
+
+        offer.price_cents = rule.max_price_cents + 1;
+        let err = engine.redeem_offer(&rule, &offer, 1, 2000).unwrap_err();
+        assert_eq!(err.code, codes::OUT_OF_BOUNDS);
+
+        offer.price_cents = rule.floor_price_cents - 1;
+        let err = engine.redeem_offer(&rule, &offer, 1, 2000).unwrap_err();
+        assert_eq!(err.code, codes::OUT_OF_BOUNDS);
     }
 
     #[test]
