@@ -85,7 +85,7 @@ PRICING
                      [--step-cents C] [--discount PERCENT]
 
 REMOTE
-    health --url URL [--token TOKEN] [--timeout MS]
+    health --url URL [--timeout MS]  (optional token from PREPPYDB_TOKEN)
                            probe a running server (exit 1 when unhealthy)
 
 EXIT CODES
@@ -262,6 +262,12 @@ fn read_stdin_line(prompt: &str) -> Result<String, String> {
 ///
 /// Exit codes: 0 healthy, 1 unhealthy or unreachable, 2 usage error.
 fn cmd_health(flags: &Flags) -> Result<(), String> {
+    if flags.get("token").is_some() {
+        return Err(
+            "--token is not accepted because command-line arguments expose secrets; set PREPPYDB_TOKEN instead"
+                .to_string(),
+        );
+    }
     let url = flags
         .get("url")
         .unwrap_or("http://127.0.0.1:7070")
@@ -272,10 +278,7 @@ fn cmd_health(flags: &Flags) -> Result<(), String> {
             .map_err(|_| "--timeout must be a number of milliseconds".to_string())?,
         None => 3000,
     };
-    let token = flags
-        .get("token")
-        .map(|value| value.to_string())
-        .or_else(|| std::env::var("PREPPYDB_TOKEN").ok());
+    let token = std::env::var("PREPPYDB_TOKEN").ok();
 
     let mut client = Client::anonymous(&url).map_err(|err| err.to_string())?;
     client = client.with_timeout(std::time::Duration::from_millis(timeout_ms));
@@ -959,4 +962,18 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
 #[allow(dead_code)]
 fn ensure_dir(path: &Path) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|err| format!("creating {}: {err}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cmd_health, Flags};
+
+    #[test]
+    fn health_refuses_bearer_tokens_in_process_arguments() {
+        let args = vec!["--token".to_string(), "private-sentinel".to_string()];
+        let flags = Flags::parse(&args, 0).unwrap();
+        let error = cmd_health(&flags).unwrap_err();
+        assert!(error.contains("PREPPYDB_TOKEN"));
+        assert!(!error.contains("private-sentinel"));
+    }
 }

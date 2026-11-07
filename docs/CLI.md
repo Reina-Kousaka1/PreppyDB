@@ -104,13 +104,15 @@ prints the resulting history. It never touches a database.
 ## Remote
 
 ```bash
-preppydb health --url http://127.0.0.1:7070 [--token TOKEN] [--timeout 3000]
+preppydb health --url http://127.0.0.1:7070 [--timeout 3000]
 ```
 
 Probes `/healthz` and `/readyz` on a **running** server (no `--data-dir` needed) and exits
 `1` when the server is unreachable or unhealthy. This is what the Docker `HEALTHCHECK`
-uses. The token can also come from `$PREPPYDB_TOKEN`; the health endpoints are public, so
-it is optional.
+uses. If a reverse proxy requires a token, set `PREPPYDB_TOKEN` in the process
+environment. The CLI refuses a `--token` argument because command-line arguments can be
+visible to other local processes. The PreppyDB health endpoints are public, so a token is
+usually unnecessary.
 
 ## Notes
 
