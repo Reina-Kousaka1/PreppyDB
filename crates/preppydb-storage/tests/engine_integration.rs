@@ -1143,6 +1143,66 @@ fn mid_log_corruption_is_rejected_by_default() {
 }
 
 #[test]
+fn read_only_open_rejects_corrupt_wal_without_mutating_any_segment() {
+    let dir = tempdir("readonly-corrupt-wal");
+    {
+        let engine = open(&dir);
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "kept", Json::int(1), PutOptions::default())
+            .unwrap();
+        engine
+            .put("c", "damaged", Json::int(2), PutOptions::default())
+            .unwrap();
+    }
+
+    let wal_dir = dir.join("wal");
+    let segment = wal::list_segments(&wal_dir).unwrap().pop().unwrap();
+    let mut damaged = std::fs::read(&segment).unwrap();
+    *damaged.last_mut().unwrap() ^= 0x80;
+    std::fs::write(&segment, &damaged).unwrap();
+    let wal_before: Vec<_> = wal::list_segments(&wal_dir)
+        .unwrap()
+        .into_iter()
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect();
+    let manifest_before = std::fs::read(Manifest::path(&dir)).unwrap();
+
+    let mut config = EngineConfig::new(&dir);
+    config.read_only = true;
+    // Read-only inspection must not apply an otherwise explicitly requested repair.
+    config.repair = RepairPolicy::TruncateCorruptTail;
+    assert!(matches!(Engine::open(config), Err(DbError::Corrupt { .. })));
+
+    let wal_after = wal::list_segments(&wal_dir)
+        .unwrap()
+        .into_iter()
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wal_after, wal_before,
+        "read-only recovery changed WAL bytes"
+    );
+    assert_eq!(
+        std::fs::read(Manifest::path(&dir)).unwrap(),
+        manifest_before,
+        "read-only recovery changed the manifest"
+    );
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("recovery-report-")),
+        "read-only recovery must not publish a recovery report"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn recovery_rejects_noncanonical_wal_name_instead_of_missing_commits() {
     let dir = tempdir("noncanonical-wal-recovery");
     {
