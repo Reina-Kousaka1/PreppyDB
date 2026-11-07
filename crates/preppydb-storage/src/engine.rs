@@ -2988,6 +2988,58 @@ mod document_undo_tests {
     }
 
     #[test]
+    fn wal_append_faults_after_segment_rotation_preserve_commit_outcome_rules() {
+        for (tag, fault, expected_after_reopen) in [
+            ("partial", crate::wal::AppendFault::PartialWrite, "old"),
+            ("pre-sync", crate::wal::AppendFault::BeforeSync, "new"),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "preppydb-wal-rotated-fault-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut config = EngineConfig::new(&dir);
+            config.max_segment_bytes = 64;
+            let engine = Engine::open(config).unwrap();
+            engine
+                .create_collection(CollectionMeta::new("c", 0))
+                .unwrap();
+            engine
+                .put("c", "key", Json::str("old"), PutOptions::default())
+                .unwrap();
+
+            let before_index = engine.lock_mutex(&engine.writer).current_index();
+            engine.lock_mutex(&engine.writer).inject_fault(fault);
+            let commit_error = engine
+                .put("c", "key", Json::str("new"), PutOptions::default())
+                .unwrap_err();
+            assert_eq!(
+                commit_error.code(),
+                crate::error::codes::COMMIT_OUTCOME_UNKNOWN,
+                "unexpected append error classification after rotation: {commit_error}"
+            );
+            assert!(
+                engine.lock_mutex(&engine.writer).current_index() > before_index,
+                "fault must occur in the rotated segment"
+            );
+            assert!(engine.get("c", "key").is_err());
+            drop(engine);
+
+            let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+            assert_eq!(
+                reopened.get("c", "key").unwrap().value.as_str(),
+                Some(expected_after_reopen),
+                "recovery outcome after {tag} failure"
+            );
+            drop(reopened);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
     fn failed_append_restores_insert_update_delete_and_index() {
         for operation in ["insert", "update", "delete"] {
             let dir = std::env::temp_dir().join(format!(
