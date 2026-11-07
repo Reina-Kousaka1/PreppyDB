@@ -688,6 +688,23 @@ impl AuthStore {
         Ok(removed)
     }
 
+    /// Revoke the API token presented by its bearer secret.
+    pub fn revoke_token_secret(&mut self, secret: &str) -> Result<bool> {
+        if secret.len() < 8 || secret.len() > 512 {
+            return Ok(false);
+        }
+        let digest = hex_encode(&sha256(secret.as_bytes()));
+        let id = self
+            .tokens
+            .iter()
+            .find(|record| constant_time_eq(record.hash_hex.as_bytes(), digest.as_bytes()))
+            .map(|record| record.id.clone());
+        match id {
+            Some(id) => self.revoke_token(&id),
+            None => Ok(false),
+        }
+    }
+
     // ------------------------------------------------------------------ auth
 
     /// Verify a bearer token.
@@ -854,6 +871,24 @@ mod tests {
         assert!(public.contains(&record.id));
         assert!(store.revoke_token(&record.id).unwrap());
         assert!(store.authenticate_token(&secret).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn revoking_token_secret_targets_exact_token_when_names_are_reused() {
+        let (mut store, dir) = store("duplicate-token-names");
+        let (first_secret, first) = store
+            .create_token("shared-name", vec![Role::Read], None)
+            .unwrap();
+        let (second_secret, second) = store
+            .create_token("shared-name", vec![Role::Write], None)
+            .unwrap();
+
+        assert!(store.revoke_token_secret(&second_secret).unwrap());
+        assert!(store.authenticate_token(&first_secret).is_some());
+        assert!(store.authenticate_token(&second_secret).is_none());
+        assert!(store.tokens.iter().any(|token| token.id == first.id));
+        assert!(!store.tokens.iter().any(|token| token.id == second.id));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

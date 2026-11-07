@@ -1351,21 +1351,18 @@ impl ApiState {
             let was_session = auth.logout(&token);
             // Also allow revoking an API token by presenting it (self-service).
             if !was_session {
-                let mut revoked = false;
-                if let Some(principal) = auth.authenticate_token(&token) {
-                    // Only revoke if the caller proved possession of the token.
-                    let id = auth.tokens_public().as_array().and_then(|items| {
-                        items
-                            .iter()
-                            .find(|item| item.get_str("name") == Some(principal.name.as_str()))
-                            .and_then(|item| item.get_str("id").map(|s| s.to_string()))
-                    });
-                    if let Some(id) = id {
-                        let _ = auth.revoke_token(&id);
-                        revoked = true;
-                    }
+                // Resolve by the presented secret's stored hash, not its display
+                // name: token names need not be unique.
+                if auth.authenticate_token(&token).is_some()
+                    && auth.revoke_token_secret(&token).is_err()
+                {
+                    eprintln!("API token revocation could not be persisted");
+                    return Response::error(
+                        503,
+                        "authentication_unavailable",
+                        "authentication state could not be persisted",
+                    );
                 }
-                let _ = revoked;
             }
         }
         ok_data(Json::obj().with("signed_out", Json::Bool(true)))
@@ -2627,6 +2624,45 @@ mod tests {
         let auth = AuthStore::open(config.auth_file()).unwrap();
         let state = ApiState::new(engine, config, auth, Arc::new(ServerCounters::default()));
         (dir, state)
+    }
+
+    #[test]
+    fn logout_revokes_the_presented_token_when_names_are_reused() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-token-logout-{}-{}",
+            std::process::id(),
+            preppydb_storage::clock::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = ServerConfig::new(&dir);
+        let mut auth = AuthStore::open(config.auth_file()).unwrap();
+        let (first_secret, _) = auth
+            .create_token("shared-name", vec![Role::Read], None)
+            .unwrap();
+        let (second_secret, _) = auth
+            .create_token("shared-name", vec![Role::Write], None)
+            .unwrap();
+        let engine = Engine::open(preppydb_storage::engine::EngineConfig::new(&dir)).unwrap();
+        let state = ApiState::new(engine, config, auth, Arc::new(ServerCounters::default()));
+
+        let request = Request {
+            method: "POST".into(),
+            path: "/v1/auth/logout".into(),
+            query: BTreeMap::new(),
+            headers: BTreeMap::from([("authorization".into(), format!("Bearer {second_secret}"))]),
+            body: Vec::new(),
+            peer: "127.0.0.1".into(),
+            request_id: "test-request".into(),
+        };
+        let response = state.handle(&request);
+        assert_eq!(response.status, 200);
+
+        let mut auth = state.auth.write().unwrap();
+        assert!(auth.authenticate_token(&first_secret).is_some());
+        assert!(auth.authenticate_token(&second_secret).is_none());
+        drop(auth);
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
