@@ -16,6 +16,7 @@ use preppydb_storage::wal::SyncMode;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -831,6 +832,128 @@ fn exact_pricing_intent_is_reconciled_during_server_restart() {
     let reopened = AuditLog::open(server.dir.join("pricing-audit.log")).unwrap();
     assert!(reopened.pending_operations().is_empty());
     assert_eq!(reopened.entry_count(), 2);
+}
+
+fn assert_pricing_operation_crash_is_reconciled(mode: &str, terminal_kind: &str) {
+    let server = start("pricing-operation-process-crash", |config| {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pricing_operation_crash_child", "--nocapture"])
+            .env("PREPPYDB_TEST_PRICING_CRASH_DIR", &config.data_path)
+            .env("PREPPYDB_TEST_PRICING_CRASH_MODE", mode)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child should terminate at the injected crash point; stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("PRICING_TEST_CRASH_POINT={mode}")),
+            "child did not reach the intended crash point: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        config.pricing_audit_path = Some(config.data_path.join("pricing-audit.log"));
+    });
+
+    let admin = admin_client(&server);
+    let recovery = admin.recovery().unwrap();
+    let audit_status = recovery.get("pricing_audit").unwrap();
+    assert_eq!(
+        audit_status.get("available").and_then(Json::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        audit_status
+            .get("pending_operations")
+            .and_then(Json::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let stored = admin.get_document("price_rules", "hat").unwrap();
+    let expected_price = if terminal_kind == "pricing_operation_committed" {
+        175
+    } else {
+        150
+    };
+    assert_eq!(
+        stored
+            .get_path("value.current_price_cents")
+            .and_then(Json::as_i64),
+        Some(expected_price)
+    );
+    let audit = AuditLog::open(server.dir.join("pricing-audit.log")).unwrap();
+    assert_eq!(audit.entry_count(), 2);
+    assert!(audit.pending_operations().is_empty());
+    assert_eq!(audit.entries().back().unwrap().kind, terminal_kind);
+}
+
+#[test]
+fn pricing_operation_crash_before_mutation_recovers_as_aborted() {
+    assert_pricing_operation_crash_is_reconciled("before", "pricing_operation_aborted");
+}
+
+#[test]
+fn pricing_operation_crash_after_mutation_before_audit_recovers_as_committed() {
+    assert_pricing_operation_crash_is_reconciled("after", "pricing_operation_committed");
+}
+
+#[test]
+fn pricing_operation_crash_child() {
+    let Some(dir) = std::env::var_os("PREPPYDB_TEST_PRICING_CRASH_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let mode = std::env::var("PREPPYDB_TEST_PRICING_CRASH_MODE").unwrap();
+    let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+    engine
+        .create_collection(preppydb_storage::catalog::CollectionMeta::new(
+            "price_rules",
+            10,
+        ))
+        .unwrap();
+    let before = Json::obj()
+        .with("item_id", Json::str("hat"))
+        .with("version", Json::uint(1))
+        .with("current_price_cents", Json::int(150));
+    engine
+        .put("price_rules", "hat", before.clone(), Default::default())
+        .unwrap();
+    let expected = Json::obj()
+        .with("item_id", Json::str("hat"))
+        .with("version", Json::uint(2))
+        .with("current_price_cents", Json::int(175));
+    let recovery = Json::obj().with(
+        "documents",
+        Json::Array(vec![Json::obj()
+            .with("collection", Json::str("price_rules"))
+            .with("key", Json::str("hat"))
+            .with("expected", expected.clone())
+            .with("before_exists", Json::Bool(true))
+            .with("before", before)]),
+    );
+    let audit_path = dir.join("pricing-audit.log");
+    let mut audit = AuditLog::open(audit_path).unwrap();
+    audit
+        .append_pricing_transition_with_recovery(
+            "process-crash:rule_updated",
+            "started",
+            1,
+            "rule_updated",
+            Json::obj().with("item_id", Json::str("hat")),
+            Some(recovery),
+        )
+        .unwrap();
+    if mode == "after" {
+        engine
+            .put("price_rules", "hat", expected, Default::default())
+            .unwrap();
+    } else {
+        assert_eq!(mode, "before");
+    }
+    eprintln!("PRICING_TEST_CRASH_POINT={mode}");
+    std::process::abort();
 }
 
 #[test]

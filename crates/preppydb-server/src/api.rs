@@ -2276,20 +2276,24 @@ fn reconcile_pricing_intents(engine: &Engine, audit: &mut AuditLog) -> Result<()
         let mut all_before = true;
         let mut unambiguous_after = true;
         for expected in documents {
-            let (Some(collection), Some(key), Some(expected_value)) = (
+            let (Some(collection), Some(key), Some(expected_value), Some(before_exists)) = (
                 expected.get_str("collection"),
                 expected.get_str("key"),
                 expected.get("expected"),
+                expected.get("before_exists").and_then(Json::as_bool),
             ) else {
                 all_after = false;
                 all_before = false;
                 break;
             };
-            let before_exists = expected
-                .get("before_exists")
-                .and_then(Json::as_bool)
-                .unwrap_or(false);
             let before = expected.get("before");
+            if (before_exists && before.is_none())
+                || (!before_exists && !matches!(before, Some(Json::Null)))
+            {
+                all_after = false;
+                all_before = false;
+                break;
+            }
             let current = match engine.get_opt(collection, key) {
                 Ok(doc) => doc.map(|doc| doc.value),
                 Err(_) => {
@@ -2758,19 +2762,39 @@ mod tests {
                 )
                 .unwrap();
         }
+        audit
+            .append_pricing_transition_with_recovery(
+                "malformed",
+                "started",
+                2,
+                "rule_updated",
+                Json::obj().with("key", Json::str("missing-before-state")),
+                Some(Json::obj().with(
+                    "documents",
+                    Json::Array(vec![
+                        Json::obj()
+                            .with("collection", Json::str("price_rules"))
+                            .with("key", Json::str("missing-before-state"))
+                            .with("expected", after.clone())
+                            .with("before", Json::Null),
+                    ]),
+                )),
+            )
+            .unwrap();
         engine
             .put("price_rules", "committed", after, PutOptions::default())
             .unwrap();
 
         reconcile_pricing_intents(&engine, &mut audit).unwrap();
-        assert_eq!(audit.pending_operations().len(), 1);
+        assert_eq!(audit.pending_operations().len(), 2);
         assert!(audit.pending_operations().contains_key("unknown"));
-        assert_eq!(audit.entry_count(), 5);
+        assert!(audit.pending_operations().contains_key("malformed"));
+        assert_eq!(audit.entry_count(), 6);
 
         let mut reopened = AuditLog::open(&audit_path).unwrap();
         reconcile_pricing_intents(&engine, &mut reopened).unwrap();
-        assert_eq!(reopened.pending_operations().len(), 1);
-        assert_eq!(reopened.entry_count(), 5);
+        assert_eq!(reopened.pending_operations().len(), 2);
+        assert_eq!(reopened.entry_count(), 6);
         let outcomes: Vec<(&str, &str)> = reopened
             .entries()
             .iter()

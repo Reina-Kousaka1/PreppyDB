@@ -1083,6 +1083,19 @@ fn persist_audit_line_with_directory_sync<F>(
 where
     F: FnOnce(&Path) -> std::io::Result<()>,
 {
+    persist_audit_line_with_sync(path, line, |file| file.sync_data(), sync_parent)
+}
+
+fn persist_audit_line_with_sync<F, G>(
+    path: &Path,
+    line: &[u8],
+    sync_file: F,
+    sync_parent: G,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&std::fs::File) -> std::io::Result<()>,
+    G: FnOnce(&Path) -> std::io::Result<()>,
+{
     use std::io::Write;
     let mut create = std::fs::OpenOptions::new();
     create.write(true).append(true).create_new(true);
@@ -1101,7 +1114,7 @@ where
         Err(error) => return Err(error),
     };
     file.write_all(line)?;
-    file.sync_data()?;
+    sync_file(&file)?;
     if created {
         let parent = path
             .parent()
@@ -1666,6 +1679,61 @@ mod tests {
             AuditLog::open(&path).unwrap_err().code,
             codes::AUDIT_INTEGRITY
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn uncertain_terminal_append_is_resolved_from_disk_without_duplicate() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-terminal-sync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let operation_id = "request-1:rule_updated";
+        let operation = "rule_updated";
+        let detail = Json::obj().with("item_id", Json::str("hat"));
+        let mut log = AuditLog::open(&path).unwrap();
+        log.append_pricing_transition(operation_id, "started", 1, operation, detail.clone())
+            .unwrap();
+
+        let terminal = Json::obj()
+            .with("operation_id", Json::str(operation_id))
+            .with("operation", Json::str(operation))
+            .with("detail", detail);
+        let error = log
+            .append_with_persist(PRICING_COMMITTED, 2, terminal, |path, line| {
+                persist_audit_line_with_sync(
+                    path,
+                    line,
+                    |_| Err(std::io::Error::other("injected audit file sync failure")),
+                    sync_audit_parent_directory,
+                )
+            })
+            .unwrap_err();
+        assert_eq!(error.code, codes::AUDIT_INTEGRITY);
+        assert_eq!(log.entry_count(), 1);
+        assert!(log.pending_operations().contains_key(operation_id));
+        assert!(log
+            .append_pricing_transition(operation_id, "committed", 3, operation, Json::Null,)
+            .is_err());
+
+        let reopened = AuditLog::open(&path).unwrap();
+        assert_eq!(reopened.entry_count(), 2);
+        assert!(reopened.pending_operations().is_empty());
+        assert_eq!(
+            reopened
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind == PRICING_COMMITTED)
+                .count(),
+            1
+        );
+        reopened.verify().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
