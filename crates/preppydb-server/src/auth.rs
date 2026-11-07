@@ -440,7 +440,7 @@ impl AuthStore {
         Ok(())
     }
 
-    fn save(&self) -> Result<()> {
+    fn save(&mut self) -> Result<()> {
         let payload = Json::obj()
             .with("format_version", Json::int(1))
             .with(
@@ -472,6 +472,7 @@ impl AuthStore {
             .map_err(|err| AuthError(err.to_string()))?;
         preppydb_storage::fsutil::replace_file(&tmp, &self.path)
             .map_err(|err| AuthError(format!("replacing auth file: {err}")))?;
+        self.loaded_digest = Some(sha256(text.as_bytes()));
         Ok(())
     }
 
@@ -572,6 +573,8 @@ impl AuthStore {
             }
             return Err(error);
         }
+        self.sessions
+            .retain(|_, session| session.username != username);
         Ok(())
     }
 
@@ -588,6 +591,10 @@ impl AuthStore {
                 user.disabled = previous_disabled;
             }
             return Err(error);
+        }
+        if disabled {
+            self.sessions
+                .retain(|_, session| session.username != username);
         }
         Ok(())
     }
@@ -873,6 +880,41 @@ mod tests {
         assert!(store.authenticate_session(&session).is_some());
         assert!(store.logout(&session));
         assert!(store.authenticate_session(&session).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn credential_updates_preserve_unaffected_sessions_and_revoke_changed_users() {
+        let (mut store, dir) = store("credential-session-revocation");
+        store
+            .create_user("admin", "correct horse battery", vec![Role::Admin])
+            .unwrap();
+        let (admin_session, _) = store.login("admin", "correct horse battery").unwrap();
+
+        // A credential file write performed by this AuthStore is not an external
+        // replacement and must not invalidate an unrelated active session.
+        store
+            .create_user("writer", "another correct horse", vec![Role::Write])
+            .unwrap();
+        assert!(store.authenticate_session(&admin_session).is_some());
+        store.reload_if_changed().unwrap();
+        assert!(store.authenticate_session(&admin_session).is_some());
+
+        let (writer_session, _) = store.login("writer", "another correct horse").unwrap();
+        store
+            .set_password("admin", "new correct horse battery")
+            .unwrap();
+        assert!(store.authenticate_session(&admin_session).is_none());
+        assert!(store.authenticate_session(&writer_session).is_some());
+        store.reload_if_changed().unwrap();
+        assert!(store.authenticate_session(&writer_session).is_some());
+
+        store.set_user_disabled("writer", true).unwrap();
+        assert!(store.authenticate_session(&writer_session).is_none());
+        assert!(store.login("writer", "another correct horse").is_err());
+        store.set_user_disabled("writer", false).unwrap();
+        assert!(store.login("writer", "another correct horse").is_ok());
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 
