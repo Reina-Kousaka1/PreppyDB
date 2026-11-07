@@ -1,15 +1,34 @@
 //! Small filesystem helpers shared by the storage engine, the backup code and the
 //! server's credential store.
 //!
-//! Publication uses the standard library's replace-existing rename. If it fails, the
-//! error is returned without deleting the destination. Durability still depends on the
-//! caller's file sync, directory sync and platform/filesystem guarantees.
+//! Windows publication uses a narrow Write-through MoveFileExW wrapper; other platforms
+//! use the standard library's rename. Replacement errors propagate without deleting the
+//! destination. Durability still depends on file sync and platform/filesystem behavior.
 
 use std::path::Path;
 
-/// Move `from` over `to`, propagating any failure without deleting `to`.
+/// Move `from` to a path that must not already exist.
+pub fn move_path(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        return preppydb_winfs::move_path(from, to);
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
+/// Move `from` over `to`, propagating any failure without deleting `to` first.
 pub fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::rename(from, to)
+    #[cfg(windows)]
+    {
+        return preppydb_winfs::replace_file(from, to);
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
 }
 
 #[cfg(test)]

@@ -1049,6 +1049,16 @@ impl RestoreIntent {
                 actual: body.len() as u64,
             });
         }
+        let suffix = format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let temp_path = append_sibling_suffix(&path, &format!(".{suffix}"))?;
+        let _temp_guard = RestoreIntentTemp(temp_path.clone());
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1057,22 +1067,52 @@ impl RestoreIntent {
             options.mode(0o600);
         }
         let mut file = options
-            .open(&path)
+            .open(&temp_path)
             .map_err(|err| DbError::io("creating restore intent", err))?;
         use std::io::Write;
         file.write_all(body.as_bytes())
             .map_err(|err| DbError::io("writing restore intent", err))?;
         file.sync_all()
             .map_err(|err| DbError::io("syncing restore intent", err))?;
+        drop(file);
+        crate::fsutil::move_path(&temp_path, &path)
+            .map_err(|err| DbError::io("publishing restore intent", err))?;
         fsync_dir(&parent)?;
         Ok(Self { path, parent })
     }
 
     fn complete(self) -> Result<()> {
-        std::fs::remove_file(&self.path)
-            .map_err(|err| DbError::io("removing completed restore intent", err))?;
-        fsync_dir(&self.parent)
+        let completed_path = append_sibling_suffix(
+            &self.path,
+            &format!(".completed-{}-{}", std::process::id(), now_ms()),
+        )?;
+        crate::fsutil::move_path(&self.path, &completed_path)
+            .map_err(|err| DbError::io("retiring completed restore intent", err))?;
+        fsync_dir(&self.parent)?;
+        // The durable rename above removes the blocking marker. A leftover tombstone
+        // is harmless and can be cleaned up later if deletion itself is interrupted.
+        let _ = std::fs::remove_file(completed_path);
+        Ok(())
     }
+}
+
+struct RestoreIntentTemp(PathBuf);
+
+impl Drop for RestoreIntentTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn append_sibling_suffix(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| DbError::validation("restore marker must have a file name"))?;
+    let mut name = name.to_os_string();
+    name.push(suffix);
+    let mut sibling = path.to_path_buf();
+    sibling.set_file_name(name);
+    Ok(sibling)
 }
 
 fn restore_intent_path(target: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -1160,11 +1200,11 @@ where
         // Exclusive reservation avoids replacing a prior restore's retained data.
         create_restore_directory(aside)?;
         let previous = aside.join("previous");
-        std::fs::rename(target, &previous)
+        crate::fsutil::move_path(target, &previous)
             .map_err(|err| DbError::io("moving existing database aside", err))?;
         let parent = target.parent().unwrap_or_else(|| Path::new("."));
         if let Err(sync_error) = sync_parent(parent) {
-            if let Err(rollback_error) = std::fs::rename(&previous, target)
+            if let Err(rollback_error) = crate::fsutil::move_path(&previous, target)
                 .and_then(|()| sync_parent(parent).map_err(std::io::Error::other))
             {
                 return Err(DbError::RecoveryRequired(format!(
@@ -1181,12 +1221,12 @@ where
     } else {
         None
     };
-    if let Err(err) = std::fs::rename(temp, target) {
+    if let Err(err) = crate::fsutil::move_path(temp, target) {
         if let Some(path) = &previous {
             // Roll back only if no other actor has installed a target meanwhile.
             match std::fs::symlink_metadata(target) {
                 Err(ref target_error) if target_error.kind() == std::io::ErrorKind::NotFound => {
-                    if let Err(rollback) = std::fs::rename(path, target) {
+                    if let Err(rollback) = crate::fsutil::move_path(path, target) {
                         return Err(DbError::RecoveryRequired(format!(
                             "restore publication and rollback failed; old database retained at {} (publish: {err}; rollback: {rollback})",
                             path.display()

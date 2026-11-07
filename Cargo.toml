@@ -4,6 +4,7 @@ members = [
     "crates/preppydb-json",
     "crates/preppydb-crypto",
     "crates/preppydb-storage",
+    "crates/preppydb-winfs",
     "crates/preppydb-pricing",
     "crates/preppydb-model",
     "crates/preppydb-client",

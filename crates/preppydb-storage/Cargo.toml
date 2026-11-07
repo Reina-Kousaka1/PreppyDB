@@ -11,3 +11,6 @@ authors.workspace = true
 [dependencies]
 preppydb-json.workspace = true
 preppydb-crypto.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+preppydb-winfs = { path = "../preppydb-winfs" }

@@ -302,6 +302,14 @@ version = "0.1.0"
 dependencies = [
  "preppydb-crypto",
  "preppydb-json",
+ "preppydb-winfs",
+]
+
+[[package]]
+name = "preppydb-winfs"
+version = "0.1.0"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]

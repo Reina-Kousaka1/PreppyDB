@@ -85,13 +85,13 @@ truncated during recovery; a torn frame in the middle of the log is treated as
 corruption and aborts recovery unless `RepairPolicy::TruncateCorruptTail` is set
 explicitly (`preppydb --repair`).
 
-A newly created segment's header is synced before a writer is returned. The containing
-directory is synced before publishing a writer for both new and existing segments:
-an existing segment may be left by an earlier creation whose directory sync failed.
-On Unix this requests directory entry durability. The current non-Unix helper does
-not issue a directory flush, so this does not establish equivalent Windows power-loss
-durability; OS, filesystem, device, and controller behavior still bound the commit
-guarantee.
+A newly created segment's header is synced in a staging file before publication. On
+Windows, publishing the segment uses `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`; other
+platforms use rename followed by a directory sync. The directory is synced before
+publishing a writer for both new and existing segments. On Unix this requests directory
+entry durability. Windows still has no supported parent-directory flush in this code,
+so write-through moves improve namespace ordering but do not establish a universal
+power-loss guarantee; OS, filesystem, device, and controller behavior still bound it.
 
 An incomplete final segment header (shorter than the fixed 12-byte header and with no
 possible record frame) is also treated as interrupted segment creation: writable open
@@ -114,15 +114,16 @@ inspect larger segments must use `scan_segment_visit` or `summarize_segment`.
 2. Rotate to a new WAL segment.
 3. Serialise the in-memory store into a new snapshot generation, framed in blocks with
    CRC32C per block plus a SHA-256 of the whole file.
-4. Sync a temporary generation manifest and rename it to a new, unused generation
-   filename. The previous published manifest is never replaced; on failure, stop writes
-   until restart. `MANIFEST.json` remains readable for databases created by older builds.
+4. Sync a temporary generation manifest and move it to a new, unused generation
+   filename. Windows uses a write-through move; the previous published manifest is
+   never replaced. On failure, stop writes until restart. `MANIFEST.json` remains
+   readable for databases created by older builds.
 5. Delete segments that only contain sequences already in the snapshot.
 
-The snapshot is synced before publication. Replacement and directory durability depend
-on the operating system and filesystem. Process-crash and power-loss behavior across
-all platforms has not yet been qualified; in particular Windows fault-injection coverage
-is still required. The manifest reference is treated as untrusted input: its filename
+The snapshot is synced before publication. Replacement and directory durability still
+depend on the operating system and filesystem. Process-crash tests cover Windows, but
+power-loss behavior is not proven by CI; the Windows parent-directory flush helper is
+still unsupported. The manifest reference is treated as untrusted input: its filename
 must exactly match its generation, and snapshot header/length metadata is checked before
 the snapshot is applied. The parser validates the footer digest and rejects trailing bytes.
 The manifest's snapshot reference must include a well-formed SHA-256 and nonzero byte

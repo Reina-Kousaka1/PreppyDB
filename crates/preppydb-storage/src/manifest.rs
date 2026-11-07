@@ -451,7 +451,7 @@ impl Manifest {
         file.sync_all()
             .map_err(|err| DbError::io("syncing checkpoint manifest", err))?;
         drop(file);
-        std::fs::rename(&tmp, &path).map_err(|err| {
+        crate::fsutil::move_path(&tmp, &path).map_err(|err| {
             DbError::io(
                 format!("publishing checkpoint manifest {}", path.display()),
                 err,

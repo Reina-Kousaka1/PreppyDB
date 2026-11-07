@@ -177,9 +177,14 @@ impl WalWriter {
         sync_mode: SyncMode,
     ) -> Result<WalWriter> {
         validate_segment_index(index)?;
-        Self::open_with_directory_sync(dir, index, max_segment_bytes, sync_mode, |path| {
-            crate::snapshot::fsync_dir(path)
-        })
+        Self::open_with_directory_sync(
+            dir,
+            index,
+            max_segment_bytes,
+            sync_mode,
+            crate::snapshot::fsync_dir,
+            crate::fsutil::move_path,
+        )
     }
 
     fn open_with_directory_sync<F>(
@@ -188,6 +193,7 @@ impl WalWriter {
         max_segment_bytes: u64,
         sync_mode: SyncMode,
         sync_directory: F,
+        publish_segment: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
     ) -> Result<WalWriter>
     where
         F: FnOnce(&Path) -> Result<()>,
@@ -206,19 +212,54 @@ impl WalWriter {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
             Err(err) => return Err(DbError::io("inspecting WAL segment", err)),
         };
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        if !existed {
-            options.create_new(true);
-        }
-        let mut file = options
-            .open(&path)
-            .map_err(|err| DbError::io(format!("opening {}", path.display()), err))?;
+        let mut file = if existed {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|err| DbError::io(format!("opening {}", path.display()), err))?
+        } else {
+            let mut staged = path.clone();
+            let mut staged_name = path
+                .file_name()
+                .ok_or_else(|| DbError::validation("WAL segment path has no file name"))?
+                .to_os_string();
+            staged_name.push(format!(
+                ".tmp-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            staged.set_file_name(staged_name);
+            let _staged_guard = StagedWalSegment(staged.clone());
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&staged)
+                .map_err(|err| DbError::io("creating staged WAL segment", err))?;
+            file.write_all(WAL_MAGIC)
+                .map_err(|err| DbError::io("writing staged WAL header", err))?;
+            file.write_all(&1u32.to_le_bytes())
+                .map_err(|err| DbError::io("writing staged WAL header", err))?;
+            file.sync_all()
+                .map_err(|err| DbError::io("syncing staged WAL header", err))?;
+            drop(file);
+            publish_segment(&staged, &path)
+                .map_err(|err| DbError::io("publishing WAL segment", err))?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|err| DbError::io(format!("opening {}", path.display()), err))?
+        };
         let len = file
             .metadata()
             .map_err(|err| DbError::io("stat WAL segment", err))?
             .len();
-        if !existed || len == 0 {
+        if len == 0 {
             // Fresh segment: write the header.
             file.seek(SeekFrom::Start(0))
                 .map_err(|err| DbError::io("seeking WAL segment", err))?;
@@ -495,6 +536,14 @@ impl WalWriter {
     }
 }
 
+struct StagedWalSegment(PathBuf);
+
+impl Drop for StagedWalSegment {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Result of scanning one WAL segment.
 #[derive(Debug, Default)]
 pub struct SegmentScan {
@@ -694,6 +743,7 @@ mod tests {
                 assert_eq!(synced_dir, dir);
                 Ok(())
             },
+            |from, to| std::fs::rename(from, to),
         )
         .unwrap();
         assert_eq!(calls, 1);
@@ -709,6 +759,7 @@ mod tests {
                 assert_eq!(synced_dir, dir);
                 Ok(())
             },
+            |from, to| std::fs::rename(from, to),
         )
         .unwrap();
         assert_eq!(calls, 2);
@@ -730,6 +781,7 @@ mod tests {
                     std::io::Error::other("injected"),
                 ))
             },
+            |from, to| std::fs::rename(from, to),
         );
         assert!(result.is_err());
 
@@ -740,6 +792,30 @@ mod tests {
         let writer = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always)
             .expect("a later successful open can safely reuse the header");
         drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_new_segment_publication_cleans_staging_file_and_publishes_no_writer() {
+        let dir = tempdir("segment-publication-failure");
+        let result = WalWriter::open_with_directory_sync(
+            &dir,
+            1,
+            64 * 1024 * 1024,
+            SyncMode::Always,
+            |_| Ok(()),
+            |staged, destination| {
+                assert!(staged.is_file());
+                assert_eq!(destination, dir.join(segment_name(1)));
+                Err(std::io::Error::other(
+                    "injected segment publication failure",
+                ))
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!dir.join(segment_name(1)).exists());
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -758,6 +834,7 @@ mod tests {
             64 * 1024 * 1024,
             SyncMode::Always,
             fail_sync,
+            |from, to| std::fs::rename(from, to),
         )
         .is_err());
         assert!(dir.join(segment_name(1)).is_file());
@@ -770,6 +847,7 @@ mod tests {
             64 * 1024 * 1024,
             SyncMode::Always,
             fail_sync,
+            |from, to| std::fs::rename(from, to),
         )
         .is_err());
         let writer = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always).unwrap();

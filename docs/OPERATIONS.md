@@ -295,8 +295,10 @@ before retrying. Keep the parent directory protected from untrusted local change
 An interrupted publication leaves a sibling restore-intent file; database open fails
 with `recovery_required` rather than creating an empty replacement. Inspect the intent,
 target, staged directory and retained `previous` directory before removing the intent.
-Windows directory-sync support is limited, and this is not a universal atomic exchange
-or power-loss guarantee.
+On Windows, restore markers and directory moves use write-through moves. The parent
+directory still cannot be flushed by the current helper, so native Windows crash tests
+cover process termination, not power loss; this is not a universal atomic exchange or
+power-loss guarantee.
 
 Backing up over HTTP (admin token required):
 
