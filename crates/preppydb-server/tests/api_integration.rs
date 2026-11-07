@@ -836,7 +836,7 @@ fn exact_pricing_intent_is_reconciled_during_server_restart() {
 
 fn assert_pricing_operation_crash_is_reconciled(mode: &str, terminal_kind: &str) {
     let server = start("pricing-operation-process-crash", |config| {
-        let output = Command::new(std::env::current_exe().unwrap())
+        let output = pricing_crash_child_command()
             .args(["--exact", "pricing_operation_crash_child", "--nocapture"])
             .env("PREPPYDB_TEST_PRICING_CRASH_DIR", &config.data_path)
             .env("PREPPYDB_TEST_PRICING_CRASH_MODE", mode)
@@ -888,6 +888,20 @@ fn assert_pricing_operation_crash_is_reconciled(mode: &str, terminal_kind: &str)
     assert_eq!(audit.entry_count(), 2);
     assert!(audit.pending_operations().is_empty());
     assert_eq!(audit.entries().back().unwrap().kind, terminal_kind);
+}
+
+fn pricing_crash_child_command() -> Command {
+    let executable = std::env::current_exe().unwrap();
+    #[cfg(target_arch = "aarch64")]
+    if let Ok(runner) = std::env::var("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER") {
+        let mut parts = runner.split_whitespace();
+        if let Some(program) = parts.next() {
+            let mut command = Command::new(program);
+            command.args(parts).arg(executable);
+            return command;
+        }
+    }
+    Command::new(executable)
 }
 
 #[test]
