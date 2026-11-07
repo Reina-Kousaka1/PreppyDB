@@ -215,3 +215,40 @@ runs on the target host for any deployment-specific capacity decision.
 4. A soak test: 24 h of mixed reads/writes with periodic checkpoints, watching RSS and
    segment growth.
 5. Cross-version upgrade test (0.1.0 → next) with a real data directory.
+
+## Raspberry Pi 4 hardware validation
+
+**Real hardware has not yet been tested.** CI #107 builds and tests ARM64 under QEMU; that is emulation, not a Raspberry Pi. The ARM64 CI job now also cross-builds the `preppydb-server` and `preppydb` release binaries, verifies their AArch64 ELF metadata, smoke-invokes both under QEMU, and publishes a commit-named artifact for 30 days. The artifact manifest identifies the source commit, target, compiler and required glibc baseline (2.35). It is suitable for 64-bit Raspberry Pi OS Bookworm or newer; older glibc systems must not run it.
+
+### Run the bounded hardware smoke test
+
+1. Wait for the CI run for the exact commit to finish successfully. Download `preppydb-linux-arm64-gnu-<full-commit-sha>` from that run's artifacts. Verify the downloaded archive using the accompanying `.sha256` file.
+2. On the Pi, use a clean clone of the same commit and extract the artifact to a separate staging directory. No Rust installation is needed on the Pi. For example:
+
+```bash
+STAGE="$(mktemp -d /var/tmp/preppydb-artifact.XXXXXXXX)"
+mkdir -m 700 "$STAGE/extracted"
+# Copy the downloaded archive and its .sha256 file into "$STAGE" first.
+(cd "$STAGE" && sha256sum -c preppydb-linux-arm64-gnu.tar.gz.sha256)
+tar -xzf "$STAGE/preppydb-linux-arm64-gnu.tar.gz" -C "$STAGE/extracted"
+git clone --branch arena/146caad2-preppydb --single-branch \
+  https://github.com/Reina-Kousaka1/PreppyDB.git "$STAGE/source"
+git -C "$STAGE/source" checkout --detach <full-commit-sha>
+cd "$STAGE/source"
+```
+
+Place the downloaded tarball and `.sha256` file directly in `$STAGE` before running the commands. Replace `<full-commit-sha>` with the commit encoded in the artifact name and manifest.
+3. Run the smoke script as an unprivileged user:
+
+```bash
+PREPPYDB_ARTIFACT_DIR="$STAGE/extracted" \
+  bash scripts/rpi4-hardware-smoke.sh
+```
+
+The script refuses non-aarch64 hosts, non-Pi-4 device trees, containers, dirty or mismatched checkouts, and glibc older than 2.35. It validates artifact checksums and the commit match before creating a unique mode-700 test directory under `/var/tmp`. It uses one synthetic collection and one document, a loopback listener on an OS-assigned port, a single controlled server-process kill/reopen to exercise WAL recovery, then backup, backup verification, restore into a new temporary path, and a read-back check. It never reboots the Pi, edits boot/kernel/Docker/cgroup configuration, or touches an existing database path or service.
+
+The server and CLI child processes receive per-process limits (`RLIMIT_AS` 512 MiB, CPU 30 seconds, file size 32 MiB, 128 open files) and 60-second deadlines by default. The script checks available RAM and free `/var/tmp` space before work and samples RAM, disk, and the active PreppyDB process each second; it terminates the test if a threshold is crossed. `MIN_MEM_AVAILABLE_MIB` cannot be lowered below 768 MiB, and `MIN_DISK_FREE_MIB` cannot be lowered below 512 MiB. The generated database is removed only after a successful run and only from the runner's own uniquely named, marked temporary directory. Failures retain that directory for diagnosis; `KEEP_TEST_DATA=1` retains it after success as well.
+
+**These limits do not provide aggregate memory isolation.** `RLIMIT_AS` applies per process, and host resource sampling is not a reservation. Therefore this runner is deliberately only a tiny smoke test. Large write loops, long soak tests, repeated crash campaigns, and full Cargo builds/tests remain blocked on the Pi until they can be run under reliable host-level resource isolation. The one-process SIGKILL check is not a power-loss test and does not prove sudden-power-loss durability.
+
+Record the CI run URL, artifact commit, Pi model and RAM size, OS/glibc/kernel, available resources before/after, output and resource samples in the hardware test report. Until that run is completed, leave this section explicitly marked untested; passing QEMU and CI jobs do not qualify Raspberry Pi hardware or establish production readiness. Windows directory-flush guarantees, an external pricing-audit anchor, independent review, and other PR hardening gates remain separate.

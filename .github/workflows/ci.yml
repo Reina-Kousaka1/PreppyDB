@@ -242,6 +242,52 @@ jobs:
             exit 1
           fi
 
+      # These exact binaries can be downloaded on a Raspberry Pi for a bounded,
+      # synthetic-data smoke test. The build is still cross-compiled on CI; this
+      # artifact is not evidence of real-hardware execution.
+      - name: Build Linux ARM64 Raspberry Pi smoke-test artifact
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: |
+          set -euo pipefail
+          TARGET=aarch64-unknown-linux-gnu
+          DIST="$GITHUB_WORKSPACE/dist/preppydb-arm64"
+          mkdir -p "$DIST"
+          cargo build --locked --release --target "$TARGET" \
+            --bin preppydb-server --bin preppydb
+          install -m 0755 "target/$TARGET/release/preppydb-server" "$DIST/preppydb-server"
+          install -m 0755 "target/$TARGET/release/preppydb" "$DIST/preppydb"
+          for binary in "$DIST/preppydb-server" "$DIST/preppydb"; do
+            readelf -h "$binary" | grep 'Machine:.*AArch64' >/dev/null
+            readelf -l "$binary" | grep '/lib/ld-linux-aarch64.so.1' >/dev/null
+          done
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "target=$TARGET"
+            echo "glibc_minimum=2.35"
+            echo "rustc=$(rustc --version)"
+            echo "cross_compiler=$(aarch64-linux-gnu-gcc --version | sed -n '1p')"
+          } > "$DIST/manifest.txt"
+          (cd "$DIST" && sha256sum preppydb-server preppydb > SHA256SUMS)
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu "$DIST/preppydb-server" --help >/dev/null
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu "$DIST/preppydb" --help >/dev/null
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          tar -czf "$GITHUB_WORKSPACE/dist/preppydb-linux-arm64-gnu.tar.gz" \
+            -C "$DIST" .
+          (cd "$GITHUB_WORKSPACE/dist" && \
+            sha256sum preppydb-linux-arm64-gnu.tar.gz > preppydb-linux-arm64-gnu.tar.gz.sha256)
+
+      - name: Upload Linux ARM64 Raspberry Pi smoke-test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-linux-arm64-gnu-${{ github.sha }}
+          path: |
+            dist/preppydb-linux-arm64-gnu.tar.gz
+            dist/preppydb-linux-arm64-gnu.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload qemu test log on failure
         if: failure()
         uses: actions/upload-artifact@v4
