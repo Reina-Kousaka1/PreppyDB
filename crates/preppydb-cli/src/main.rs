@@ -465,21 +465,20 @@ fn cmd_stats(flags: &Flags) -> Result<(), String> {
 
 fn cmd_collections(flags: &Flags) -> Result<(), String> {
     let engine = open_engine(flags)?;
-    let collections: Vec<Json> = engine
+    let metadata = engine
         .try_list_collections()
-        .map_err(|err| err.to_string())?
-        .iter()
-        .map(|meta| {
+        .map_err(|err| err.to_string())?;
+    let mut collections = Vec::with_capacity(metadata.len());
+    for meta in metadata {
+        let count = engine.count(&meta.name).map_err(|err| err.to_string())?;
+        collections.push(
             Json::obj()
                 .with("name", Json::str(meta.name.clone()))
-                .with(
-                    "documents",
-                    Json::uint(engine.count(&meta.name).unwrap_or(0) as u64),
-                )
+                .with("documents", Json::uint(count as u64))
                 .with("indexes", Json::uint(meta.indexes.len() as u64))
-                .with("schema", Json::Bool(meta.schema.is_some()))
-        })
-        .collect();
+                .with("schema", Json::Bool(meta.schema.is_some())),
+        );
+    }
     print_json(Json::obj().with("collections", Json::Array(collections)));
     Ok(())
 }
@@ -520,10 +519,12 @@ fn cmd_collection(args: &[String]) -> Result<(), String> {
             let meta = engine
                 .collection_meta(name)
                 .map_err(|err| err.to_string())?;
-            print_json(Json::obj().with("collection", meta.to_json()).with(
-                "documents",
-                Json::uint(engine.count(name).unwrap_or(0) as u64),
-            ));
+            let count = engine.count(name).map_err(|err| err.to_string())?;
+            print_json(
+                Json::obj()
+                    .with("collection", meta.to_json())
+                    .with("documents", Json::uint(count as u64)),
+            );
             Ok(())
         }
         other => Err(format!("unknown collection subcommand '{other}'")),
