@@ -275,6 +275,18 @@ do
   t:equal(ok, nil, "https urls are refused")
   t:truthy(failure:find("plain HTTP"), "the https refusal explains itself")
 
+  for _, url in ipairs({
+    "http://example.org:0",
+    "http://example.org:65536",
+    "http://example.org:999999999999999999999999999999",
+  }) do
+    local parsed, parse_error = preppydb.parse_url(url)
+    t:equal(parsed, nil, "out-of-range URL port is rejected: " .. url)
+    t:truthy(parse_error:find("port must"), "invalid port error is specific")
+  end
+  local parsed = assert(preppydb.parse_url("http://example.org:65535"))
+  t:equal(parsed.port, 65535, "maximum valid port is accepted")
+
   local good, calls2 = new_client({
     json_response(200, { data = { version = 2 } }),
     json_response(200, { data = { offer_id = "of_1", price_cents = 2500 } }),

@@ -418,14 +418,20 @@ local function parse_url(url)
     authority, path = rest, ""
   end
   if path == "/" then path = "" end
-  local host, port = authority:match("^(.+):(%d+)$")
-  if not host then
-    host, port = authority, "80"
+  local host, port_text = authority:match("^(.+):(%d+)$")
+  local port = 80
+  if host then
+    port = tonumber(port_text)
+    if not port or port < 1 or port > 65535 then
+      return nil, "port must be an integer between 1 and 65535"
+    end
+  else
+    host = authority
   end
   if host == "" then
     return nil, "url has no host"
   end
-  return { host = host, port = tonumber(port), prefix = path }
+  return { host = host, port = port, prefix = path }
 end
 
 preppydb.parse_url = parse_url
