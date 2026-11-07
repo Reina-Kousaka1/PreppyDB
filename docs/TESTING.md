@@ -218,17 +218,17 @@ runs on the target host for any deployment-specific capacity decision.
 
 ## Raspberry Pi 4 hardware validation
 
-**Real hardware has not yet been tested.** CI #107 builds and tests ARM64 under QEMU; that is emulation, not a Raspberry Pi. The ARM64 CI job now also cross-builds the `preppydb-server` and `preppydb` release binaries, verifies their AArch64 ELF metadata, smoke-invokes both under QEMU, and publishes a commit-named artifact for 30 days. The artifact manifest identifies the source commit, target, compiler and required glibc baseline (2.35). It is suitable for 64-bit Raspberry Pi OS Bookworm or newer; older glibc systems must not run it.
+**Real hardware has not yet been tested.** CI #107 and #109 build and test ARM64 under QEMU; that is emulation, not a Raspberry Pi. CI #109 also cross-builds the `preppydb-server` and `preppydb` release binaries from the exact PR-head commit, verifies their AArch64 ELF metadata, smoke-invokes both under QEMU, and publishes a commit-named artifact for 30 days. The artifact manifest identifies the source commit, target, compiler and required glibc baseline (2.35). It is suitable for 64-bit Raspberry Pi OS Bookworm or newer; older glibc systems must not run it. [CI #109](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42411562670) passed for commit `fa6126d8c49ec80fa8aba92e4faa26355c97825f`.
 
 ### Run the bounded hardware smoke test
 
-1. Wait for the CI run for the exact commit to finish successfully. Download `preppydb-linux-arm64-gnu-<full-commit-sha>` from that run's artifacts. Verify the downloaded archive using the accompanying `.sha256` file.
-2. On the Pi, use a clean clone of the same commit and extract the artifact to a separate staging directory. No Rust installation is needed on the Pi. For example:
+1. Wait for the CI run for the exact commit to finish successfully. Download `preppydb-linux-arm64-gnu-<full-commit-sha>` from that run's artifacts. The downloaded GitHub artifact is an outer ZIP containing `preppydb-linux-arm64-gnu.tar.gz` and its `.sha256` file.
+2. Extract that outer ZIP on the workstation, then transfer only the tarball and checksum file to a new staging directory on the Pi (for example by authorized SCP or removable media). The Pi commands below print the unique staging path; place both files there before running the checksum and extraction commands. On the Pi, use a clean clone of the same commit:
 
 ```bash
 STAGE="$(mktemp -d /var/tmp/preppydb-artifact.XXXXXXXX)"
 mkdir -m 700 "$STAGE/extracted"
-# Copy the downloaded archive and its .sha256 file into "$STAGE" first.
+printf 'Copy the tarball and checksum into: %s\n' "$STAGE"
 (cd "$STAGE" && sha256sum -c preppydb-linux-arm64-gnu.tar.gz.sha256)
 tar -xzf "$STAGE/preppydb-linux-arm64-gnu.tar.gz" -C "$STAGE/extracted"
 git clone --branch arena/146caad2-preppydb --single-branch \
@@ -237,7 +237,7 @@ git -C "$STAGE/source" checkout --detach <full-commit-sha>
 cd "$STAGE/source"
 ```
 
-Place the downloaded tarball and `.sha256` file directly in `$STAGE` before running the commands. Replace `<full-commit-sha>` with the commit encoded in the artifact name and manifest.
+The script requires Bash, Git, curl, util-linux `prlimit`, and standard Linux command-line tools already present on the Pi. It installs nothing and does not require Rust. Replace `<full-commit-sha>` with the commit encoded in the artifact name and manifest.
 3. Run the smoke script as an unprivileged user:
 
 ```bash

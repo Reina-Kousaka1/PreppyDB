@@ -16,8 +16,8 @@ MAX_FILE_MIB="${MAX_FILE_MIB:-32}"
 die() { echo "FAIL: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"; }
 
-for command in awk curl date df file free getconf git grep id mktemp prlimit ps \
-    rm seq sed sha256sum sort tar tail tr; do
+for command in awk cat chmod curl date df dirname getconf git grep head id mktemp prlimit ps \
+    rm seq sed sha256sum sleep sort tail tr uname; do
     need "$command"
 done
 
@@ -72,8 +72,6 @@ MANIFEST_COMMIT="$(sed -n 's/^commit=//p' "$MANIFEST")"
     die "checkout commit $HEAD does not match artifact commit $MANIFEST_COMMIT"
 grep -q '^target=aarch64-unknown-linux-gnu$' "$MANIFEST" || die "artifact target is not Linux ARM64 GNU"
 grep -q '^glibc_minimum=2.35$' "$MANIFEST" || die "unexpected artifact glibc baseline"
-file "$SERVER" "$CLI" | grep 'ARM aarch64' >/dev/null || die "artifact binaries are not AArch64 ELF files"
-
 TEST_ROOT="$(mktemp -d /var/tmp/preppydb-arm64-smoke.XXXXXXXX)" || die "cannot create isolated /var/tmp directory"
 case "$TEST_ROOT" in /var/tmp/preppydb-arm64-smoke.*) ;; *) die "unexpected test directory path" ;; esac
 chmod 700 "$TEST_ROOT"

@@ -35,6 +35,9 @@ jobs:
         with:
           ruby-version: '3.3'
 
+      - name: Raspberry Pi smoke script syntax
+        run: bash -n scripts/rpi4-hardware-smoke.sh
+
       - name: Formatting
         run: |
           set -o pipefail
