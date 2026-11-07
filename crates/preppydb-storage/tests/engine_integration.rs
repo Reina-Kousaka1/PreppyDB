@@ -1168,13 +1168,18 @@ fn read_only_open_rejects_corrupt_wal_without_mutating_any_segment() {
         .into_iter()
         .map(|path| (path.clone(), std::fs::read(path).unwrap()))
         .collect();
-    let manifest = Manifest::load(&dir).unwrap().unwrap();
-    let manifest_path = if manifest.generation == 0 {
-        Manifest::path(&dir)
-    } else {
-        Manifest::generation_path(&dir, manifest.generation)
+    let read_manifests = || {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with("manifest")
+                    && entry.file_type().unwrap().is_file()
+            })
+            .map(|entry| (entry.path(), std::fs::read(entry.path()).unwrap()))
+            .collect::<Vec<_>>()
     };
-    let manifest_before = std::fs::read(&manifest_path).unwrap();
+    let manifests_before = read_manifests();
 
     let mut config = EngineConfig::new(&dir);
     config.read_only = true;
@@ -1192,8 +1197,8 @@ fn read_only_open_rejects_corrupt_wal_without_mutating_any_segment() {
         "read-only recovery changed WAL bytes"
     );
     assert_eq!(
-        std::fs::read(&manifest_path).unwrap(),
-        manifest_before,
+        read_manifests(),
+        manifests_before,
         "read-only recovery changed the manifest"
     );
     assert!(
