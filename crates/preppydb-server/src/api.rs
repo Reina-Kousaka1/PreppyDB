@@ -62,7 +62,9 @@ impl ApiState {
             Err(error) => (None, Some(format!("{}: {}", error.code, error.message))),
         };
         if let Some(log) = audit.as_mut() {
-            if let Err(error) = reconcile_pricing_intents(&engine, log) {
+            if let Err(error) = ensure_empty_audit_matches_pricing_state(&engine, log)
+                .and_then(|()| reconcile_pricing_intents(&engine, log))
+            {
                 audit = None;
                 audit_startup_error = Some(error);
             }
@@ -2222,6 +2224,44 @@ fn is_managed_pricing_collection(name: &str) -> bool {
     )
 }
 
+/// An empty audit chain cannot explain preexisting managed pricing records. Fail
+/// closed in that case instead of treating a missing or truncated-to-empty log as
+/// a fresh database. This only detects the empty-chain case; a valid non-empty
+/// prefix still needs an external trusted anchor to detect suffix deletion.
+fn ensure_empty_audit_matches_pricing_state(
+    engine: &Engine,
+    audit: &AuditLog,
+) -> Result<(), String> {
+    if audit.entry_count() != 0 {
+        return Ok(());
+    }
+
+    let collections = engine
+        .try_list_collections()
+        .map_err(|error| format!("checking pricing state for an empty audit log: {error}"))?;
+    for name in ["price_rules", "price_offers", "price_history", "purchases"] {
+        if !collections.iter().any(|collection| collection.name == name) {
+            continue;
+        }
+        let records = engine
+            .scan(
+                name,
+                &ScanOptions {
+                    limit: 1,
+                    include_expired: true,
+                    ..ScanOptions::default()
+                },
+            )
+            .map_err(|error| format!("checking {name} for an empty pricing audit log: {error}"))?;
+        if !records.is_empty() {
+            return Err(format!(
+                "pricing audit is empty but managed collection '{name}' already contains records"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reconcile only exact, self-describing pricing intents after the storage engine has
 /// replayed its WAL. Legacy intents and any state that matches neither the recorded
 /// before-image nor the complete expected after-image remain unresolved.
@@ -2524,6 +2564,58 @@ mod tests {
         assert_eq!(json.get_str("key"), Some("k"));
         assert_eq!(json.get("version").unwrap().as_u64(), Some(2));
         assert!(json.get("expires_at").unwrap().is_null());
+    }
+
+    fn state_with_empty_audit(tag: &str, seed_pricing_record: bool) -> (PathBuf, ApiState) {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-empty-pricing-audit-{}-{tag}-{}",
+            std::process::id(),
+            preppydb_storage::clock::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Engine::open(preppydb_storage::engine::EngineConfig::new(&dir)).unwrap();
+        if seed_pricing_record {
+            engine
+                .create_collection(CollectionMeta::new("price_rules", 1))
+                .unwrap();
+            engine
+                .put(
+                    "price_rules",
+                    "existing",
+                    Json::obj().with("price", Json::int(100)),
+                    PutOptions::default(),
+                )
+                .unwrap();
+        } else {
+            engine
+                .create_collection(CollectionMeta::new("price_rules", 1))
+                .unwrap();
+        }
+        let config = ServerConfig::new(&dir);
+        let auth = AuthStore::open(config.auth_file()).unwrap();
+        let state = ApiState::new(engine, config, auth, Arc::new(ServerCounters::default()));
+        (dir, state)
+    }
+
+    #[test]
+    fn empty_pricing_audit_fails_closed_when_managed_data_exists() {
+        let (dir, state) = state_with_empty_audit("existing-data", true);
+        let diagnostic = state
+            .audit_startup_error()
+            .expect("an empty audit cannot explain existing managed pricing data");
+        assert!(diagnostic.contains("price_rules"));
+        assert!(state.pricing.lock().unwrap().audit.is_none());
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn empty_pricing_audit_allows_empty_managed_collections() {
+        let (dir, state) = state_with_empty_audit("empty-collection", false);
+        assert_eq!(state.audit_startup_error(), None);
+        assert!(state.pricing.lock().unwrap().audit.is_some());
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
