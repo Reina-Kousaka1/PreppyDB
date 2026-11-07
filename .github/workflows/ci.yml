@@ -242,28 +242,39 @@ jobs:
             exit 1
           fi
 
+      - name: Checkout exact source commit for the Pi artifact
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifact-source
+
       # These exact binaries can be downloaded on a Raspberry Pi for a bounded,
-      # synthetic-data smoke test. The build is still cross-compiled on CI; this
-      # artifact is not evidence of real-hardware execution.
+      # synthetic-data smoke test. The source SHA is the branch head, not the
+      # synthetic merge commit used by pull_request workflow jobs.
       - name: Build Linux ARM64 Raspberry Pi smoke-test artifact
+        working-directory: artifact-source
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           TARGET=aarch64-unknown-linux-gnu
           DIST="$GITHUB_WORKSPACE/dist/preppydb-arm64"
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-arm64-artifact"
           mkdir -p "$DIST"
-          cargo build --locked --release --target "$TARGET" \
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo build --locked --release --target "$TARGET" \
             --bin preppydb-server --bin preppydb
-          install -m 0755 "target/$TARGET/release/preppydb-server" "$DIST/preppydb-server"
-          install -m 0755 "target/$TARGET/release/preppydb" "$DIST/preppydb"
+          install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/preppydb-server" "$DIST/preppydb-server"
+          install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/preppydb" "$DIST/preppydb"
           for binary in "$DIST/preppydb-server" "$DIST/preppydb"; do
             readelf -h "$binary" | grep 'Machine:.*AArch64' >/dev/null
             readelf -l "$binary" | grep '/lib/ld-linux-aarch64.so.1' >/dev/null
           done
           {
-            echo "commit=$GITHUB_SHA"
+            echo "commit=$SOURCE_COMMIT"
             echo "target=$TARGET"
             echo "glibc_minimum=2.35"
             echo "rustc=$(rustc --version)"
@@ -281,7 +292,7 @@ jobs:
       - name: Upload Linux ARM64 Raspberry Pi smoke-test artifact
         uses: actions/upload-artifact@v4
         with:
-          name: preppydb-linux-arm64-gnu-${{ github.sha }}
+          name: preppydb-linux-arm64-gnu-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             dist/preppydb-linux-arm64-gnu.tar.gz
             dist/preppydb-linux-arm64-gnu.tar.gz.sha256
