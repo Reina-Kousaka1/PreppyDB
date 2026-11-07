@@ -620,15 +620,13 @@ fn pricing_flow_is_version_bound_and_immutable() {
         Some(charged)
     );
     let err = client.delete_document("purchases", "whatever").unwrap_err();
-    assert_eq!(err.code(), Some("immutable_collection"));
+    assert_eq!(err.code(), Some("managed_collection"));
     let overwrite = client.put_document(
         "purchases",
         "manual",
         &Json::obj().with("price_cents", Json::int(1)),
     );
-    // A brand-new append is rejected only by the schema (missing fields) — never by
-    // silently rewriting an existing record.
-    assert!(overwrite.is_err());
+    assert_eq!(overwrite.unwrap_err().code(), Some("managed_collection"));
 
     let admin = admin_client(&server);
     let verified = admin.audit_verify().unwrap();
@@ -661,6 +659,35 @@ fn pricing_audit_failure_is_reported_and_disables_further_writes() {
         stored.get_path("value.version").and_then(|v| v.as_u64()),
         Some(1)
     );
+}
+
+#[test]
+fn pricing_collections_reject_generic_mutations() {
+    let server = start("pricing-managed-collections", |_| {});
+    let admin = admin_client(&server);
+    assert_eq!(
+        admin
+            .create_collection("price_rules", None)
+            .unwrap_err()
+            .code(),
+        Some("managed_collection")
+    );
+    // Accessing the pricing API provisions its own collections.
+    admin.pricing_rules().unwrap();
+    assert_eq!(
+        admin.drop_collection("price_rules").unwrap_err().code(),
+        Some("managed_collection")
+    );
+    let client = Client::new(&server.base_url, &server.writer).unwrap();
+    let error = client
+        .put_document(
+            "price_rules",
+            "hat",
+            &Json::obj().with("anchor_price_cents", Json::int(100)),
+        )
+        .unwrap_err();
+    assert_eq!(error.status(), Some(403));
+    assert_eq!(error.code(), Some("managed_collection"));
 }
 
 #[test]
@@ -750,6 +777,60 @@ fn unresolved_pricing_audit_intent_blocks_retries_after_restart() {
     let error = admin_client(&server).put_price_rule(&rule).unwrap_err();
     assert_eq!(error.status(), Some(503));
     assert_eq!(error.code(), Some("audit_outcome_unknown"));
+}
+
+#[test]
+fn exact_pricing_intent_is_reconciled_during_server_restart() {
+    let server = start("pricing-audit-reconcile", |config| {
+        let engine = Engine::open(EngineConfig::new(&config.data_path)).unwrap();
+        engine
+            .create_collection(preppydb_storage::catalog::CollectionMeta::new(
+                "price_rules",
+                100,
+            ))
+            .unwrap();
+        let expected = Json::obj()
+            .with("item_id", Json::str("hat"))
+            .with("version", Json::uint(2))
+            .with("current_price_cents", Json::int(175));
+        engine
+            .put("price_rules", "hat", expected.clone(), Default::default())
+            .unwrap();
+        drop(engine);
+
+        let audit_path = config.data_path.join("pricing-audit.log");
+        let mut audit = AuditLog::open(&audit_path).unwrap();
+        audit
+            .append_pricing_transition_with_recovery(
+                "request-before-crash:rule_updated",
+                "started",
+                100,
+                "rule_updated",
+                Json::obj().with("item_id", Json::str("hat")),
+                Some(Json::obj().with(
+                    "documents",
+                    Json::Array(vec![Json::obj()
+                        .with("collection", Json::str("price_rules"))
+                        .with("key", Json::str("hat"))
+                        .with("expected", expected)
+                        .with("before_exists", Json::Bool(false))
+                        .with("before", Json::Null)]),
+                )),
+            )
+            .unwrap();
+        config.pricing_audit_path = Some(audit_path);
+    });
+
+    let recovery = admin_client(&server).recovery().unwrap();
+    let audit = recovery.get("pricing_audit").unwrap();
+    assert!(audit
+        .get("pending_operations")
+        .and_then(Json::as_array)
+        .unwrap()
+        .is_empty());
+    let reopened = AuditLog::open(server.dir.join("pricing-audit.log")).unwrap();
+    assert!(reopened.pending_operations().is_empty());
+    assert_eq!(reopened.entry_count(), 2);
 }
 
 #[test]

@@ -145,6 +145,8 @@ Unknown user and wrong password return the identical `401 invalid_credentials` b
 `409 collection_exists` if the name is taken. Names are `[A-Za-z0-9_-]{1,64}`. The
 collections `purchases`, `price_history`, `price_rules` and `price_offers` are managed by
 the pricing subsystem and cannot be created or dropped through this endpoint.
+Their documents can be read normally, but mutations must use the pricing endpoints so
+the audit intent and pricing state stay recoverable together.
 
 ### `GET /v1/collections/{name}`
 
@@ -353,6 +355,7 @@ See [DYNAMIC-PRICING.md](DYNAMIC-PRICING.md) for invariants.
 | `invalid_credentials` | 401 | no | wrong username/password |
 | `forbidden` | 403 | no | role too low for this operation |
 | `forbidden_collection` | 403 | no | economy/pricing collections are managed internally |
+| `managed_collection` | 403 | no | pricing documents can only be changed through pricing endpoints |
 | `immutable_collection` | 403 | no | `purchases` and `price_history` are append-only |
 | `read_only` | 403 | no | server started with `--read-only` |
 | `not_found` / `collection_not_found` / `index_not_found` | 404 | no | missing object |

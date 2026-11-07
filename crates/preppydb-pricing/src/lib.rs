@@ -796,6 +796,28 @@ impl AuditLog {
         operation: &str,
         detail: Json,
     ) -> Result<AuditEntry> {
+        self.append_pricing_transition_with_recovery(
+            operation_id,
+            state,
+            at,
+            operation,
+            detail,
+            None,
+        )
+    }
+
+    /// Append a pricing transition with an optional exact-state recovery descriptor.
+    /// Descriptors are only recorded on the start boundary and let the server classify
+    /// an interrupted write after storage recovery without guessing from partial fields.
+    pub fn append_pricing_transition_with_recovery(
+        &mut self,
+        operation_id: &str,
+        state: &str,
+        at: i64,
+        operation: &str,
+        detail: Json,
+        recovery: Option<Json>,
+    ) -> Result<AuditEntry> {
         let kind = match state {
             "started" => PRICING_STARTED,
             "committed" => PRICING_COMMITTED,
@@ -807,10 +829,15 @@ impl AuditLog {
                 ))
             }
         };
-        let transition = Json::obj()
+        let mut transition = Json::obj()
             .with("operation_id", Json::str(operation_id))
             .with("operation", Json::str(operation))
             .with("detail", detail);
+        if state == "started" {
+            if let Some(recovery) = recovery {
+                transition.set("recovery", recovery);
+            }
+        }
         let mut candidate = self.pending_operations.clone();
         update_pending_operation(&mut candidate, kind, &transition)?;
         let entry = self.append(kind, at, transition)?;

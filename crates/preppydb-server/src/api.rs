@@ -57,10 +57,16 @@ impl ApiState {
             None => PricingEngine::from_entropy()
                 .unwrap_or_else(|_| PricingEngine::with_seed(b"fallback")),
         };
-        let (audit, audit_startup_error) = match AuditLog::open(config.audit_file()) {
+        let (mut audit, mut audit_startup_error) = match AuditLog::open(config.audit_file()) {
             Ok(audit) => (Some(audit), None),
             Err(error) => (None, Some(format!("{}: {}", error.code, error.message))),
         };
+        if let Some(log) = audit.as_mut() {
+            if let Err(error) = reconcile_pricing_intents(&engine, log) {
+                audit = None;
+                audit_startup_error = Some(error);
+            }
+        }
         ApiState {
             engine,
             config: config.clone(),
@@ -96,6 +102,13 @@ impl ApiState {
         let name = body.get_str("name").ok_or_else(|| {
             Response::error(400, "invalid_request", "collection 'name' is required")
         })?;
+        if is_managed_pricing_collection(name) {
+            return Err(Response::error(
+                403,
+                "managed_collection",
+                format!("'{name}' is managed by the pricing API"),
+            ));
+        }
         if preppydb_model::is_forbidden_collection(name) {
             return Err(Response::error(
                 403,
@@ -247,6 +260,17 @@ impl ApiState {
         operation: &str,
         detail: Json,
     ) -> Result<(), Response> {
+        self.audit_transition_with_recovery(operation_id, state, operation, detail, None)
+    }
+
+    fn audit_transition_with_recovery(
+        &self,
+        operation_id: &str,
+        state: &str,
+        operation: &str,
+        detail: Json,
+        recovery: Option<Json>,
+    ) -> Result<(), Response> {
         let mut pricing = self.pricing.lock().unwrap_or_else(|err| err.into_inner());
         let audit = match pricing.audit.as_mut() {
             Some(audit) => audit,
@@ -262,12 +286,13 @@ impl ApiState {
             return Err(Response::error(503, "audit_outcome_unknown", "a prior pricing operation has no durable outcome; inspect the admin recovery report before retrying"));
         }
         if audit
-            .append_pricing_transition(
+            .append_pricing_transition_with_recovery(
                 operation_id,
                 state,
                 preppydb_storage::clock::now_ms(),
                 operation,
                 detail,
+                recovery,
             )
             .is_err()
         {
@@ -365,29 +390,6 @@ impl ApiState {
         self.engine
             .put("price_rules", &rule.item_id, value, PutOptions::default())
             .map_err(db_error)
-    }
-
-    fn append_price_history(
-        &self,
-        item_id: &str,
-        price_cents: i64,
-        previous_cents: i64,
-        rule_version: u64,
-        at: i64,
-        reason: &str,
-    ) -> Result<(), Response> {
-        let key = format!("{item_id}-{at}-{price_cents}");
-        let value = Json::obj()
-            .with("item_id", Json::str(item_id))
-            .with("price_cents", Json::int(price_cents))
-            .with("previous_cents", Json::int(previous_cents))
-            .with("rule_version", Json::uint(rule_version))
-            .with("at", Json::int(at))
-            .with("reason", Json::str(reason));
-        self.engine
-            .put("price_history", &key, value, PutOptions::default())
-            .map_err(db_error)?;
-        Ok(())
     }
 
     // ---------------------------------------------------------------- routing
@@ -544,6 +546,13 @@ impl ApiState {
             }
             ("DELETE", ["v1", "collections", name]) => {
                 self.with_role(principal, Role::Admin, "dropping collections", || {
+                    if is_managed_pricing_collection(name) {
+                        return Response::error(
+                            403,
+                            "managed_collection",
+                            format!("'{name}' is managed by the pricing API"),
+                        );
+                    }
                     if !request.query_bool("confirm") {
                         return Response::error(
                             400,
@@ -1441,6 +1450,13 @@ impl ApiState {
     }
 
     fn check_collection_mutable(&self, collection: &str, is_delete: bool) -> Result<(), Response> {
+        if is_managed_pricing_collection(collection) {
+            return Err(Response::error(
+                403,
+                "managed_collection",
+                format!("'{collection}' is managed by the pricing API"),
+            ));
+        }
         if !preppydb_model::is_immutable_collection(collection) {
             return Ok(());
         }
@@ -1678,11 +1694,12 @@ impl ApiState {
         }
         // Bump the rule version on every definition change so that outstanding offers
         // become stale instead of silently applying to different bounds.
-        let previous_version = self
-            .engine
-            .get_opt("price_rules", item)
-            .ok()
-            .flatten()
+        let previous_doc = match self.engine.get_opt("price_rules", item) {
+            Ok(doc) => doc,
+            Err(error) => return db_error(error),
+        };
+        let previous_version = previous_doc
+            .as_ref()
             .and_then(|doc| doc.value.get_i64("version"))
             .unwrap_or(0);
         definition.set("version", Json::uint(previous_version as u64 + 1));
@@ -1700,11 +1717,19 @@ impl ApiState {
             .with("item_id", Json::str(item))
             .with("version", Json::uint(rule.version))
             .with("rule", rule.to_json());
-        if let Err(response) = self.audit_transition(
+        let mut expected_doc = rule.to_json();
+        expected_doc.set("current_price_cents", Json::int(current));
+        if let Err(response) = self.audit_transition_with_recovery(
             &operation_id,
             "started",
             "rule_updated",
             audit_detail.clone(),
+            Some(pricing_write_recovery(
+                "price_rules",
+                item,
+                expected_doc,
+                previous_doc.map(|doc| doc.value),
+            )),
         ) {
             return response;
         }
@@ -1758,22 +1783,45 @@ impl ApiState {
             current = change.new_cents;
             let operation_id = format!("{}:price_change:{step}", request.request_id);
             let audit_detail = change.to_json();
-            if let Err(response) = self.audit_transition(
+            let history_key = operation_id.clone();
+            let history_value = Json::obj()
+                .with("item_id", Json::str(item))
+                .with("price_cents", Json::int(change.discounted_cents))
+                .with("previous_cents", Json::int(change.previous_cents))
+                .with("rule_version", Json::uint(rule.version))
+                .with("at", Json::int(change.at))
+                .with("reason", Json::str("random_walk"));
+            if let Err(response) = self.audit_transition_with_recovery(
                 &operation_id,
                 "started",
                 "price_change",
                 audit_detail.clone(),
+                Some(pricing_write_recovery(
+                    "price_history",
+                    &history_key,
+                    history_value,
+                    None,
+                )),
             ) {
                 return response;
             }
-            if let Err(response) = self.append_price_history(
-                item,
-                change.discounted_cents,
-                change.previous_cents,
-                rule.version,
-                change.at,
-                "random_walk",
-            ) {
+            if let Err(response) = self
+                .engine
+                .put(
+                    "price_history",
+                    &history_key,
+                    Json::obj()
+                        .with("item_id", Json::str(item))
+                        .with("price_cents", Json::int(change.discounted_cents))
+                        .with("previous_cents", Json::int(change.previous_cents))
+                        .with("rule_version", Json::uint(rule.version))
+                        .with("at", Json::int(change.at))
+                        .with("reason", Json::str("random_walk")),
+                    PutOptions::default(),
+                )
+                .map(|_| ())
+                .map_err(db_error)
+            {
                 return self.audit_known_failure(
                     &operation_id,
                     "price_change",
@@ -1793,11 +1841,23 @@ impl ApiState {
             .with("item_id", Json::str(item))
             .with("rule_version", Json::uint(rule.version))
             .with("current_price_cents", Json::int(current));
-        if let Err(response) = self.audit_transition(
+        let stored_rule_before = match self.engine.get_opt("price_rules", item) {
+            Ok(doc) => doc.map(|doc| doc.value),
+            Err(error) => return db_error(error),
+        };
+        let mut expected_rule = rule.to_json();
+        expected_rule.set("current_price_cents", Json::int(current));
+        if let Err(response) = self.audit_transition_with_recovery(
             &operation_id,
             "started",
             "rule_price_update",
             rule_detail.clone(),
+            Some(pricing_write_recovery(
+                "price_rules",
+                item,
+                expected_rule,
+                stored_rule_before,
+            )),
         ) {
             return response;
         }
@@ -1868,9 +1928,22 @@ impl ApiState {
             }
         };
         let operation_id = format!("{}:offer_created", request.request_id);
-        if let Err(response) =
-            self.audit_transition(&operation_id, "started", "offer_created", offer.to_json())
-        {
+        let previous_offer = match self.engine.get_opt("price_offers", &offer.offer_id) {
+            Ok(doc) => doc.map(|doc| doc.value),
+            Err(error) => return db_error(error),
+        };
+        if let Err(response) = self.audit_transition_with_recovery(
+            &operation_id,
+            "started",
+            "offer_created",
+            offer.to_json(),
+            Some(pricing_write_recovery(
+                "price_offers",
+                &offer.offer_id,
+                offer.to_json(),
+                previous_offer,
+            )),
+        ) {
             return response;
         }
         match self.engine.put(
@@ -1998,13 +2071,41 @@ impl ApiState {
         let mut updated_offer = offer_doc.value.clone();
         updated_offer.set("redeemed", Json::Bool(true));
         updated_offer.set("purchase_id", Json::str(purchase.purchase_id.clone()));
-        if let Err(err) = txn.put("price_offers", &offer_id, updated_offer, None) {
+        let previous_purchase = match self.engine.get_opt("purchases", &purchase.purchase_id) {
+            Ok(doc) => doc.map(|doc| doc.value),
+            Err(error) => return db_error(error),
+        };
+        if previous_purchase.is_some() {
+            return Response::error(
+                503,
+                "audit_outcome_unknown",
+                "purchase identifier already exists; no new purchase was recorded",
+            );
+        }
+        if let Err(err) = txn.put("price_offers", &offer_id, updated_offer.clone(), None) {
             return db_error(err);
         }
         let operation_id = format!("{}:purchase", request.request_id);
-        if let Err(response) =
-            self.audit_transition(&operation_id, "started", "purchase", purchase.to_json())
-        {
+        if let Err(response) = self.audit_transition_with_recovery(
+            &operation_id,
+            "started",
+            "purchase",
+            purchase.to_json(),
+            Some(pricing_transaction_recovery(vec![
+                (
+                    "purchases",
+                    &purchase.purchase_id,
+                    purchase.to_json(),
+                    previous_purchase,
+                ),
+                (
+                    "price_offers",
+                    &offer_id,
+                    updated_offer.clone(),
+                    Some(offer_doc.value.clone()),
+                ),
+            ])),
+        ) {
             return response;
         }
         match txn.commit() {
@@ -2106,6 +2207,119 @@ fn preppydb_server_session_ttl() -> i64 {
 }
 
 const CSP: &str = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'self'; form-action 'self'; base-uri 'none'";
+
+fn is_managed_pricing_collection(name: &str) -> bool {
+    matches!(
+        name,
+        "price_rules" | "price_offers" | "price_history" | "purchases"
+    )
+}
+
+/// Reconcile only exact, self-describing pricing intents after the storage engine has
+/// replayed its WAL. Legacy intents and any state that matches neither the recorded
+/// before-image nor the complete expected after-image remain unresolved.
+fn reconcile_pricing_intents(engine: &Engine, audit: &mut AuditLog) -> Result<(), String> {
+    let pending: Vec<Json> = audit.pending_operations().values().cloned().collect();
+    for intent in pending {
+        let Some(recovery) = intent.get("recovery") else {
+            continue;
+        };
+        let Some(documents) = recovery.get("documents").and_then(Json::as_array) else {
+            continue;
+        };
+        if documents.is_empty() {
+            continue;
+        }
+        let mut all_after = true;
+        let mut all_before = true;
+        let mut unambiguous_after = true;
+        for expected in documents {
+            let (Some(collection), Some(key), Some(expected_value)) = (
+                expected.get_str("collection"),
+                expected.get_str("key"),
+                expected.get("expected"),
+            ) else {
+                all_after = false;
+                all_before = false;
+                break;
+            };
+            let before_exists = expected
+                .get("before_exists")
+                .and_then(Json::as_bool)
+                .unwrap_or(false);
+            let before = expected.get("before");
+            let current = match engine.get_opt(collection, key) {
+                Ok(doc) => doc.map(|doc| doc.value),
+                Err(_) => {
+                    all_after = false;
+                    all_before = false;
+                    break;
+                }
+            };
+            all_after &= current.as_ref() == Some(expected_value);
+            let before_matches = if before_exists {
+                current.as_ref() == before
+            } else {
+                current.is_none()
+            };
+            all_before &= before_matches;
+            unambiguous_after &= !(before_exists && before == Some(expected_value));
+        }
+        let state = if all_after && unambiguous_after {
+            Some("committed")
+        } else if all_before {
+            Some("aborted")
+        } else {
+            None
+        };
+        let Some(state) = state else { continue };
+        let (Some(operation_id), Some(operation), Some(detail)) = (
+            intent.get_str("operation_id"),
+            intent.get_str("operation"),
+            intent.get("detail"),
+        ) else {
+            return Err("pricing audit contains a malformed pending intent".to_string());
+        };
+        audit
+            .append_pricing_transition(
+                operation_id,
+                state,
+                preppydb_storage::clock::now_ms(),
+                operation,
+                detail.clone(),
+            )
+            .map_err(|error| format!("resolving pricing audit intent: {}", error.message))?;
+    }
+    Ok(())
+}
+
+fn pricing_write_recovery(
+    collection: &str,
+    key: &str,
+    expected: Json,
+    before: Option<Json>,
+) -> Json {
+    pricing_transaction_recovery(vec![(collection, key, expected, before)])
+}
+
+fn pricing_transaction_recovery(documents: Vec<(&str, &str, Json, Option<Json>)>) -> Json {
+    Json::obj().with(
+        "documents",
+        Json::Array(
+            documents
+                .into_iter()
+                .map(|(collection, key, expected, before)| {
+                    Json::obj()
+                        .with("collection", Json::str(collection))
+                        .with("key", Json::str(key))
+                        .with("expected", expected)
+                        .with("before_exists", Json::Bool(before.is_some()))
+                        .with("before", before.unwrap_or(Json::Null))
+                })
+                .collect(),
+        ),
+    )
+}
 
 /// Percent-decoded path segments without the leading slash.
 fn path_segments(path: &str) -> Vec<String> {
@@ -2303,5 +2517,92 @@ mod tests {
         assert_eq!(json.get_str("key"), Some("k"));
         assert_eq!(json.get("version").unwrap().as_u64(), Some(2));
         assert!(json.get("expires_at").unwrap().is_null());
+    }
+
+    #[test]
+    fn pricing_intent_recovery_is_exact_and_idempotent() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "preppydb-pricing-recovery-{}-{}",
+            std::process::id(),
+            preppydb_storage::clock::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Engine::open(preppydb_storage::engine::EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("price_rules", 1))
+            .unwrap();
+        let before = Json::obj().with("price", Json::int(100));
+        let after = Json::obj().with("price", Json::int(110));
+        let divergent = Json::obj().with("price", Json::int(120));
+        engine
+            .put(
+                "price_rules",
+                "committed",
+                before.clone(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        engine
+            .put(
+                "price_rules",
+                "ambiguous",
+                divergent.clone(),
+                PutOptions::default(),
+            )
+            .unwrap();
+
+        let audit_path = dir.join("pricing-audit.log");
+        let mut audit = AuditLog::open(&audit_path).unwrap();
+        for (id, key, expected, prior) in [
+            ("commit", "committed", after.clone(), Some(before.clone())),
+            ("abort", "not-applied", after.clone(), None),
+            ("unknown", "ambiguous", after.clone(), Some(before.clone())),
+        ] {
+            audit
+                .append_pricing_transition_with_recovery(
+                    id,
+                    "started",
+                    2,
+                    "rule_updated",
+                    Json::obj().with("key", Json::str(key)),
+                    Some(pricing_write_recovery("price_rules", key, expected, prior)),
+                )
+                .unwrap();
+        }
+        engine
+            .put("price_rules", "committed", after, PutOptions::default())
+            .unwrap();
+
+        reconcile_pricing_intents(&engine, &mut audit).unwrap();
+        assert_eq!(audit.pending_operations().len(), 1);
+        assert!(audit.pending_operations().contains_key("unknown"));
+        assert_eq!(audit.entry_count(), 5);
+
+        let mut reopened = AuditLog::open(&audit_path).unwrap();
+        reconcile_pricing_intents(&engine, &mut reopened).unwrap();
+        assert_eq!(reopened.pending_operations().len(), 1);
+        assert_eq!(reopened.entry_count(), 5);
+        let outcomes: Vec<(&str, &str)> = reopened
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.kind == "pricing_operation_committed"
+                    || entry.kind == "pricing_operation_aborted"
+            })
+            .map(|entry| {
+                (
+                    entry.kind.as_str(),
+                    entry.detail.get_str("operation_id").unwrap(),
+                )
+            })
+            .collect();
+        assert!(outcomes.contains(&("pricing_operation_committed", "commit")));
+        assert!(outcomes.contains(&("pricing_operation_aborted", "abort")));
+
+        drop(reopened);
+        drop(audit);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
