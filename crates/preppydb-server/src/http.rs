@@ -757,6 +757,7 @@ fn valid_header_value(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
 
     struct NoopHandler;
 
@@ -764,6 +765,77 @@ mod tests {
         fn handle(&self, _request: &Request) -> Response {
             Response::empty(204)
         }
+    }
+
+    struct EchoPathHandler;
+
+    impl Handler for EchoPathHandler {
+        fn handle(&self, request: &Request) -> Response {
+            Response::new(
+                200,
+                "text/plain; charset=utf-8",
+                request.path.as_bytes().to_vec(),
+            )
+        }
+    }
+
+    #[test]
+    fn serves_multiple_keep_alive_requests_on_one_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let server = std::thread::spawn(move || {
+            serve(
+                listener,
+                Arc::new(EchoPathHandler),
+                HttpLimits {
+                    workers: 1,
+                    ..HttpLimits::default()
+                },
+                thread_shutdown,
+                Arc::new(ServerCounters::default()),
+            )
+            .unwrap();
+        });
+
+        let client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut client = BufReader::new(client);
+        for (path, connection) in [("/first", "keep-alive"), ("/second", "close")] {
+            write!(
+                client.get_mut(),
+                "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: {connection}\r\n\r\n"
+            )
+            .unwrap();
+            client.get_mut().flush().unwrap();
+
+            let mut status = String::new();
+            client.read_line(&mut status).unwrap();
+            assert!(status.starts_with("HTTP/1.1 200 "), "{status:?}");
+            let mut content_length = None;
+            loop {
+                let mut header = String::new();
+                client.read_line(&mut header).unwrap();
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            let mut body = vec![0; content_length.expect("response needs content-length")];
+            client.read_exact(&mut body).unwrap();
+            assert_eq!(body, path.as_bytes());
+        }
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(address);
+        server.join().unwrap();
     }
 
     #[test]

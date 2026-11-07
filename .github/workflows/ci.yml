@@ -162,6 +162,7 @@ jobs:
                 -ArgumentList "--data-dir", $data, "--listen", "127.0.0.1:7070" `
                 -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
             $healthy = $false
+            $closeHeaders = @{ Connection = "close" }
             $stage = "health check"
             for ($i = 0; $i -lt 30; $i++) {
               Start-Sleep -Milliseconds 500
@@ -169,12 +170,12 @@ jobs:
                 throw "server exited with code $($server.ExitCode) before becoming healthy"
               }
               try {
-                $health = Invoke-RestMethod -Uri "http://127.0.0.1:7070/healthz" -TimeoutSec 2
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:7070/healthz" -Headers $closeHeaders -TimeoutSec 2
                 if ($health.status -eq "ok") { $healthy = $true; break }
               } catch { }
             }
             if (-not $healthy) { throw "server did not become healthy" }
-            $headers = @{ Authorization = "Bearer $token" }
+            $headers = @{ Authorization = "Bearer $token"; Connection = "close" }
             $stage = "create collection"
             Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections" `
                 -Headers $headers -ContentType "application/json" -Body '{"name":"windows_smoke"}' | Out-Null
@@ -187,6 +188,7 @@ jobs:
             Write-Host "smoke test passed"
           } catch {
             Write-Host "::error::Smoke test failed during $stage`: $($_.Exception.ToString())"
+            if ($server -and $server.HasExited) { Write-Host "server-exit-code: $($server.ExitCode)" }
             if (Test-Path $out) { Get-Content $out -Tail 30 | ForEach-Object { Write-Host "server-out: $_" } }
             if (Test-Path $err) { Get-Content $err -Tail 30 | ForEach-Object { Write-Host "server-err: $_" } }
             exit 1
