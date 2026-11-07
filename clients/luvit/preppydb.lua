@@ -401,9 +401,13 @@ preppydb.percent_encode = percent_encode
 preppydb.encode_path = encode_path
 
 local function parse_url(url)
-  local scheme, rest = tostring(url):match("^(%w+)://(.*)$")
+  url = tostring(url)
+  if url:find("[%c%s]") then
+    return nil, "url contains whitespace or control characters"
+  end
+  local scheme, rest = url:match("^(%w+)://(.*)$")
   if not scheme then
-    return nil, "url must start with http:// (got '" .. tostring(url) .. "')"
+    return nil, "url must start with http:// (got '" .. url .. "')"
   end
   if scheme ~= "http" then
     return nil, "unsupported scheme '" .. scheme .. "': the client speaks plain HTTP "

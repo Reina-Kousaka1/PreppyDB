@@ -61,6 +61,19 @@ do
   end)
 end
 
+do
+  for _, bad_url in ipairs({
+    "http://127.0.0.1:7077/base\r\nX-Injected: yes",
+    "http://127.0.0.1:7077/has space",
+  }) do
+    local transport, calls = recorder({})
+    local rejected, err = preppydb.new({ url = bad_url, transport = transport })
+    t:equal(rejected, nil, "constructor rejects URL whitespace and controls")
+    t:truthy(type(err) == "string", "invalid URL returns a configuration error")
+    t:equal(#calls, 0, "invalid URL is rejected before transport")
+  end
+end
+
 -- ------------------------------------------------------------- happy paths
 do
   local client, calls = new_client({
