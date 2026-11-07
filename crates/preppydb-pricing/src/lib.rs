@@ -515,6 +515,58 @@ pub struct AuditLog {
     /// Persistence may have succeeded partially or fully even when append returned
     /// an error. Require reopening and rescanning before this handle can be reused.
     poisoned: bool,
+    /// Pricing mutations are bracketed by durable start and terminal records. An
+    /// unfinished start means the database outcome must be inspected before writes
+    /// can resume.
+    pending_operations: std::collections::BTreeMap<String, Json>,
+}
+
+const PRICING_STARTED: &str = "pricing_operation_started";
+const PRICING_COMMITTED: &str = "pricing_operation_committed";
+const PRICING_ABORTED: &str = "pricing_operation_aborted";
+
+fn update_pending_operation(
+    pending: &mut std::collections::BTreeMap<String, Json>,
+    kind: &str,
+    detail: &Json,
+) -> Result<()> {
+    if !matches!(kind, PRICING_STARTED | PRICING_COMMITTED | PRICING_ABORTED) {
+        return Ok(());
+    }
+    let id = detail.get_str("operation_id").ok_or_else(|| {
+        PricingError::new(
+            codes::AUDIT_INTEGRITY,
+            "pricing audit transition has no operation_id",
+        )
+    })?;
+    match kind {
+        PRICING_STARTED => {
+            if pending.contains_key(id) {
+                return Err(PricingError::new(
+                    codes::AUDIT_INTEGRITY,
+                    "pricing operation was started more than once",
+                ));
+            }
+            pending.insert(id.to_string(), detail.clone());
+        }
+        PRICING_COMMITTED | PRICING_ABORTED => {
+            let Some(start) = pending.get(id) else {
+                return Err(PricingError::new(
+                    codes::AUDIT_INTEGRITY,
+                    "pricing operation has a terminal record without a start",
+                ));
+            };
+            if start.get_str("operation") != detail.get_str("operation") {
+                return Err(PricingError::new(
+                    codes::AUDIT_INTEGRITY,
+                    "pricing operation terminal record does not match its start",
+                ));
+            }
+            pending.remove(id);
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 
 /// Maximum serialized size of one audit record, including its line terminator.
@@ -691,11 +743,24 @@ impl AuditLog {
             entry_count: 0,
             head_hash: ZERO_AUDIT_HASH.to_string(),
             poisoned: false,
+            pending_operations: std::collections::BTreeMap::new(),
         };
         let path = log.path.clone();
+        let mut transition_error = None;
         let (entry_count, head_hash) = scan_audit_log(&path, |entry, size| {
+            if transition_error.is_none() {
+                transition_error = update_pending_operation(
+                    &mut log.pending_operations,
+                    &entry.kind,
+                    &entry.detail,
+                )
+                .err();
+            }
             retain_audit_entry(&mut log, entry, size);
         })?;
+        if let Some(error) = transition_error {
+            return Err(error);
+        }
         log.entry_count = entry_count;
         log.head_hash = head_hash;
         Ok(log)
@@ -712,6 +777,45 @@ impl AuditLog {
     /// Total verified entries in the file; `entries()` returns only the bounded recent tail.
     pub fn entry_count(&self) -> u64 {
         self.entry_count
+    }
+
+    /// Pricing operations whose durable start record has no durable terminal record.
+    /// These outcomes require inspection and must not be retried automatically.
+    pub fn pending_operations(&self) -> &std::collections::BTreeMap<String, Json> {
+        &self.pending_operations
+    }
+
+    /// Append a truthful operation boundary. The start record is persisted before
+    /// the database mutation; a terminal record is persisted only after its outcome
+    /// is known. An unmatched start survives restart and is reported as unresolved.
+    pub fn append_pricing_transition(
+        &mut self,
+        operation_id: &str,
+        state: &str,
+        at: i64,
+        operation: &str,
+        detail: Json,
+    ) -> Result<AuditEntry> {
+        let kind = match state {
+            "started" => PRICING_STARTED,
+            "committed" => PRICING_COMMITTED,
+            "aborted" => PRICING_ABORTED,
+            _ => {
+                return Err(PricingError::new(
+                    codes::AUDIT_INTEGRITY,
+                    "unknown pricing audit transition",
+                ))
+            }
+        };
+        let transition = Json::obj()
+            .with("operation_id", Json::str(operation_id))
+            .with("operation", Json::str(operation))
+            .with("detail", detail);
+        let mut candidate = self.pending_operations.clone();
+        update_pending_operation(&mut candidate, kind, &transition)?;
+        let entry = self.append(kind, at, transition)?;
+        self.pending_operations = candidate;
+        Ok(entry)
     }
 
     /// Append an entry, chaining it to the previous one and flushing to disk.
@@ -735,6 +839,27 @@ impl AuditLog {
                 "audit log handle is unusable after an uncertain append; reopen it",
             ));
         }
+        if matches!(kind, PRICING_STARTED | PRICING_COMMITTED | PRICING_ABORTED) {
+            let mut candidate = self.pending_operations.clone();
+            update_pending_operation(&mut candidate, kind, &detail)?;
+            // Apply the transition only after append persistence succeeds.
+            let entry = self.append_validated(kind, at, detail, persist)?;
+            self.pending_operations = candidate;
+            return Ok(entry);
+        }
+        self.append_validated(kind, at, detail, persist)
+    }
+
+    fn append_validated<F>(
+        &mut self,
+        kind: &str,
+        at: i64,
+        detail: Json,
+        persist: F,
+    ) -> Result<AuditEntry>
+    where
+        F: FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+    {
         let seq = self
             .entry_count
             .checked_add(1)
@@ -1234,6 +1359,49 @@ mod tests {
         let err = AuditLog::open(&path).unwrap_err();
         assert_eq!(err.code, codes::AUDIT_INTEGRITY);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unresolved_pricing_transition_survives_restart_until_terminal_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-transition-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("audit.log");
+        let detail = Json::obj()
+            .with("item_id", Json::str("hat"))
+            .with("price_cents", Json::int(125));
+        let mut log = AuditLog::open(&path).unwrap();
+        log.append_pricing_transition(
+            "request-1:offer",
+            "started",
+            100,
+            "offer_created",
+            detail.clone(),
+        )
+        .unwrap();
+        assert_eq!(log.pending_operations().len(), 1);
+        drop(log);
+
+        let mut recovered = AuditLog::open(&path).unwrap();
+        assert_eq!(recovered.pending_operations().len(), 1);
+        assert_eq!(
+            recovered.pending_operations()["request-1:offer"].get_str("operation"),
+            Some("offer_created")
+        );
+        recovered
+            .append_pricing_transition("request-1:offer", "committed", 101, "offer_created", detail)
+            .unwrap();
+        assert!(recovered.pending_operations().is_empty());
+        drop(recovered);
+        let reopened = AuditLog::open(&path).unwrap();
+        assert!(reopened.pending_operations().is_empty());
+        reopened.verify().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

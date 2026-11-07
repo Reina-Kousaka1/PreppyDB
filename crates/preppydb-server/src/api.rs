@@ -240,18 +240,58 @@ impl ApiState {
         Ok(())
     }
 
-    fn audit_append(&self, kind: &str, detail: Json) -> Result<(), Response> {
+    fn audit_transition(
+        &self,
+        operation_id: &str,
+        state: &str,
+        operation: &str,
+        detail: Json,
+    ) -> Result<(), Response> {
         let mut pricing = self.pricing.lock().unwrap_or_else(|err| err.into_inner());
-        let result = match pricing.audit.as_mut() {
-            Some(audit) => audit.append(kind, preppydb_storage::clock::now_ms(), detail),
-            None => return Err(Response::error(503, "audit_unavailable", "audit unavailable; the pricing operation may already have committed; inspect its state before retrying")),
+        let audit = match pricing.audit.as_mut() {
+            Some(audit) => audit,
+            None => {
+                return Err(Response::error(
+                    503,
+                    "audit_unavailable",
+                    "pricing audit is unavailable; no mutation was started",
+                ))
+            }
         };
-        if result.is_err() {
-            // A partial append or failed sync leaves the on-disk chain uncertain.
+        if state == "started" && !audit.pending_operations().is_empty() {
+            return Err(Response::error(503, "audit_outcome_unknown", "a prior pricing operation has no durable outcome; inspect the admin recovery report before retrying"));
+        }
+        if audit
+            .append_pricing_transition(
+                operation_id,
+                state,
+                preppydb_storage::clock::now_ms(),
+                operation,
+                detail,
+            )
+            .is_err()
+        {
             pricing.audit = None;
-            return Err(Response::error(503, "audit_unavailable", "audit append failed; the pricing operation may already have committed; inspect its state before retrying"));
+            return Err(Response::error(503, "audit_unavailable", "pricing audit transition could not be persisted; inspect the audit log and database before retrying"));
         }
         Ok(())
+    }
+
+    fn audit_known_failure(
+        &self,
+        operation_id: &str,
+        operation: &str,
+        detail: Json,
+        response: Response,
+    ) -> Response {
+        if response.status < 500 {
+            if let Err(audit_error) =
+                self.audit_transition(operation_id, "aborted", operation, detail)
+            {
+                return audit_error;
+            }
+        }
+        response
     }
 
     fn require_audit(&self) -> Result<(), Response> {
@@ -261,6 +301,17 @@ impl ApiState {
                 503,
                 "audit_unavailable",
                 "pricing audit is unavailable",
+            ));
+        }
+        if pricing
+            .audit
+            .as_ref()
+            .is_some_and(|audit| !audit.pending_operations().is_empty())
+        {
+            return Err(Response::error(
+                503,
+                "audit_outcome_unknown",
+                "a pricing operation has no durable terminal audit record; inspect its database state before retrying",
             ));
         }
         Ok(())
@@ -799,12 +850,19 @@ impl ApiState {
                         .iter()
                         .map(|note| note.to_json())
                         .collect();
-                    let audit_available = self
-                        .pricing
-                        .lock()
-                        .unwrap_or_else(|err| err.into_inner())
+                    let pricing = self.pricing.lock().unwrap_or_else(|err| err.into_inner());
+                    let audit_available = pricing.audit.is_some();
+                    let pending_operations = pricing
                         .audit
-                        .is_some();
+                        .as_ref()
+                        .map(|audit| {
+                            audit
+                                .pending_operations()
+                                .values()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
                     ok_data(
                         Json::obj()
                             .with("notes", Json::Array(notes))
@@ -819,7 +877,8 @@ impl ApiState {
                                             .as_deref()
                                             .map(Json::str)
                                             .unwrap_or(Json::Null),
-                                    ),
+                                    )
+                                    .with("pending_operations", Json::Array(pending_operations)),
                             ),
                     )
                 })
@@ -1636,16 +1695,25 @@ impl ApiState {
             return Response::error(422, err.code, err.message);
         }
         let current = rule.anchor_price_cents;
-        if let Err(response) = self.store_rule(&rule, current) {
+        let operation_id = format!("{}:rule_updated", request.request_id);
+        let audit_detail = Json::obj()
+            .with("item_id", Json::str(item))
+            .with("version", Json::uint(rule.version))
+            .with("rule", rule.to_json());
+        if let Err(response) = self.audit_transition(
+            &operation_id,
+            "started",
+            "rule_updated",
+            audit_detail.clone(),
+        ) {
             return response;
         }
-        if let Err(response) = self.audit_append(
-            "rule_updated",
-            Json::obj()
-                .with("item_id", Json::str(item))
-                .with("version", Json::uint(rule.version))
-                .with("rule", rule.to_json()),
-        ) {
+        if let Err(response) = self.store_rule(&rule, current) {
+            return self.audit_known_failure(&operation_id, "rule_updated", audit_detail, response);
+        }
+        if let Err(response) =
+            self.audit_transition(&operation_id, "committed", "rule_updated", audit_detail)
+        {
             return response;
         }
         let mut value = rule.to_json();
@@ -1678,7 +1746,7 @@ impl ApiState {
             Err(response) => return response,
         };
         let mut changes = Vec::with_capacity(steps);
-        for _ in 0..steps {
+        for step in 0..steps {
             let now = preppydb_storage::clock::now_ms();
             let change = {
                 let mut pricing = self.pricing.lock().unwrap_or_else(|err| err.into_inner());
@@ -1688,6 +1756,16 @@ impl ApiState {
                 }
             };
             current = change.new_cents;
+            let operation_id = format!("{}:price_change:{step}", request.request_id);
+            let audit_detail = change.to_json();
+            if let Err(response) = self.audit_transition(
+                &operation_id,
+                "started",
+                "price_change",
+                audit_detail.clone(),
+            ) {
+                return response;
+            }
             if let Err(response) = self.append_price_history(
                 item,
                 change.discounted_cents,
@@ -1696,14 +1774,44 @@ impl ApiState {
                 change.at,
                 "random_walk",
             ) {
-                return response;
+                return self.audit_known_failure(
+                    &operation_id,
+                    "price_change",
+                    audit_detail,
+                    response,
+                );
             }
-            if let Err(response) = self.audit_append("price_change", change.to_json()) {
+            if let Err(response) =
+                self.audit_transition(&operation_id, "committed", "price_change", audit_detail)
+            {
                 return response;
             }
             changes.push(change.to_json());
         }
+        let operation_id = format!("{}:rule_price_update", request.request_id);
+        let rule_detail = Json::obj()
+            .with("item_id", Json::str(item))
+            .with("rule_version", Json::uint(rule.version))
+            .with("current_price_cents", Json::int(current));
+        if let Err(response) = self.audit_transition(
+            &operation_id,
+            "started",
+            "rule_price_update",
+            rule_detail.clone(),
+        ) {
+            return response;
+        }
         if let Err(response) = self.store_rule(&rule, current) {
+            return self.audit_known_failure(
+                &operation_id,
+                "rule_price_update",
+                rule_detail,
+                response,
+            );
+        }
+        if let Err(response) =
+            self.audit_transition(&operation_id, "committed", "rule_price_update", rule_detail)
+        {
             return response;
         }
         ok_data(
@@ -1759,6 +1867,12 @@ impl ApiState {
                 Err(err) => return Response::error(422, err.code, err.message),
             }
         };
+        let operation_id = format!("{}:offer_created", request.request_id);
+        if let Err(response) =
+            self.audit_transition(&operation_id, "started", "offer_created", offer.to_json())
+        {
+            return response;
+        }
         match self.engine.put(
             "price_offers",
             &offer.offer_id,
@@ -1766,7 +1880,12 @@ impl ApiState {
             PutOptions::default(),
         ) {
             Ok(_) => {
-                if let Err(response) = self.audit_append("offer_created", offer.to_json()) {
+                if let Err(response) = self.audit_transition(
+                    &operation_id,
+                    "committed",
+                    "offer_created",
+                    offer.to_json(),
+                ) {
                     return response;
                 }
                 Response::json(
@@ -1776,7 +1895,10 @@ impl ApiState {
                         .with("data", offer.to_json()),
                 )
             }
-            Err(err) => db_error(err),
+            Err(err) => {
+                let response = db_error(err);
+                self.audit_known_failure(&operation_id, "offer_created", offer.to_json(), response)
+            }
         }
     }
 
@@ -1879,9 +2001,20 @@ impl ApiState {
         if let Err(err) = txn.put("price_offers", &offer_id, updated_offer, None) {
             return db_error(err);
         }
+        let operation_id = format!("{}:purchase", request.request_id);
+        if let Err(response) =
+            self.audit_transition(&operation_id, "started", "purchase", purchase.to_json())
+        {
+            return response;
+        }
         match txn.commit() {
             Ok(outcome) => {
-                if let Err(response) = self.audit_append("purchase", purchase.to_json()) {
+                if let Err(response) = self.audit_transition(
+                    &operation_id,
+                    "committed",
+                    "purchase",
+                    purchase.to_json(),
+                ) {
                     return response;
                 }
                 Response::json(
@@ -1894,7 +2027,10 @@ impl ApiState {
                     ),
                 )
             }
-            Err(err) => db_error(err),
+            Err(err) => {
+                let response = db_error(err);
+                self.audit_known_failure(&operation_id, "purchase", purchase.to_json(), response)
+            }
         }
     }
 

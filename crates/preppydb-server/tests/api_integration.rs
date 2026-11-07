@@ -6,6 +6,7 @@
 
 use preppydb_client::Client;
 use preppydb_json::Json;
+use preppydb_pricing::AuditLog;
 use preppydb_server::api::ApiState;
 use preppydb_server::auth::{AuthStore, Role};
 use preppydb_server::config::ServerConfig;
@@ -651,14 +652,14 @@ fn pricing_audit_failure_is_reported_and_disables_further_writes() {
     let stored = client.get_document("price_rules", "skirt").unwrap();
     assert_eq!(
         stored.get_path("value.version").and_then(|v| v.as_u64()),
-        Some(2)
+        Some(1)
     );
     let err = client.put_price_rule(&rule).unwrap_err();
     assert_eq!(err.code(), Some("audit_unavailable"));
     let stored = client.get_document("price_rules", "skirt").unwrap();
     assert_eq!(
         stored.get_path("value.version").and_then(|v| v.as_u64()),
-        Some(2)
+        Some(1)
     );
 }
 
@@ -685,6 +686,70 @@ fn admin_recovery_reports_pricing_audit_startup_failure() {
     let error = admin_client(&server).put_price_rule(&rule).unwrap_err();
     assert_eq!(error.status(), Some(503));
     assert_eq!(error.code(), Some("audit_unavailable"));
+}
+
+#[test]
+fn unresolved_pricing_audit_intent_blocks_retries_after_restart() {
+    let server = start("pricing-audit-unresolved", |config| {
+        let audit_path = config.data_path.join("pricing-audit.log");
+        let mut audit = AuditLog::open(&audit_path).unwrap();
+        audit
+            .append_pricing_transition(
+                "request-before-crash:purchase",
+                "started",
+                100,
+                "purchase",
+                Json::obj()
+                    .with("purchase_id", Json::str("purchase-1"))
+                    .with("price_cents", Json::int(250)),
+            )
+            .unwrap();
+
+        // Model a process that durably changed the database, then terminated before
+        // it could append the terminal audit record.
+        let engine = Engine::open(EngineConfig::new(&config.data_path)).unwrap();
+        engine
+            .create_collection(preppydb_storage::catalog::CollectionMeta::new(
+                "purchases",
+                100,
+            ))
+            .unwrap();
+        engine
+            .put(
+                "purchases",
+                "purchase-1",
+                Json::obj().with("price_cents", Json::int(250)),
+                Default::default(),
+            )
+            .unwrap();
+        drop(engine);
+        config.pricing_audit_path = Some(audit_path);
+    });
+
+    let recovery = admin_client(&server).recovery().unwrap();
+    let audit = recovery.get("pricing_audit").unwrap();
+    let pending = audit
+        .get("pending_operations")
+        .and_then(Json::as_array)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].get_str("operation"), Some("purchase"));
+    assert_eq!(
+        admin_client(&server)
+            .get_document("purchases", "purchase-1")
+            .unwrap()
+            .get_path("value.price_cents")
+            .and_then(Json::as_i64),
+        Some(250)
+    );
+
+    let rule = preppydb_json::parse(
+        r#"{"item_id":"hat","min_price_cents":100,"max_price_cents":200,"anchor_price_cents":150,"step_cents":20}"#,
+    )
+    .unwrap();
+    let error = admin_client(&server).put_price_rule(&rule).unwrap_err();
+    assert_eq!(error.status(), Some(503));
+    assert_eq!(error.code(), Some("audit_outcome_unknown"));
 }
 
 #[test]
