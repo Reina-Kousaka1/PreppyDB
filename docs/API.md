@@ -91,7 +91,7 @@ unless this capability is intentionally administered.
 * `admin` — everything, plus collection/index creation and deletion, checkpoints,
   compaction, verify, backups, personality bootstrap, audit verification.
 
-Passwords must be at least 12 characters and are stored as PBKDF2-SHA-256 with a per-user
+Passwords must be 12..=512 characters and are stored as PBKDF2-SHA-256 with a per-user
 salt. Tokens are stored as SHA-256 digests; the plaintext is shown exactly once.
 
 ### `POST /v1/auth/login`

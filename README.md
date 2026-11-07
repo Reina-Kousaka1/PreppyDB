@@ -37,7 +37,7 @@ database itself knows nothing about any of them.
 ### Docker (recommended)
 
 ```bash
-export PREPPYDB_ADMIN_PASSWORD='choose-a-long-password'   # min. 12 characters
+export PREPPYDB_ADMIN_PASSWORD='choose-a-long-password'   # 12..512 characters
 docker compose up -d --build
 curl -s http://127.0.0.1:7077/healthz
 ```

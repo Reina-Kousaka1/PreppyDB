@@ -304,6 +304,7 @@ pub const SESSION_TTL_MS: i64 = 8 * 60 * 60 * 1000;
 const MAX_ACTIVE_SESSIONS: usize = 10_000;
 /// Minimum password length accepted for a login user.
 pub const MIN_PASSWORD_LEN: usize = 12;
+pub const MAX_PASSWORD_LEN: usize = 512;
 /// Upper bound for credential file reads, including files that grow during reading.
 pub const MAX_AUTH_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const DUMMY_PASSWORD_SALT: [u8; 16] = [0; 16];
@@ -513,9 +514,15 @@ impl AuthStore {
         roles: Vec<Role>,
     ) -> Result<UserRecord> {
         validate_username(username)?;
-        if password.chars().count() < MIN_PASSWORD_LEN {
+        let password_len = password.chars().count();
+        if password_len < MIN_PASSWORD_LEN {
             return Err(AuthError(format!(
                 "password must be at least {MIN_PASSWORD_LEN} characters"
+            )));
+        }
+        if password_len > MAX_PASSWORD_LEN {
+            return Err(AuthError(format!(
+                "password must be at most {MAX_PASSWORD_LEN} characters"
             )));
         }
         if roles.is_empty() {
@@ -546,9 +553,15 @@ impl AuthStore {
 
     /// Replace a user's password.
     pub fn set_password(&mut self, username: &str, password: &str) -> Result<()> {
-        if password.chars().count() < MIN_PASSWORD_LEN {
+        let password_len = password.chars().count();
+        if password_len < MIN_PASSWORD_LEN {
             return Err(AuthError(format!(
                 "password must be at least {MIN_PASSWORD_LEN} characters"
+            )));
+        }
+        if password_len > MAX_PASSWORD_LEN {
+            return Err(AuthError(format!(
+                "password must be at most {MAX_PASSWORD_LEN} characters"
             )));
         }
         let mut salt = [0u8; 16];
@@ -698,7 +711,7 @@ impl AuthStore {
 
     /// Username/password login; returns a session token valid for [`SESSION_TTL_MS`].
     pub fn login(&mut self, username: &str, password: &str) -> Result<(String, Principal)> {
-        if password.chars().count() > 512 {
+        if password.chars().count() > MAX_PASSWORD_LEN {
             return Err(AuthError("invalid credentials".to_string()));
         }
         let user = self
@@ -863,12 +876,18 @@ mod tests {
     fn password_login_and_weak_password_rejection() {
         let (mut store, dir) = store("login");
         let missing_user = store.login("missing", "wrong password here").unwrap_err();
+        let oversized_password = "x".repeat(MAX_PASSWORD_LEN + 1);
         assert!(store
             .create_user("admin", "short", vec![Role::Admin])
+            .is_err());
+        assert!(store
+            .create_user("oversized", &oversized_password, vec![Role::Admin])
             .is_err());
         store
             .create_user("admin", "correct horse battery", vec![Role::Admin])
             .unwrap();
+        assert!(store.set_password("admin", &oversized_password).is_err());
+        assert!(store.login("admin", &oversized_password).is_err());
         let wrong_password = store.login("admin", "wrong password here").unwrap_err();
         assert_eq!(missing_user.0, wrong_password.0);
         store.set_user_disabled("admin", true).unwrap();
