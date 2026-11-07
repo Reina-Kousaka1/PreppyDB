@@ -242,15 +242,28 @@ pub fn create_backup(
         engine.checkpoint()?;
     }
 
-    engine.with_stable_files(|seq| create_backup_locked(engine, archive, checkpoint_first, seq))
+    engine.with_stable_files(|seq| {
+        create_backup_locked(engine, archive, checkpoint_first, seq, |_, _, _| {})
+    })
 }
 
-fn create_backup_locked(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackupPublicationPoint {
+    TempVerified,
+    ArchiveRenamed,
+    ArchiveDirectorySynced,
+}
+
+fn create_backup_locked<F>(
     engine: &Engine,
     archive: &Path,
     checkpoint_first: bool,
     seq: u64,
-) -> Result<BackupReport> {
+    mut publication_hook: F,
+) -> Result<BackupReport>
+where
+    F: FnMut(BackupPublicationPoint, &Path, &Path),
+{
     let root = engine.paths().root.clone();
     validate_backup_destination(&root, archive)?;
 
@@ -354,18 +367,26 @@ fn create_backup_locked(
     // descriptor-relative publication would be needed to eliminate the final TOCTOU
     // window on hostile, concurrently modified parent directories.
     validate_backup_destination(&root, archive)?;
+    publication_hook(BackupPublicationPoint::TempVerified, &tmp, archive);
     crate::fsutil::replace_file(&tmp, archive)
         .map_err(|err| DbError::io("renaming archive into place", err))?;
     temp_guard.disarm();
-    fsync_dir(archive.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(
-        || Path::new("."),
-    ))
-    .map_err(|err| {
+    publication_hook(BackupPublicationPoint::ArchiveRenamed, &tmp, archive);
+    let archive_parent = archive
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fsync_dir(archive_parent).map_err(|err| {
         DbError::io(
             "backup archive was published but syncing its parent directory failed; publication durability is unknown",
             std::io::Error::other(err.to_string()),
         )
     })?;
+    publication_hook(
+        BackupPublicationPoint::ArchiveDirectorySynced,
+        &tmp,
+        archive,
+    );
 
     Ok(BackupReport {
         archive: archive.display().to_string(),
@@ -800,6 +821,9 @@ where
     extract_archive(&mut reader, &temp)?;
     verify_restored_database(&temp)?;
     sync_staged_tree(&temp)?;
+    // The staged tree has synced its own directories bottom-up. Persist the sibling
+    // name as well before the restore intent can authorize moving the live target.
+    fsync_dir(parent)?;
 
     let aside = parent.join(format!(
         "{}.replaced-{stamp}",
@@ -811,7 +835,19 @@ where
     // Hold the target's writer lock through publication. Engine::open checks the
     // sibling intent both before creating the database directory and again after
     // taking its directory lock, closing the open-vs-restore race for writers.
-    validate_restore_target(target, force)?;
+    let target_existed = validate_restore_target(target, force)?;
+    if !target_existed {
+        // Reserve a missing target with the same in-directory lock used by Engine::open.
+        // An opener that passed the first intent check before this reservation either
+        // wins the lock (and makes restore stop) or loses it before it creates wal/snap.
+        // The intent is written while this lock is held, then the reservation moves
+        // aside with publication just like an empty pre-existing target.
+        match create_restore_directory(target) {
+            Ok(()) => {}
+            Err(_error) if matches!(std::fs::symlink_metadata(target), Ok(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
     let mut target_lock = match std::fs::symlink_metadata(target) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
             Some(FileLock::acquire(target)?)
@@ -834,6 +870,14 @@ where
         publish_restore(&temp, target, &aside, force),
         target,
     )?;
+    let replaced_path = if target_existed {
+        replaced_path
+    } else {
+        // The aside directory contains only the temporary LOCK reservation, not a
+        // database that existed before this restore.
+        let _ = std::fs::remove_dir_all(&aside);
+        None
+    };
 
     Ok(RestoreReport {
         archive: archive.display().to_string(),
@@ -1226,7 +1270,7 @@ fn publish_restore_with<F>(
     target: &Path,
     aside: &Path,
     force: bool,
-    mut sync_parent: F,
+    mut sync_directory: F,
 ) -> Result<Option<String>>
 where
     F: FnMut(&Path) -> Result<()>,
@@ -1234,17 +1278,24 @@ where
     let previous = if validate_restore_target(target, force)? {
         // Exclusive reservation avoids replacing a prior restore's retained data.
         create_restore_directory(aside)?;
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        // Persist the destination directory before moving the old database into it.
+        sync_directory(parent)?;
         let previous = aside.join("previous");
         crate::fsutil::move_path(target, &previous)
             .map_err(|err| DbError::io("moving existing database aside", err))?;
-        let parent = target.parent().unwrap_or_else(|| Path::new("."));
-        if let Err(sync_error) = sync_parent(parent) {
-            if let Err(rollback_error) = crate::fsutil::move_path(&previous, target)
-                .and_then(|()| sync_parent(parent).map_err(std::io::Error::other))
+        if let Err(sync_error) = sync_moved_directory(&mut sync_directory, parent, aside) {
+            if let Err(rollback_error) =
+                crate::fsutil::move_path(&previous, target).and_then(|()| {
+                    sync_moved_directory(&mut sync_directory, aside, parent)
+                        .map_err(std::io::Error::other)
+                })
             {
                 return Err(DbError::RecoveryRequired(format!(
                     "syncing old restore target failed and rollback did not complete; prior database remains at {} (sync: {}; rollback: {})",
-                    previous.display(), sync_error, rollback_error
+                    previous.display(),
+                    sync_error,
+                    rollback_error
                 )));
             }
             return Err(DbError::Io {
@@ -1268,7 +1319,11 @@ where
                         )));
                     }
                     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-                    if let Err(sync_error) = sync_parent(parent) {
+                    if let Err(sync_error) = sync_moved_directory(
+                        &mut sync_directory,
+                        path.parent().unwrap_or_else(|| Path::new(".")),
+                        parent,
+                    ) {
                         return Err(DbError::RecoveryRequired(format!(
                             "restore publication failed and the old database was restored, but syncing its parent failed: {sync_error} (publish: {err})"
                         )));
@@ -1285,7 +1340,7 @@ where
         return Err(DbError::io("moving restored database into place", err));
     }
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    if let Err(error) = sync_parent(parent) {
+    if let Err(error) = sync_directory(parent) {
         let previous_description = previous
             .as_ref()
             .map(|path| format!(" prior database retained at {}", path.display()))
@@ -1296,6 +1351,20 @@ where
         )));
     }
     Ok(previous.map(|path| path.display().to_string()))
+}
+
+/// A rename between directories changes both directory entries. Sync the destination
+/// first so a crash cannot persist the source removal without the retained database
+/// entry, then sync the source directory to persist its removal.
+fn sync_moved_directory<F>(sync_directory: &mut F, source: &Path, destination: &Path) -> Result<()>
+where
+    F: FnMut(&Path) -> Result<()>,
+{
+    sync_directory(destination)?;
+    if source != destination {
+        sync_directory(source)?;
+    }
+    Ok(())
 }
 
 // The archive can change after the initial verification. Verify the exact bytes
@@ -1550,7 +1619,7 @@ mod tests {
         let mut sync_calls = 0;
         let error = publish_restore_with(&staged, &target, &aside, true, |_| {
             sync_calls += 1;
-            if sync_calls == 2 {
+            if sync_calls == 4 {
                 return Err(DbError::io(
                     "injected parent sync failure",
                     std::io::Error::other("injected"),
@@ -1575,32 +1644,35 @@ mod tests {
 
     #[test]
     fn restore_publication_rolls_back_when_syncing_old_target_fails() {
-        let root = tempdir("publish-old-sync-failure");
-        let target = root.join("database");
-        let aside = root.join("aside");
-        let staged = root.join("staged");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("old"), b"old").unwrap();
-        std::fs::create_dir(&staged).unwrap();
-        std::fs::write(staged.join("new"), b"new").unwrap();
+        for fail_sync_call in [2, 3] {
+            let root = tempdir("publish-old-sync-failure");
+            let target = root.join("database");
+            let aside = root.join("aside");
+            let staged = root.join("staged");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("old"), b"old").unwrap();
+            std::fs::create_dir(&staged).unwrap();
+            std::fs::write(staged.join("new"), b"new").unwrap();
 
-        let mut sync_calls = 0;
-        let error = publish_restore_with(&staged, &target, &aside, true, |_| {
-            sync_calls += 1;
-            if sync_calls == 1 {
-                return Err(DbError::io(
-                    "injected parent sync failure",
-                    std::io::Error::other("injected"),
-                ));
-            }
-            Ok(())
-        })
-        .unwrap_err();
+            let mut sync_calls = 0;
+            let error = publish_restore_with(&staged, &target, &aside, true, |_| {
+                sync_calls += 1;
+                if sync_calls == fail_sync_call {
+                    return Err(DbError::io(
+                        "injected old-target directory sync failure",
+                        std::io::Error::other("injected"),
+                    ));
+                }
+                Ok(())
+            })
+            .unwrap_err();
 
-        assert_ne!(error.code(), crate::error::codes::RESTORE_OUTCOME_UNKNOWN);
-        assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old");
-        assert!(!target.join("new").exists());
-        std::fs::remove_dir_all(root).unwrap();
+            assert_ne!(error.code(), crate::error::codes::RESTORE_OUTCOME_UNKNOWN);
+            assert_eq!(sync_calls, 5, "rollback must sync both changed directories");
+            assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old");
+            assert!(!target.join("new").exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -1618,7 +1690,7 @@ mod tests {
             let mut sync_calls = 0;
             let publication = publish_restore_with(&missing_stage, &target, &aside, true, |_| {
                 sync_calls += 1;
-                if fail_rollback_sync && sync_calls == 2 {
+                if fail_rollback_sync && sync_calls == 5 {
                     return Err(DbError::io(
                         "injected rollback sync failure",
                         std::io::Error::other("injected"),
@@ -1626,7 +1698,10 @@ mod tests {
                 }
                 Ok(())
             });
-            assert_eq!(sync_calls, 2, "move and rollback must both be synced");
+            assert_eq!(
+                sync_calls, 5,
+                "both moves must sync both changed directories"
+            );
             assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old");
 
             let error = complete_restore_publication(intent, publication, &target).unwrap_err();
@@ -1664,6 +1739,76 @@ mod tests {
         let engine = Engine::open(crate::engine::EngineConfig::new(&target)).unwrap();
         assert_eq!(engine.stats().total_documents, 0);
         drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_reserves_a_missing_target_before_engine_creates_child_directories() {
+        let root = tempdir("restore-missing-target-reservation");
+        let target = root.join("database");
+        let staged = root.join("staged");
+        let aside = root.join("aside");
+        create_restore_directory(&target).unwrap();
+        let target_lock = FileLock::acquire(&target).unwrap();
+
+        let error = match Engine::open(crate::engine::EngineConfig::new(&target)) {
+            Ok(_) => panic!("restore reservation must prevent a competing open"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), crate::error::codes::LOCKED);
+        assert!(!target.join("wal").exists());
+        assert!(!target.join("snap").exists());
+
+        let intent = RestoreIntent::create(&target, &staged, &aside).unwrap();
+        drop(target_lock);
+        let error = match Engine::open(crate::engine::EngineConfig::new(&target)) {
+            Ok(_) => panic!("an unfinished restore intent must block open"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), crate::error::codes::RECOVERY_REQUIRED);
+        assert!(!target.join("wal").exists());
+        assert!(!target.join("snap").exists());
+
+        intent.complete().unwrap();
+        let engine = Engine::open(crate::engine::EngineConfig::new(&target)).unwrap();
+        assert_eq!(engine.stats().total_documents, 0);
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_target_rename_syncs_destination_and_source_directories() {
+        let root = tempdir("restore-cross-directory-sync");
+        let target = root.join("database");
+        let aside = root.join("aside");
+        let staged = root.join("staged");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("old"), b"old").unwrap();
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("new"), b"new").unwrap();
+        let intent = RestoreIntent::create(&target, &staged, &aside).unwrap();
+
+        let mut synced = Vec::new();
+        let parent = root.as_path();
+        let previous = publish_restore_with(&staged, &target, &aside, true, |directory| {
+            synced.push(directory.to_path_buf());
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(previous, aside.join("previous").display().to_string());
+        assert_eq!(
+            synced,
+            vec![
+                parent.to_path_buf(), // persist the newly reserved aside directory
+                aside.clone(),        // persist `previous` before source removal
+                parent.to_path_buf(), // persist removal of the old target name
+                parent.to_path_buf(), // persist the staged-to-target rename
+            ]
+        );
+        assert_eq!(std::fs::read(target.join("new")).unwrap(), b"new");
+        assert_eq!(std::fs::read(aside.join("previous/old")).unwrap(), b"old");
+        intent.complete().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1797,8 +1942,12 @@ mod tests {
         }
         for phase in [
             "before_publish",
+            "before_publish_missing_target",
             "after_old_target_move",
+            "after_old_destination_sync",
+            "after_old_target_parent_sync",
             "after_new_target_move",
+            "after_new_target_parent_sync",
             "after_intent_retirement",
         ] {
             let root = tempdir(&format!("restore-process-crash-{phase}"));
@@ -1829,6 +1978,9 @@ mod tests {
                 )
                 .unwrap();
                 drop(new);
+            } else if phase == "before_publish_missing_target" {
+                std::fs::create_dir(&staged).unwrap();
+                std::fs::write(staged.join("new"), b"new-state").unwrap();
             } else {
                 std::fs::create_dir(&target).unwrap();
                 std::fs::write(target.join("old"), b"old-state").unwrap();
@@ -1873,6 +2025,13 @@ mod tests {
                     Some("old-state")
                 );
                 drop(previous);
+                let reopened = Engine::open(crate::engine::EngineConfig::new(&target)).unwrap();
+                assert_eq!(reopened.count("c").unwrap(), 1);
+                assert_eq!(
+                    reopened.get("c", "new").unwrap().value.as_str(),
+                    Some("new-state")
+                );
+                drop(reopened);
                 assert!(std::fs::read_dir(&root).unwrap().any(|entry| {
                     entry
                         .unwrap()
@@ -1895,6 +2054,16 @@ mod tests {
                 Err(error) => error,
             };
             assert_eq!(open_error.code(), crate::error::codes::RECOVERY_REQUIRED);
+            let marker_before_retry = std::fs::read(&intent_path).unwrap();
+            assert!(matches!(
+                Engine::open(crate::engine::EngineConfig::new(&target)),
+                Err(DbError::RecoveryRequired(_))
+            ));
+            assert_eq!(
+                std::fs::read(&intent_path).unwrap(),
+                marker_before_retry,
+                "repeated fail-closed recovery checks must not mutate the intent"
+            );
 
             match phase {
                 "before_publish" => {
@@ -1902,7 +2071,16 @@ mod tests {
                     assert_eq!(std::fs::read(staged.join("new")).unwrap(), b"new-state");
                     assert!(!aside.exists());
                 }
-                "after_old_target_move" => {
+                "before_publish_missing_target" => {
+                    assert!(target.is_dir());
+                    assert!(!target.join("wal").exists());
+                    assert!(!target.join("snap").exists());
+                    assert_eq!(std::fs::read(staged.join("new")).unwrap(), b"new-state");
+                    assert!(!aside.exists());
+                }
+                "after_old_target_move"
+                | "after_old_destination_sync"
+                | "after_old_target_parent_sync" => {
                     assert!(!target.exists());
                     assert_eq!(
                         std::fs::read(aside.join("previous/old")).unwrap(),
@@ -1910,7 +2088,7 @@ mod tests {
                     );
                     assert_eq!(std::fs::read(staged.join("new")).unwrap(), b"new-state");
                 }
-                "after_new_target_move" => {
+                "after_new_target_move" | "after_new_target_parent_sync" => {
                     assert_eq!(std::fs::read(target.join("new")).unwrap(), b"new-state");
                     assert_eq!(
                         std::fs::read(aside.join("previous/old")).unwrap(),
@@ -1922,6 +2100,124 @@ mod tests {
             }
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn backup_publication_process_crashes_keep_only_complete_archives() {
+        // qemu-user cannot re-execute this test binary without binfmt_misc. Native
+        // Linux and Windows exercise the process-abort cases.
+        if std::env::var_os("PREPPYDB_SKIP_CHILD_CRASH").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        for phase in ["before_rename", "after_rename", "after_directory_sync"] {
+            let root = tempdir(&format!("backup-process-crash-{phase}"));
+            let database = root.join("database");
+            let archive = root.join("backup.pdbbak");
+            let engine = Engine::open(crate::engine::EngineConfig::new(&database)).unwrap();
+            engine
+                .create_collection(crate::catalog::CollectionMeta::new("c", 0))
+                .unwrap();
+            engine
+                .put(
+                    "c",
+                    "old",
+                    Json::str("old-state"),
+                    crate::engine::PutOptions::default(),
+                )
+                .unwrap();
+            create_backup(&engine, &archive, false).unwrap();
+            let original_digest = archive_sha256(&archive).unwrap();
+            drop(engine);
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backup::tests::backup_publication_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("PREPPYDB_BACKUP_CRASH_ROOT", &root)
+                .env("PREPPYDB_BACKUP_CRASH_PHASE", phase)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "child should abort at {phase}; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            verify_backup(&archive).unwrap();
+            match phase {
+                "before_rename" => {
+                    assert_eq!(archive_sha256(&archive).unwrap(), original_digest);
+                    let temporary_archives = std::fs::read_dir(&root)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .filter(|path| {
+                            path.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".preppydb-backup-")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(temporary_archives.len(), 1);
+                    verify_backup(&temporary_archives[0]).unwrap();
+                }
+                "after_rename" | "after_directory_sync" => {
+                    assert_ne!(archive_sha256(&archive).unwrap(), original_digest);
+                    assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".preppydb-backup-")));
+                }
+                _ => unreachable!(),
+            }
+            let reopened = Engine::open(crate::engine::EngineConfig::new(&database)).unwrap();
+            assert!(reopened.verify().unwrap().ok);
+            assert!(reopened.get_opt("c", "new").unwrap().is_some());
+            drop(reopened);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Child-process crash helper for `backup_publication_process_crashes_keep_only_complete_archives`.
+    #[test]
+    #[ignore = "spawned by backup_publication_process_crashes_keep_only_complete_archives"]
+    fn backup_publication_crash_child() {
+        let Ok(root) = std::env::var("PREPPYDB_BACKUP_CRASH_ROOT") else {
+            return;
+        };
+        let phase = std::env::var("PREPPYDB_BACKUP_CRASH_PHASE").unwrap();
+        let root = PathBuf::from(root);
+        let database = root.join("database");
+        let archive = root.join("backup.pdbbak");
+        let engine = Engine::open(crate::engine::EngineConfig::new(&database)).unwrap();
+        engine
+            .put(
+                "c",
+                "new",
+                Json::str("new-state"),
+                crate::engine::PutOptions::default(),
+            )
+            .unwrap();
+        let _ = engine.with_stable_files(|seq| {
+            create_backup_locked(&engine, &archive, false, seq, |point, _, _| {
+                let crash_point = match phase.as_str() {
+                    "before_rename" => BackupPublicationPoint::TempVerified,
+                    "after_rename" => BackupPublicationPoint::ArchiveRenamed,
+                    "after_directory_sync" => BackupPublicationPoint::ArchiveDirectorySynced,
+                    _ => panic!("unknown backup crash phase: {phase}"),
+                };
+                if point == crash_point {
+                    std::process::abort();
+                }
+            })
+        });
+        panic!("backup crash phase '{phase}' was not reached");
     }
 
     /// Child-process crash helper for `restore_publication_process_crashes_fail_closed_at_rename_boundaries`.
@@ -1936,8 +2232,18 @@ mod tests {
         let target = root.join("database");
         let staged = root.join("staged");
         let aside = root.join("aside");
+        let missing_target = phase == "before_publish_missing_target";
+        if missing_target {
+            create_restore_directory(&target).unwrap();
+        }
+        let target_lock = if missing_target {
+            Some(FileLock::acquire(&target).unwrap())
+        } else {
+            None
+        };
         let intent = RestoreIntent::create(&target, &staged, &aside).unwrap();
-        if phase == "before_publish" {
+        drop(target_lock);
+        if phase == "before_publish" || missing_target {
             std::process::abort();
         }
         if phase == "after_intent_retirement" {
@@ -1951,9 +2257,21 @@ mod tests {
         let mut sync_calls = 0;
         let _ = publish_restore_with(&staged, &target, &aside, true, |parent| {
             sync_calls += 1;
-            if (phase == "after_old_target_move" && sync_calls == 1)
-                || (phase == "after_new_target_move" && sync_calls == 2)
+            if (phase == "after_old_target_move" && sync_calls == 2)
+                || (phase == "after_new_target_move" && sync_calls == 4)
             {
+                std::process::abort();
+            }
+            if phase == "after_old_destination_sync" && sync_calls == 2 {
+                fsync_dir(parent).unwrap();
+                std::process::abort();
+            }
+            if phase == "after_old_target_parent_sync" && sync_calls == 3 {
+                fsync_dir(parent).unwrap();
+                std::process::abort();
+            }
+            if phase == "after_new_target_parent_sync" && sync_calls == 4 {
+                fsync_dir(parent).unwrap();
                 std::process::abort();
             }
             fsync_dir(parent)

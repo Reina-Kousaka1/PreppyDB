@@ -2142,6 +2142,16 @@ fn backup_and_restore_roundtrip() {
     let target = tempdir("backup-dst").join("restored");
     let restored = backup::restore_backup(&archive, &target, false).unwrap();
     assert_eq!(restored.entries, report.entries);
+    assert!(restored.replaced_path.is_none());
+    assert!(!std::fs::read_dir(target.parent().unwrap())
+        .unwrap()
+        .any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("restored.replaced-")
+        }));
     let engine = open(&target);
     assert_eq!(engine.count("people").unwrap(), 20);
     assert_eq!(

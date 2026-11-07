@@ -505,12 +505,8 @@ impl Engine {
         let paths = DataPaths::new(cfg.path.clone());
         if cfg.read_only {
             require_existing_directory(&paths.root, false)?;
-            require_existing_directory(&paths.wal_dir, false)?;
-            require_existing_directory(&paths.snap_dir, true)?;
         } else {
             create_private_dir(&paths.root)?;
-            create_private_dir(&paths.wal_dir)?;
-            create_private_dir(&paths.snap_dir)?;
         }
 
         let lock = if cfg.take_lock {
@@ -526,6 +522,19 @@ impl Engine {
         // creates the directory. Recheck after taking the directory lock so a writer
         // cannot race publication or initialize an empty replacement path.
         crate::backup::ensure_no_restore_intent(&cfg.path)?;
+
+        // Take the target lock before creating child storage directories. Restore
+        // reserves a previously absent target by creating and locking the root, then
+        // publishes its durable intent before releasing that lock. Creating `wal/`
+        // or `snap/` before acquiring the lock would let an opener that passed the
+        // first intent check modify that reservation while restore is publishing.
+        if cfg.read_only {
+            require_existing_directory(&paths.wal_dir, false)?;
+            require_existing_directory(&paths.snap_dir, true)?;
+        } else {
+            create_private_dir(&paths.wal_dir)?;
+            create_private_dir(&paths.snap_dir)?;
+        }
 
         let mut manifest = match Manifest::load(&paths.root)? {
             Some(manifest) => manifest,

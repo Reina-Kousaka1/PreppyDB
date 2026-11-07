@@ -284,8 +284,10 @@ performs that validation, copies and rechecks each member,
 then strictly opens/verifies the staged database before publishing it; an invalid archive
 or database leaves the target untouched. Verification requires temporary disk space
 approximately equal to the database copy. Files and staged directories are synced before
-publication, and the parent directory is synced after each publication rename where the
-platform supports it. Restoring over an existing target requires `--force`, which moves
+publication, and the staged directory's parent is synced before publication. A restore
+reserves the target under its directory lock before writing the durable intent; on
+platforms that support directory sync, a cross-directory move syncs both its destination
+and source directories. Restoring over an existing target requires `--force`, which moves
 the old data to `<target>.replaced-<timestamp>/previous` instead of deleting it. The
 reserved directory must not already exist. Replacing an existing target uses two renames,
 so a process crash between them can leave the original under that `previous` path and the
