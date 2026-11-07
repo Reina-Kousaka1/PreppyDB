@@ -3313,4 +3313,105 @@ mod wal_repair_tests {
         drop(reopened);
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn failed_repair_directory_sync_returns_error_and_reopen_rechecks_barrier() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-wal-repair-directory-sync-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut config = EngineConfig::new(&dir);
+        config.sync_mode = SyncMode::Always;
+        config.max_segment_bytes = wal::WAL_HEADER_LEN + 1;
+        {
+            let engine = Engine::open(config.clone()).unwrap();
+            engine
+                .create_collection(CollectionMeta::new("c", 0))
+                .unwrap();
+            engine
+                .put("c", "baseline", Json::int(0), PutOptions::default())
+                .unwrap();
+            engine.checkpoint().unwrap();
+            for index in 0..3 {
+                engine
+                    .put(
+                        "c",
+                        &format!("post-checkpoint-{index}"),
+                        Json::int(index),
+                        PutOptions::default(),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let segments = wal::list_segments(&dir.join("wal")).unwrap();
+        assert!(
+            segments.len() >= 3,
+            "expected rotated segments: {segments:?}"
+        );
+        let damaged_segment = &segments[0];
+        let mut bytes = std::fs::read(damaged_segment).unwrap();
+        bytes[wal::WAL_HEADER_LEN as usize + 4] ^= 0x80;
+        std::fs::write(damaged_segment, bytes).unwrap();
+        let scan = wal::scan_segment(damaged_segment).unwrap();
+        assert!(scan.corruption.is_some());
+        assert_eq!(scan.valid_len, wal::WAL_HEADER_LEN);
+
+        let mut sync_attempts = 0;
+        let error = repair_corrupt_wal_suffix_with(
+            damaged_segment,
+            &segments[1..],
+            scan.valid_len,
+            |segment, valid_len| {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(segment)
+                    .map_err(|err| DbError::io("opening corrupt WAL segment for repair", err))?;
+                file.set_len(valid_len)
+                    .map_err(|err| DbError::io("truncating corrupt WAL suffix", err))?;
+                file.sync_all()
+                    .map_err(|err| DbError::io("syncing repaired WAL segment", err))
+            },
+            |path| std::fs::remove_file(path),
+            |_| {
+                sync_attempts += 1;
+                Err(DbError::io(
+                    "injected WAL repair directory sync failure",
+                    std::io::Error::other("injected"),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), crate::error::codes::IO_ERROR);
+        assert_eq!(sync_attempts, 1);
+        assert_eq!(
+            std::fs::metadata(damaged_segment).unwrap().len(),
+            wal::WAL_HEADER_LEN
+        );
+        assert!(segments[1..].iter().all(|segment| !segment.exists()));
+
+        // Recovery must reach WalWriter::open, which repeats the directory
+        // durability barrier before exposing an append-capable writer.
+        let reopened = Engine::open(config.clone()).unwrap();
+        assert_eq!(reopened.count("c").unwrap(), 1);
+        assert_eq!(
+            reopened.get("c", "baseline").unwrap().value.as_i64(),
+            Some(0)
+        );
+        reopened
+            .put("c", "after-repair", Json::int(9), PutOptions::default())
+            .unwrap();
+        drop(reopened);
+
+        let verified = Engine::open(config).unwrap();
+        assert_eq!(verified.count("c").unwrap(), 2);
+        assert_eq!(
+            verified.get("c", "after-repair").unwrap().value.as_i64(),
+            Some(9)
+        );
+        drop(verified);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
