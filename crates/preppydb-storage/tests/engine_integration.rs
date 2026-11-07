@@ -1173,13 +1173,21 @@ fn read_only_open_rejects_corrupt_wal_without_mutating_any_segment() {
             .unwrap()
             .map(|entry| entry.unwrap())
             .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("manifest")
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with("manifest")
                     && entry.file_type().unwrap().is_file()
             })
             .map(|entry| (entry.path(), std::fs::read(entry.path()).unwrap()))
             .collect::<Vec<_>>()
     };
     let manifests_before = read_manifests();
+    assert!(
+        !manifests_before.is_empty(),
+        "fixture must include a persisted manifest"
+    );
 
     let mut config = EngineConfig::new(&dir);
     config.read_only = true;
@@ -1256,13 +1264,21 @@ fn read_only_open_preserves_later_segments_after_middle_segment_corruption() {
             .unwrap()
             .map(|entry| entry.unwrap())
             .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with("manifest")
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .starts_with("manifest")
                     && entry.file_type().unwrap().is_file()
             })
             .map(|entry| (entry.path(), std::fs::read(entry.path()).unwrap()))
             .collect::<Vec<_>>()
     };
     let manifests_before = read_manifests();
+    assert!(
+        !manifests_before.is_empty(),
+        "fixture must include a persisted manifest"
+    );
 
     config.read_only = true;
     // Read-only inspection must not truncate the bad segment or remove its suffix.
@@ -1282,6 +1298,119 @@ fn read_only_open_preserves_later_segments_after_middle_segment_corruption() {
         read_manifests(),
         manifests_before,
         "read-only recovery changed manifest files"
+    );
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("recovery-report-")),
+        "read-only recovery must not publish a recovery report"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn read_only_open_preserves_snapshot_and_wal_suffix_after_missing_middle_segment() {
+    let dir = tempdir("readonly-middle-missing-wal");
+    let mut config = EngineConfig::new(&dir);
+    config.sync_mode = SyncMode::Always;
+    config.max_segment_bytes = wal::WAL_HEADER_LEN + 1;
+    {
+        let engine = Engine::open(config.clone()).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "baseline", Json::int(0), PutOptions::default())
+            .unwrap();
+        engine.checkpoint().unwrap();
+        for index in 0..4 {
+            engine
+                .put(
+                    "c",
+                    &format!("post-checkpoint-{index}"),
+                    Json::int(index),
+                    PutOptions::default(),
+                )
+                .unwrap();
+        }
+    }
+
+    let wal_dir = dir.join("wal");
+    let segments = wal::list_segments(&wal_dir).unwrap();
+    assert!(
+        segments.len() >= 4,
+        "expected rotated post-checkpoint segments: {segments:?}"
+    );
+    let missing_segment = &segments[1];
+    std::fs::remove_file(missing_segment).unwrap();
+
+    let wal_before: Vec<_> = wal::list_segments(&wal_dir)
+        .unwrap()
+        .into_iter()
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect();
+    let read_files = |path: &Path| {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| (entry.path(), std::fs::read(entry.path()).unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let manifests_before = read_files(&dir)
+        .into_iter()
+        .filter(|(path, _)| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("manifest")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !manifests_before.is_empty(),
+        "fixture must include a persisted manifest"
+    );
+    let snapshots_before = read_files(&dir.join("snap"));
+    assert!(
+        !snapshots_before.is_empty(),
+        "checkpoint fixture must include a snapshot"
+    );
+
+    config.read_only = true;
+    config.repair = RepairPolicy::TruncateCorruptTail;
+    assert!(matches!(Engine::open(config), Err(DbError::Corrupt { .. })));
+
+    let wal_after = wal::list_segments(&wal_dir)
+        .unwrap()
+        .into_iter()
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wal_after, wal_before,
+        "read-only recovery changed surviving WAL segments"
+    );
+    let manifests_after = read_files(&dir)
+        .into_iter()
+        .filter(|(path, _)| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("manifest")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        manifests_after, manifests_before,
+        "read-only recovery changed manifest files"
+    );
+    assert_eq!(
+        read_files(&dir.join("snap")),
+        snapshots_before,
+        "read-only recovery changed snapshot files"
     );
     assert!(
         std::fs::read_dir(&dir).unwrap().all(|entry| !entry
