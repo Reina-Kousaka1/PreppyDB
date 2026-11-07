@@ -25,14 +25,27 @@ process.
 
 ## Current qualification snapshot
 
-- PreppyDB PR #1 is open at the head above; GitHub reports `CLEAN` merge state and all
-  displayed CI jobs successful. This is merge mechanics, not a finding closure decision.
+- Refreshed on 2026-11-08 against PR #1 head `528b3a9774193688e0bb7f169756e5dfee041144`.
+  The comparison table above remains a point-in-time architectural comparison from the
+  date stated at its top.
+- PR #1 remains open and not draft. GitHub reports `mergeable=true`; that is merge
+  mechanics, not a finding-closure or independent-review decision.
+- CI run [#112](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42421176015)
+  completed successfully for Linux x86-64, Windows x86-64, ARM64/QEMU, Lua/Luvit, Docker
+  image builds, Docker persistence, and the aggregate status. Vercel also reports
+  success. These checks qualify the checked-in head, not local uncommitted changes.
 - The execution plan classifies WAL atomicity, WAL recovery, Windows manifest behavior,
   backup/restore, HTTP, authentication, pricing audit, clients, Ruby/Lua runtime paths,
   platform qualification, and performance qualification as `PARTIAL`.
 - Finding inventory remains `OPEN`: the original review reports 15 findings, while only
   14 can be uniquely identified from the available report and repository records.
-- No independent final review has been recorded.
+- No independent final review has been recorded; there are no submitted PR reviews or
+  inline review threads.
+- Remaining documented qualification limits include interrupted restore replacement
+  requiring fail-closed/manual recovery, no Windows parent-directory flush or universal
+  power-loss guarantee, non-atomic pricing-audit/database mutation, no external trusted
+  anchor for detecting removal of a valid audit suffix, incomplete fault/performance
+  matrices, and ARM64 QEMU rather than physical Raspberry Pi qualification.
 - SeaWorld's current main CI includes Rust 1.89, Ubuntu, and Windows checks. The latest
   main commit was a Dependabot-only commit; its passing Dependabot checks are not engine
   test evidence. The engine CI run identified in the SeaWorld repository history passed
