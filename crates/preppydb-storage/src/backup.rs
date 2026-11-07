@@ -1031,6 +1031,20 @@ impl RestoreIntent {
     where
         F: FnOnce(&Path) -> Result<()>,
     {
+        Self::create_with_sync_hooks(target, staged, aside, |file| file.sync_all(), sync_parent)
+    }
+
+    fn create_with_sync_hooks<S, P>(
+        target: &Path,
+        staged: &Path,
+        aside: &Path,
+        sync_intent: S,
+        sync_parent: P,
+    ) -> Result<Self>
+    where
+        S: FnOnce(&std::fs::File) -> std::io::Result<()>,
+        P: FnOnce(&Path) -> Result<()>,
+    {
         let (path, parent) = restore_intent_path(target)?;
         let target_name = target
             .file_name()
@@ -1084,7 +1098,7 @@ impl RestoreIntent {
                 path.display()
             )));
         }
-        if let Err(error) = file.sync_all() {
+        if let Err(error) = sync_intent(&file) {
             return Err(DbError::RecoveryRequired(format!(
                 "restore intent '{}' was written but could not be synced; database open is blocked for safe inspection: {error}",
                 path.display()
@@ -1676,6 +1690,45 @@ mod tests {
         assert_eq!(error.code(), crate::error::codes::RECOVERY_REQUIRED);
         let intent_path = restore_intent_path(&target).unwrap().0;
         assert!(intent_path.exists(), "visible intent must be retained");
+        assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old-state");
+        assert_eq!(std::fs::read(staged.join("new")).unwrap(), b"new-state");
+        assert!(matches!(
+            Engine::open(crate::engine::EngineConfig::new(&target)),
+            Err(DbError::RecoveryRequired(_))
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_intent_file_sync_failure_retains_marker_and_blocks_open() {
+        let root = tempdir("restore-intent-file-sync-failure");
+        let target = root.join("database");
+        let staged = root.join("staged");
+        let aside = root.join("aside");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("old"), b"old-state").unwrap();
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("new"), b"new-state").unwrap();
+
+        let error = match RestoreIntent::create_with_sync_hooks(
+            &target,
+            &staged,
+            &aside,
+            |_| {
+                Err(std::io::Error::other(
+                    "injected restore intent file sync failure",
+                ))
+            },
+            fsync_dir,
+        ) {
+            Ok(_) => panic!("a failed intent sync must not return a usable restore intent"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), crate::error::codes::RECOVERY_REQUIRED);
+        let intent_path = restore_intent_path(&target).unwrap().0;
+        assert!(intent_path.is_file(), "created intent must be retained");
         assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old-state");
         assert_eq!(std::fs::read(staged.join("new")).unwrap(), b"new-state");
         assert!(matches!(
