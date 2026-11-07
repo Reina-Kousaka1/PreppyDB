@@ -539,13 +539,34 @@ impl AuditEntry {
     }
 
     pub fn from_json(value: &Json) -> Result<AuditEntry> {
+        let invalid = |field: &str| {
+            PricingError::new(
+                codes::AUDIT_INTEGRITY,
+                format!("audit entry is missing a valid '{field}'"),
+            )
+        };
         Ok(AuditEntry {
-            seq: value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
-            at: value.get_i64("at").unwrap_or(0),
-            kind: value.get_str("kind").unwrap_or("").to_string(),
-            detail: value.get("detail").cloned().unwrap_or(Json::Null),
-            prev_hash: value.get_str("prev_hash").unwrap_or("").to_string(),
-            hash: value.get_str("hash").unwrap_or("").to_string(),
+            seq: value
+                .get("seq")
+                .and_then(Json::as_u64)
+                .ok_or_else(|| invalid("seq"))?,
+            at: value.get_i64("at").ok_or_else(|| invalid("at"))?,
+            kind: value
+                .get_str("kind")
+                .ok_or_else(|| invalid("kind"))?
+                .to_string(),
+            detail: value
+                .get("detail")
+                .cloned()
+                .ok_or_else(|| invalid("detail"))?,
+            prev_hash: value
+                .get_str("prev_hash")
+                .ok_or_else(|| invalid("prev_hash"))?
+                .to_string(),
+            hash: value
+                .get_str("hash")
+                .ok_or_else(|| invalid("hash"))?
+                .to_string(),
         })
     }
 }
@@ -1639,6 +1660,56 @@ mod tests {
             AuditLog::open(&path).unwrap_err().code,
             codes::AUDIT_INTEGRITY
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_log_rejects_missing_required_entry_fields_even_with_matching_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-audit-required-fields-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for missing in ["seq", "at", "kind", "detail", "prev_hash", "hash"] {
+            let seq = if missing == "seq" { 0 } else { 1 };
+            let at = if missing == "at" { 0 } else { 123 };
+            let kind = if missing == "kind" { "" } else { "test" };
+            let detail = if missing == "detail" {
+                Json::Null
+            } else {
+                Json::obj().with("sample", Json::int(1))
+            };
+            let prev_hash = if missing == "prev_hash" {
+                ""
+            } else {
+                ZERO_AUDIT_HASH
+            };
+            let hash = AuditEntry::compute_hash(seq, at, kind, &detail, prev_hash);
+            let mut entry = Json::obj()
+                .with("seq", Json::uint(seq))
+                .with("at", Json::int(at))
+                .with("kind", Json::str(kind))
+                .with("detail", detail)
+                .with("prev_hash", Json::str(prev_hash))
+                .with("hash", Json::str(hash));
+            let _ = entry.remove_key(missing);
+
+            let path = dir.join(format!("{missing}.log"));
+            std::fs::write(&path, format!("{entry}\n")).unwrap();
+            let error = AuditLog::open(&path).unwrap_err();
+            assert_eq!(error.code, codes::AUDIT_INTEGRITY, "field {missing}");
+            assert!(
+                error.message.contains(missing),
+                "missing field {missing} should be reported, got: {}",
+                error.message
+            );
+        }
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 
