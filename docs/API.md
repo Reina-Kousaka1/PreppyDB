@@ -321,17 +321,20 @@ See [DATA-MODEL.md](DATA-MODEL.md).
 | `GET /v1/pricing/audit` | admin | audit log entries |
 | `GET /v1/pricing/audit/verify` | admin | verify the audit hash chain |
 
-The pricing audit file and database are separate writes, not one transaction. A
-pricing mutation may already be committed if an audit append fails; in that case
-the server returns `503 audit_unavailable` and clients must inspect the operation's
-state before retrying. Further pricing mutations are rejected until the audit is
-reopened by restarting the server after the cause is resolved. A valid suffix removed
-from the audit file before the first open cannot be detected without an external
-trusted anchor. Each audit record is limited to 1 MiB and parsed with bounded JSON
-limits. The full chain is verified while streaming on open and on explicit verify; the
-server retains only a recent tail bounded by 1,000 entries and 4 MiB of serialized
-records. `GET /v1/pricing/audit` can return fewer entries than requested when the byte
-bound is reached. The verify response reports the total verified entry count.
+The pricing audit file and database are separate writes, not one transaction. Before
+each pricing mutation, the server synchronizes a `pricing_operation_started` record;
+it records `pricing_operation_committed` only after a known successful write and
+`pricing_operation_aborted` after a definite rejection. If the process stops between
+those boundaries, startup exposes the unmatched intent under `pricing_audit.pending_operations`
+in `GET /v1/admin/recovery`, and further pricing writes return `503 audit_outcome_unknown`
+until an operator inspects the database and audit state. If persisting the start record
+fails, the mutation does not begin. A valid suffix removed from the audit file before
+the first open cannot be detected without an external trusted anchor. Each audit record
+is limited to 1 MiB and parsed with bounded JSON limits. The full chain is verified
+while streaming on open and on explicit verify; the server retains only a recent tail
+bounded by 1,000 entries and 4 MiB of serialized records. `GET /v1/pricing/audit` can
+return fewer entries than requested when the byte bound is reached. The verify response
+reports the total verified entry count.
 
 If the audit log cannot be opened at startup, the server records the diagnostic,
 continues to serve non-pricing operations, and rejects pricing mutations. The server

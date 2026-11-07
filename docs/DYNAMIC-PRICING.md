@@ -90,8 +90,12 @@ quoted, forever.
 
 ## Audit log
 
-Every price change, offer, purchase and rule edit appends one entry to
-`<data-dir>/pricing-audit.log`:
+Each persisted pricing mutation is bracketed by records in
+`<data-dir>/pricing-audit.log`. A `pricing_operation_started` record, containing an
+operation ID, operation name and exact intended detail, is synchronized before the
+database write. A `pricing_operation_committed` record is synchronized after a known
+successful write. A definite rejection is recorded as `pricing_operation_aborted`.
+Tick requests record each history change and the final current-price update separately.
 
 ```
 AuditEntry { seq, kind, at, detail, previous_hash, hash }
@@ -101,6 +105,13 @@ AuditEntry { seq, kind, at, detail, previous_hash, hash }
 (or `preppydb audit verify`) recomputes the chain; editing, reordering or deleting an
 entry breaks it and is reported instead of being ignored. The log is append-only from the
 server's point of view — there is no rotate/truncate endpoint.
+
+If the process stops after a start record but before its terminal record, the outcome
+is unresolved. On restart, the admin recovery report lists that intent and pricing
+mutations are blocked with `503 audit_outcome_unknown` until an operator inspects the
+database and audit state. The system does not infer success, invent a terminal record,
+or retry the operation. If writing the start record fails, the database mutation does
+not begin.
 
 Audit records are streamed and verified one at a time on open and explicit verify; a
 record is limited to 1 MiB and parsed with bounded JSON depth/item limits. The in-memory
