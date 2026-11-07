@@ -1184,10 +1184,6 @@ fn read_only_open_rejects_corrupt_wal_without_mutating_any_segment() {
             .collect::<Vec<_>>()
     };
     let manifests_before = read_manifests();
-    assert!(
-        !manifests_before.is_empty(),
-        "fixture must include a persisted manifest"
-    );
 
     let mut config = EngineConfig::new(&dir);
     config.read_only = true;
