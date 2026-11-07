@@ -60,7 +60,7 @@ preppydb-cli:      0 tests (verified manually, see below)
 * **Server smoke test** — started `preppydb-server` on `127.0.0.1:7077` with a bootstrap
   token and exercised, with `curl`: `/healthz`, `/readyz`, `/v1/version`, `/v1/stats`
   (401 without token), collection creation, `PUT`/`GET` documents, schema rejection,
-  compare-and-set conflict (`409`, `retryable`), batch atomicity, scan, forbidden economy
+  compare-and-set conflict (`409`, `retryable: false`), batch atomicity, scan, forbidden economy
   collection (`403`), personality bootstrap (14 collections), price rule + tick, offer →
   purchase → double-redeem rejection, delete of an immutable `purchases` record (`403`),
   audit verification, checkpoint, verify, and the web UI (`/`, `/assets/app.js` → 200).

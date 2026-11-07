@@ -14,7 +14,7 @@
       local version = db:put("themes", "pastel", { name = "Pastel" })
 
   Every method returns `result` on success and `nil, err` on failure, where
-  `err = { status = 409, code = "conflict", message = "...", retryable = true }`.
+  `err = { status = 409, code = "conflict", message = "...", retryable = false }`.
   Nothing raises for API errors, so callers can pattern-match on `err.code`.
 
   API version: /v1.  Requires a bearer token for everything except /healthz,

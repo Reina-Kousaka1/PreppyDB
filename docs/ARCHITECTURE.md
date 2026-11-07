@@ -185,7 +185,8 @@ txn.commit()?;                              // validates read versions, one WAL 
   error. The engine poisons itself after append errors to prevent further writes until
   reopen; callers must inspect state after recovery instead of assuming the operation
   aborted.
-* There is no automatic retry. Callers get `409 conflict`, `retryable: true`, and decide.
+* There is no automatic retry. Callers get `409 conflict` with `retryable: false` and
+  must re-read and reconcile before issuing a new request.
 * Read sets are bounded by the configured `max_batch_ops` limit (1,000 by default).
   Staged write data is bounded to 32 MiB per transaction before commit; re-writing the
   same key replaces its buffered-byte accounting. Serialized size is counted through a

@@ -181,7 +181,8 @@ A document is an envelope plus an opaque JSON value:
 * `PUT` answers `200`, `POST /v1/collections/{c}/documents` (key in the body) answers
   `201`; both return `{"collection":"themes","key":"pastel","version":3}`.
 * `expected_version: 0` means "must not exist yet"; omitting it means unconditional.
-* `409 conflict` (`retryable: true`) when the current version differs.
+* `409 conflict` (`retryable: false`) when the current version differs; re-read and
+  reconcile before issuing a new write.
 * `400 validation_failed` when the collection schema rejects the value.
 * `422 limit_exceeded` when the document or the collection exceeds configured limits.
 
@@ -253,10 +254,11 @@ collection, so one atomic commit can span collections:
 
 Semantics: all operations are validated against the current versions first
 (compare-and-set via `expected_version`), then applied as a single WAL record. If any
-check fails the whole transaction is rejected with `409 conflict` (`retryable: true`)
+check fails the whole transaction is rejected with `409 conflict` (`retryable: false`)
 and nothing changes. There is no interactive session and no server-side retry loop —
-the client re-reads and retries. The Rust `Engine::begin()` API additionally offers a
-read-your-writes transaction handle for in-process use.
+the caller re-reads, reconciles the intended change, and issues a new request. The
+Rust `Engine::begin()` API additionally offers a read-your-writes transaction handle
+for in-process use.
 
 ## Indexes
 
@@ -380,5 +382,6 @@ See [DYNAMIC-PRICING.md](DYNAMIC-PRICING.md) for invariants.
 
 1. Read the document, remember `version`.
 2. Write with `expected_version`.
-3. On `409 conflict` with `retryable: true`, re-read and retry (bounded backoff).
-4. Treat `429` the same way, honouring `Retry-After`.
+3. On `409 conflict` (`retryable: false`), re-read and reconcile the intended change;
+   do not replay the same request automatically.
+4. On `429` (`retryable: true`), retry within a bound and honour `Retry-After`.

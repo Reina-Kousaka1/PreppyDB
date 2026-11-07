@@ -169,8 +169,8 @@ build needs the crates cached or reachable from crates.io. See
   kernel when the process dies). Inside the
   process a writer mutex serialises mutations; readers use the in-memory store under a
   read lock. Transactions are read-committed with read-your-writes buffering and
-  version validation at commit; there is no automatic retry, conflicts surface as
-  `409 conflict` with `retryable: true`.
+  version validation at commit; there is no automatic retry, and `409 conflict` is
+  not automatically retryable. Callers must re-read and reconcile the current version.
 * **API.** `GET/POST/PUT/DELETE /v1/...`, JSON in and out, `{"ok":true,"data":...}` or
   `{"ok":false,"error":{"code","message","retryable"}}`. Bearer tokens or session
   tokens, per-credential rate limiting, bounded request bodies, request ids.
