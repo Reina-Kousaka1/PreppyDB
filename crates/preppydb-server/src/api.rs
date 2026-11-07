@@ -2636,6 +2636,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let config = ServerConfig::new(&dir);
+        let auth_path = config.auth_file();
         let mut auth = AuthStore::open(config.auth_file()).unwrap();
         let (first_secret, _) = auth
             .create_token("shared-name", vec![Role::Read], None)
@@ -2646,7 +2647,7 @@ mod tests {
         let engine = Engine::open(preppydb_storage::engine::EngineConfig::new(&dir)).unwrap();
         let state = ApiState::new(engine, config, auth, Arc::new(ServerCounters::default()));
 
-        let request = Request {
+        let mut request = Request {
             method: "POST".into(),
             path: "/v1/auth/logout".into(),
             query: BTreeMap::new(),
@@ -2662,6 +2663,25 @@ mod tests {
         assert!(auth.authenticate_token(&first_secret).is_some());
         assert!(auth.authenticate_token(&second_secret).is_none());
         drop(auth);
+
+        let (third_secret, _) = state
+            .auth
+            .write()
+            .unwrap()
+            .create_token("shared-name", vec![Role::Read], None)
+            .unwrap();
+        let temp_path = auth_path.with_extension("json.tmp");
+        std::fs::create_dir(&temp_path).unwrap();
+        request
+            .headers
+            .insert("authorization".into(), format!("Bearer {third_secret}"));
+        let response = state.handle(&request);
+        assert_eq!(response.status, 503);
+
+        let mut auth = state.auth.write().unwrap();
+        assert!(auth.authenticate_token(&third_secret).is_some());
+        drop(auth);
+        std::fs::remove_dir(&temp_path).unwrap();
         drop(state);
         std::fs::remove_dir_all(dir).unwrap();
     }
