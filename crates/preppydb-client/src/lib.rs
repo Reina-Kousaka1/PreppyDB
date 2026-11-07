@@ -87,6 +87,28 @@ impl ClientError {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+fn required_u64(data: &Json, field: &str) -> Result<u64> {
+    data.get(field)
+        .and_then(Json::as_u64)
+        .ok_or_else(|| ClientError::Protocol(format!("response is missing a valid '{field}'")))
+}
+
+fn required_data(response: &Json) -> Result<Json> {
+    response
+        .get("data")
+        .cloned()
+        .ok_or_else(|| ClientError::Protocol("successful response is missing 'data'".into()))
+}
+
+fn required_array(data: &Json, field: &str) -> Result<Vec<Json>> {
+    data.get(field)
+        .and_then(Json::as_array)
+        .cloned()
+        .ok_or_else(|| {
+            ClientError::Protocol(format!("response is missing a valid '{field}' array"))
+        })
+}
+
 const MAX_RESPONSE_HEADERS: usize = 16 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BEARER_TOKEN_BYTES: usize = 512;
@@ -410,7 +432,7 @@ impl Client {
 
     fn data(&self, method: &str, path: &str, body: Option<&Json>) -> Result<Json> {
         let response = self.request(method, path, body)?;
-        Ok(response.get("data").cloned().unwrap_or(Json::Null))
+        required_data(&response)
     }
 
     fn encode(segment: &str) -> String {
@@ -450,14 +472,15 @@ impl Client {
             .with("username", Json::str(username))
             .with("password", Json::str(password));
         let data = self.data("POST", "/v1/auth/login", Some(&body))?;
-        if let Some(token) = data.get_str("token") {
-            if !valid_bearer_token(token) {
-                return Err(ClientError::Protocol(
-                    "server returned an invalid bearer token".into(),
-                ));
-            }
-            self.token = Some(token.to_string());
+        let token = data
+            .get_str("token")
+            .ok_or_else(|| ClientError::Protocol("login response is missing a token".into()))?;
+        if !valid_bearer_token(token) {
+            return Err(ClientError::Protocol(
+                "server returned an invalid bearer token".into(),
+            ));
         }
+        self.token = Some(token.to_string());
         Ok(data)
     }
 
@@ -471,16 +494,14 @@ impl Client {
 
     pub fn list_collections(&self) -> Result<Vec<String>> {
         let data = self.data("GET", "/v1/collections", None)?;
-        Ok(data
-            .get("collections")
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get_str("name").map(|s| s.to_string()))
-                    .collect()
+        required_array(&data, "collections")?
+            .iter()
+            .map(|item| {
+                item.get_str("name").map(str::to_owned).ok_or_else(|| {
+                    ClientError::Protocol("collection response has an invalid name".into())
+                })
             })
-            .unwrap_or_default())
+            .collect()
     }
 
     pub fn create_collection(&self, name: &str, schema: Option<Json>) -> Result<()> {
@@ -537,7 +558,7 @@ impl Client {
             &format!("/v1/collections/{}/documents", Self::encode(collection)),
             Some(&body),
         )?;
-        Ok(data.get("version").and_then(|v| v.as_u64()).unwrap_or(0))
+        required_u64(&data, "version")
     }
 
     pub fn put_document_checked(
@@ -560,7 +581,7 @@ impl Client {
             ),
             Some(&body),
         )?;
-        Ok(data.get("version").and_then(|v| v.as_u64()).unwrap_or(0))
+        required_u64(&data, "version")
     }
 
     /// Fetch a document envelope (`{key, value, version, ...}`).
@@ -599,11 +620,7 @@ impl Client {
             path.push_str(&format!("&prefix={}", Self::encode(prefix)));
         }
         let data = self.data("GET", &path, None)?;
-        Ok(data
-            .get("documents")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default())
+        required_array(&data, "documents")
     }
 
     /// Atomic batch of `put`/`delete` operations with optional compare-and-set.
@@ -623,11 +640,7 @@ impl Client {
             Self::encode(&value.to_string())
         );
         let data = self.data("GET", &path, None)?;
-        Ok(data
-            .get("documents")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default())
+        required_array(&data, "documents")
     }
 
     pub fn checkpoint(&self) -> Result<Json> {
@@ -642,7 +655,7 @@ impl Client {
         // `/v1/admin/verify` answers 409 when it finds issues; report the body instead
         // of turning a successful verification *run* into a transport error.
         match self.request("POST", "/v1/admin/verify", None) {
-            Ok(value) => Ok(value.get("data").cloned().unwrap_or(value)),
+            Ok(value) => required_data(&value),
             Err(ClientError::Api { status, code, .. }) if status == 409 && code == "conflict" => {
                 Ok(Json::obj().with("ok", Json::Bool(false)))
             }
@@ -672,20 +685,12 @@ impl Client {
 
     pub fn personality_profiles(&self) -> Result<Vec<Json>> {
         let data = self.data("GET", "/v1/personality/profiles", None)?;
-        Ok(data
-            .get("profiles")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default())
+        required_array(&data, "profiles")
     }
 
     pub fn pricing_rules(&self) -> Result<Vec<Json>> {
         let data = self.data("GET", "/v1/pricing/rules", None)?;
-        Ok(data
-            .get("rules")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default())
+        required_array(&data, "rules")
     }
 
     pub fn put_price_rule(&self, rule: &Json) -> Result<Json> {
@@ -728,11 +733,7 @@ impl Client {
             &format!("/v1/pricing/history/{}", Self::encode(item)),
             None,
         )?;
-        Ok(data
-            .get("history")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default())
+        required_array(&data, "history")
     }
 
     pub fn simulate(&self, rule: &Json, steps: u32, seed: &str) -> Result<Json> {
@@ -767,6 +768,46 @@ mod tests {
             .request("GET", "/", None);
         server.join().unwrap();
         result
+    }
+
+    #[test]
+    fn required_response_fields_fail_closed() {
+        let valid = Json::obj()
+            .with("version", Json::uint(3))
+            .with("documents", Json::Array(vec![]));
+        assert_eq!(required_u64(&valid, "version").unwrap(), 3);
+        assert!(required_array(&valid, "documents").unwrap().is_empty());
+        assert!(matches!(
+            required_u64(&valid, "missing"),
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(matches!(
+            required_array(&valid, "version"),
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(required_data(&Json::obj().with("data", Json::Null)).is_ok());
+        assert!(matches!(
+            required_data(&Json::obj()),
+            Err(ClientError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn successful_response_requires_data_envelope() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}".to_vec();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(&response);
+        });
+        let result = Client::anonymous(&format!("http://{address}"))
+            .unwrap()
+            .data("GET", "/", None);
+        server.join().unwrap();
+        assert!(matches!(result, Err(ClientError::Protocol(_))));
     }
 
     #[test]
