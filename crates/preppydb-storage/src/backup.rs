@@ -844,7 +844,7 @@ where
         // aside with publication just like an empty pre-existing target.
         match create_restore_directory(target) {
             Ok(()) => {}
-            Err(_error) if matches!(std::fs::symlink_metadata(target), Ok(_)) => {}
+            Err(_error) if std::fs::symlink_metadata(target).is_ok() => {}
             Err(error) => return Err(error),
         }
     }
