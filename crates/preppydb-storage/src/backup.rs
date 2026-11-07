@@ -1061,16 +1061,6 @@ impl RestoreIntent {
                 actual: body.len() as u64,
             });
         }
-        let suffix = format!(
-            "tmp-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let temp_path = append_sibling_suffix(&path, &format!(".{suffix}"))?;
-        let _temp_guard = RestoreIntentTemp(temp_path.clone());
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1079,19 +1069,31 @@ impl RestoreIntent {
             options.mode(0o600);
         }
         let mut file = options
-            .open(&temp_path)
-            .map_err(|err| DbError::io("creating restore intent", err))?;
+            .open(&path)
+            .map_err(|err| match err.kind() {
+                std::io::ErrorKind::AlreadyExists => DbError::RecoveryRequired(format!(
+                    "restore intent already exists at {}; inspect the interrupted restore before starting another one",
+                    path.display()
+                )),
+                _ => DbError::io("creating restore intent", err),
+            })?;
         use std::io::Write;
-        file.write_all(body.as_bytes())
-            .map_err(|err| DbError::io("writing restore intent", err))?;
-        file.sync_all()
-            .map_err(|err| DbError::io("syncing restore intent", err))?;
+        if let Err(error) = file.write_all(body.as_bytes()) {
+            return Err(DbError::RecoveryRequired(format!(
+                "restore intent '{}' was created but could not be fully written; database open is blocked for safe inspection: {error}",
+                path.display()
+            )));
+        }
+        if let Err(error) = file.sync_all() {
+            return Err(DbError::RecoveryRequired(format!(
+                "restore intent '{}' was written but could not be synced; database open is blocked for safe inspection: {error}",
+                path.display()
+            )));
+        }
         drop(file);
-        crate::fsutil::move_path(&temp_path, &path)
-            .map_err(|err| DbError::io("publishing restore intent", err))?;
         if let Err(error) = sync_parent(&parent) {
-            // After the rename, a failed parent sync cannot establish whether the
-            // marker will survive a crash. Keep the visible marker so opens fail closed.
+            // After creation, a failed parent sync cannot establish whether the
+            // marker will survive a crash. Keep it visible so opens fail closed.
             return Err(DbError::RecoveryRequired(format!(
                 "restore intent '{}' is visible but syncing its parent failed; database open is blocked for safe inspection: {error}",
                 path.display()
@@ -1120,14 +1122,6 @@ impl RestoreIntent {
         // is harmless and can be cleaned up later if deletion itself is interrupted.
         let _ = std::fs::remove_file(completed_path);
         Ok(())
-    }
-}
-
-struct RestoreIntentTemp(PathBuf);
-
-impl Drop for RestoreIntentTemp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -1684,6 +1678,29 @@ mod tests {
         assert!(intent_path.exists(), "visible intent must be retained");
         assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old-state");
         assert_eq!(std::fs::read(staged.join("new")).unwrap(), b"new-state");
+        assert!(matches!(
+            Engine::open(crate::engine::EngineConfig::new(&target)),
+            Err(DbError::RecoveryRequired(_))
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_intent_creation_does_not_replace_an_existing_marker() {
+        let root = tempdir("restore-intent-no-replace");
+        let target = root.join("database");
+        let staged = root.join("staged");
+        let aside = root.join("aside");
+        let first = RestoreIntent::create(&target, &staged, &aside).unwrap();
+        let original = std::fs::read(&first.path).unwrap();
+
+        let error = match RestoreIntent::create(&target, &staged, &aside) {
+            Ok(_) => panic!("a second restore must not replace the active intent marker"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), crate::error::codes::RECOVERY_REQUIRED);
+        assert_eq!(std::fs::read(&first.path).unwrap(), original);
         assert!(matches!(
             Engine::open(crate::engine::EngineConfig::new(&target)),
             Err(DbError::RecoveryRequired(_))
