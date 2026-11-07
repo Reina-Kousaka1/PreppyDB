@@ -810,12 +810,15 @@ mod tests {
                 "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: {connection}\r\n\r\n"
             )
             .unwrap();
-            client.get_mut().flush().unwrap();
+        }
+        client.get_mut().flush().unwrap();
 
+        for (path, expected_connection) in [("/first", "keep-alive"), ("/second", "close")] {
             let mut status = String::new();
             client.read_line(&mut status).unwrap();
             assert!(status.starts_with("HTTP/1.1 200 "), "{status:?}");
             let mut content_length = None;
+            let mut connection = None;
             loop {
                 let mut header = String::new();
                 client.read_line(&mut header).unwrap();
@@ -826,11 +829,15 @@ mod tests {
                     if name.eq_ignore_ascii_case("content-length") {
                         content_length = Some(value.trim().parse::<usize>().unwrap());
                     }
+                    if name.eq_ignore_ascii_case("connection") {
+                        connection = Some(value.trim().to_ascii_lowercase());
+                    }
                 }
             }
             let mut body = vec![0; content_length.expect("response needs content-length")];
             client.read_exact(&mut body).unwrap();
             assert_eq!(body, path.as_bytes());
+            assert_eq!(connection.as_deref(), Some(expected_connection));
         }
 
         shutdown.store(true, Ordering::SeqCst);
