@@ -3077,6 +3077,58 @@ mod document_undo_tests {
     }
 
     #[test]
+    fn wal_rotation_sync_failure_does_not_publish_a_new_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-wal-rotation-sync-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut config = EngineConfig::new(&dir);
+        config.max_segment_bytes = 64;
+        let engine = Engine::open(config).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "key", Json::str("old"), PutOptions::default())
+            .unwrap();
+
+        let current_index = engine.lock_mutex(&engine.writer).current_index();
+        let next_segment = dir
+            .join("wal")
+            .join(crate::wal::segment_name(current_index + 1));
+        assert!(!next_segment.exists());
+        engine.lock_mutex(&engine.writer).inject_sync_failure();
+        let error = engine
+            .put("c", "key", Json::str("new"), PutOptions::default())
+            .unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::COMMIT_OUTCOME_UNKNOWN);
+        assert_eq!(
+            engine.lock_mutex(&engine.writer).current_index(),
+            current_index,
+            "failed rotation sync must retain the old writer"
+        );
+        assert!(
+            !next_segment.exists(),
+            "failed rotation must not publish a segment"
+        );
+        assert!(matches!(
+            engine.get("c", "key"),
+            Err(DbError::CommitOutcomeUnknown(_))
+        ));
+        drop(engine);
+
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        assert_eq!(
+            reopened.get("c", "key").unwrap().value.as_str(),
+            Some("old")
+        );
+        assert!(!next_segment.exists());
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn failed_append_restores_insert_update_delete_and_index() {
         for operation in ["insert", "update", "delete"] {
             let dir = std::env::temp_dir().join(format!(
