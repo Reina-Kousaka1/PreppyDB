@@ -1019,6 +1019,18 @@ struct RestoreIntent {
 
 impl RestoreIntent {
     fn create(target: &Path, staged: &Path, aside: &Path) -> Result<Self> {
+        Self::create_with_parent_sync(target, staged, aside, fsync_dir)
+    }
+
+    fn create_with_parent_sync<F>(
+        target: &Path,
+        staged: &Path,
+        aside: &Path,
+        sync_parent: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
         let (path, parent) = restore_intent_path(target)?;
         let target_name = target
             .file_name()
@@ -1077,7 +1089,14 @@ impl RestoreIntent {
         drop(file);
         crate::fsutil::move_path(&temp_path, &path)
             .map_err(|err| DbError::io("publishing restore intent", err))?;
-        fsync_dir(&parent)?;
+        if let Err(error) = sync_parent(&parent) {
+            // After the rename, a failed parent sync cannot establish whether the
+            // marker will survive a crash. Keep the visible marker so opens fail closed.
+            return Err(DbError::RecoveryRequired(format!(
+                "restore intent '{}' is visible but syncing its parent failed; database open is blocked for safe inspection: {error}",
+                path.display()
+            )));
+        }
         Ok(Self { path, parent })
     }
 
@@ -1637,6 +1656,39 @@ mod tests {
         let engine = Engine::open(crate::engine::EngineConfig::new(&target)).unwrap();
         assert_eq!(engine.stats().total_documents, 0);
         drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_intent_parent_sync_failure_is_classified_and_blocks_open() {
+        let root = tempdir("restore-intent-parent-sync-failure");
+        let target = root.join("database");
+        let staged = root.join("staged");
+        let aside = root.join("aside");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("old"), b"old-state").unwrap();
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("new"), b"new-state").unwrap();
+
+        let error = match RestoreIntent::create_with_parent_sync(&target, &staged, &aside, |_| {
+            Err(DbError::io(
+                "injected restore intent parent sync failure",
+                std::io::Error::other("injected"),
+            ))
+        }) {
+            Ok(_) => panic!("a failed parent sync must not return a usable restore intent"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), crate::error::codes::RECOVERY_REQUIRED);
+        let intent_path = restore_intent_path(&target).unwrap().0;
+        assert!(intent_path.exists(), "visible intent must be retained");
+        assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old-state");
+        assert_eq!(std::fs::read(staged.join("new")).unwrap(), b"new-state");
+        assert!(matches!(
+            Engine::open(crate::engine::EngineConfig::new(&target)),
+            Err(DbError::RecoveryRequired(_))
+        ));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
