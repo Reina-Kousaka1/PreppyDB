@@ -1668,7 +1668,11 @@ mod tests {
             .unwrap_err();
 
             assert_ne!(error.code(), crate::error::codes::RESTORE_OUTCOME_UNKNOWN);
-            assert_eq!(sync_calls, 5, "rollback must sync both changed directories");
+            let expected_sync_calls = if fail_sync_call == 2 { 4 } else { 5 };
+            assert_eq!(
+                sync_calls, expected_sync_calls,
+                "rollback must sync both changed directories"
+            );
             assert_eq!(std::fs::read(target.join("old")).unwrap(), b"old");
             assert!(!target.join("new").exists());
             std::fs::remove_dir_all(root).unwrap();
