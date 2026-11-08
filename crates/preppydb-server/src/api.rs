@@ -2274,7 +2274,12 @@ fn reconcile_pricing_intents(engine: &Engine, audit: &mut AuditLog) -> Result<()
         }
         let mut all_after = true;
         let mut all_before = true;
-        let mut unambiguous_after = true;
+        // Recovery may infer a terminal outcome only if at least one recorded
+        // document distinguishes the before-image from the expected after-image.
+        // A same-value write has no value-level evidence of whether its WAL record
+        // committed, so leave an all-no-op intent pending rather than inventing an
+        // "aborted" outcome.
+        let mut has_recovery_signal = false;
         for expected in documents {
             let (Some(collection), Some(key), Some(expected_value), Some(before_exists)) = (
                 expected.get_str("collection"),
@@ -2309,11 +2314,11 @@ fn reconcile_pricing_intents(engine: &Engine, audit: &mut AuditLog) -> Result<()
                 current.is_none()
             };
             all_before &= before_matches;
-            unambiguous_after &= !(before_exists && before == Some(expected_value));
+            has_recovery_signal |= !before_exists || before != Some(expected_value);
         }
-        let state = if all_after && unambiguous_after {
+        let state = if all_after && has_recovery_signal {
             Some("committed")
-        } else if all_before {
+        } else if all_before && has_recovery_signal {
             Some("aborted")
         } else {
             None
@@ -2814,6 +2819,169 @@ mod tests {
 
         drop(reopened);
         drop(audit);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pricing_intent_recovery_does_not_guess_for_noop_writes() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "preppydb-pricing-noop-recovery-{}-{}",
+            std::process::id(),
+            preppydb_storage::clock::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Engine::open(preppydb_storage::engine::EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("price_rules", 1))
+            .unwrap();
+        engine
+            .create_collection(CollectionMeta::new("price_history", 1))
+            .unwrap();
+
+        let unchanged = Json::obj().with("price", Json::int(100));
+        let changed_before = Json::obj().with("price", Json::int(200));
+        let changed_after = Json::obj().with("price", Json::int(210));
+        let abort_before = Json::obj().with("price", Json::int(300));
+        let abort_after = Json::obj().with("price", Json::int(310));
+        engine
+            .put(
+                "price_rules",
+                "unchanged",
+                unchanged.clone(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        engine
+            .put(
+                "price_rules",
+                "changed",
+                changed_before.clone(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        engine
+            .put(
+                "price_rules",
+                "abort",
+                abort_before.clone(),
+                PutOptions::default(),
+            )
+            .unwrap();
+
+        let audit_path = dir.join("pricing-audit.log");
+        let mut audit = AuditLog::open(&audit_path).unwrap();
+        audit
+            .append_pricing_transition_with_recovery(
+                "noop",
+                "started",
+                3,
+                "rule_price_update",
+                Json::obj().with("item_id", Json::str("unchanged")),
+                Some(pricing_write_recovery(
+                    "price_rules",
+                    "unchanged",
+                    unchanged.clone(),
+                    Some(unchanged.clone()),
+                )),
+            )
+            .unwrap();
+        audit
+            .append_pricing_transition_with_recovery(
+                "mixed",
+                "started",
+                4,
+                "purchase",
+                Json::obj(),
+                Some(pricing_transaction_recovery(vec![
+                    (
+                        "price_rules",
+                        "unchanged",
+                        unchanged.clone(),
+                        Some(unchanged.clone()),
+                    ),
+                    (
+                        "price_rules",
+                        "changed",
+                        changed_after.clone(),
+                        Some(changed_before),
+                    ),
+                ])),
+            )
+            .unwrap();
+        audit
+            .append_pricing_transition_with_recovery(
+                "mixed-abort",
+                "started",
+                5,
+                "rule_price_update",
+                Json::obj(),
+                Some(pricing_transaction_recovery(vec![
+                    (
+                        "price_rules",
+                        "unchanged",
+                        unchanged.clone(),
+                        Some(unchanged.clone()),
+                    ),
+                    ("price_rules", "abort", abort_after, Some(abort_before)),
+                ])),
+            )
+            .unwrap();
+
+        // Model a committed same-value write and an atomic mixed transaction that
+        // crashes after its DB commit but before either audit intent is finalized.
+        engine
+            .put(
+                "price_rules",
+                "unchanged",
+                unchanged.clone(),
+                PutOptions::default(),
+            )
+            .unwrap();
+        let mut transaction = engine.begin();
+        transaction
+            .put("price_rules", "unchanged", unchanged.clone(), None)
+            .unwrap();
+        transaction
+            .put("price_rules", "changed", changed_after.clone(), None)
+            .unwrap();
+        transaction.commit().unwrap();
+
+        // Recovery must use the persisted post-crash engine state, not the live
+        // Store instance that performed the writes above.
+        drop(audit);
+        drop(engine);
+        let engine = Engine::open(preppydb_storage::engine::EngineConfig::new(&dir)).unwrap();
+        let mut audit = AuditLog::open(&audit_path).unwrap();
+        reconcile_pricing_intents(&engine, &mut audit).unwrap();
+
+        assert!(audit.pending_operations().contains_key("noop"));
+        assert!(!audit.pending_operations().contains_key("mixed"));
+        assert!(!audit.pending_operations().contains_key("mixed-abort"));
+        assert!(audit.entries().iter().any(|entry| {
+            entry.kind == "pricing_operation_committed"
+                && entry.detail.get_str("operation_id") == Some("mixed")
+        }));
+        assert!(audit.entries().iter().any(|entry| {
+            entry.kind == "pricing_operation_aborted"
+                && entry.detail.get_str("operation_id") == Some("mixed-abort")
+        }));
+        assert!(!audit.entries().iter().any(|entry| {
+            entry.kind == "pricing_operation_aborted"
+                && entry.detail.get_str("operation_id") == Some("noop")
+        }));
+
+        drop(audit);
+        drop(engine);
+        let engine = Engine::open(preppydb_storage::engine::EngineConfig::new(&dir)).unwrap();
+        let mut reopened = AuditLog::open(&audit_path).unwrap();
+        reconcile_pricing_intents(&engine, &mut reopened).unwrap();
+        assert!(reopened.pending_operations().contains_key("noop"));
+        assert!(!reopened.pending_operations().contains_key("mixed"));
+        assert!(!reopened.pending_operations().contains_key("mixed-abort"));
+
+        drop(reopened);
         drop(engine);
         std::fs::remove_dir_all(dir).unwrap();
     }

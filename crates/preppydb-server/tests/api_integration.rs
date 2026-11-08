@@ -914,12 +914,145 @@ fn pricing_operation_crash_after_mutation_before_audit_recovers_as_committed() {
     assert_pricing_operation_crash_is_reconciled("after", "pricing_operation_committed");
 }
 
+fn assert_pricing_mixed_transaction_crash_is_reconciled(mode: &str, terminal_kind: &str) {
+    let server = start("pricing-mixed-process-crash", |config| {
+        let output = pricing_crash_child_command()
+            .args(["--exact", "pricing_operation_crash_child", "--nocapture"])
+            .env("PREPPYDB_TEST_PRICING_CRASH_DIR", &config.data_path)
+            .env("PREPPYDB_TEST_PRICING_CRASH_MODE", mode)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child should terminate at the injected crash point; stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("PRICING_TEST_CRASH_POINT={mode}")),
+            "child did not reach the intended crash point: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        config.pricing_audit_path = Some(config.data_path.join("pricing-audit.log"));
+    });
+
+    let admin = admin_client(&server);
+    let recovery = admin.recovery().unwrap();
+    assert_eq!(
+        recovery
+            .get("pricing_audit")
+            .and_then(|audit| audit.get("pending_operations"))
+            .and_then(Json::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    let glove = admin.get_document("price_rules", "glove").unwrap();
+    let expected_glove_price = if terminal_kind == "pricing_operation_committed" {
+        90
+    } else {
+        80
+    };
+    assert_eq!(
+        glove
+            .get_path("value.current_price_cents")
+            .and_then(Json::as_i64),
+        Some(expected_glove_price)
+    );
+    let audit = AuditLog::open(server.dir.join("pricing-audit.log")).unwrap();
+    assert_eq!(audit.entry_count(), 2);
+    assert!(audit.pending_operations().is_empty());
+    assert_eq!(audit.entries().back().unwrap().kind, terminal_kind);
+    assert_eq!(
+        audit
+            .entries()
+            .back()
+            .unwrap()
+            .detail
+            .get_str("operation_id"),
+        Some("process-crash:mixed")
+    );
+}
+
+#[test]
+fn pricing_mixed_transaction_crash_before_commit_recovers_as_aborted() {
+    assert_pricing_mixed_transaction_crash_is_reconciled(
+        "mixed-before",
+        "pricing_operation_aborted",
+    );
+}
+
+#[test]
+fn pricing_mixed_transaction_crash_after_commit_recovers_as_committed() {
+    assert_pricing_mixed_transaction_crash_is_reconciled(
+        "mixed-after",
+        "pricing_operation_committed",
+    );
+}
+
+#[test]
+fn pricing_noop_write_crash_remains_unresolved() {
+    let server = start("pricing-noop-process-crash", |config| {
+        let output = pricing_crash_child_command()
+            .args(["--exact", "pricing_operation_crash_child", "--nocapture"])
+            .env("PREPPYDB_TEST_PRICING_CRASH_DIR", &config.data_path)
+            .env("PREPPYDB_TEST_PRICING_CRASH_MODE", "noop")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child should terminate at the injected crash point; stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("PRICING_TEST_CRASH_POINT=noop"),
+            "child did not reach the intended crash point: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        config.pricing_audit_path = Some(config.data_path.join("pricing-audit.log"));
+    });
+
+    let admin = admin_client(&server);
+    let recovery = admin.recovery().unwrap();
+    let audit_status = recovery.get("pricing_audit").unwrap();
+    assert_eq!(
+        audit_status.get("available").and_then(Json::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        audit_status
+            .get("pending_operations")
+            .and_then(Json::as_array)
+            .map(Vec::len),
+        Some(1),
+        "a no-op intent has no value-level evidence to classify as committed or aborted"
+    );
+
+    let stored = admin.get_document("price_rules", "hat").unwrap();
+    assert_eq!(
+        stored
+            .get_path("value.current_price_cents")
+            .and_then(Json::as_i64),
+        Some(150)
+    );
+    let audit = AuditLog::open(server.dir.join("pricing-audit.log")).unwrap();
+    assert_eq!(audit.entry_count(), 1);
+    assert!(audit
+        .pending_operations()
+        .contains_key("process-crash:rule_updated"));
+    assert!(!audit.entries().iter().any(|entry| {
+        entry.kind == "pricing_operation_aborted" || entry.kind == "pricing_operation_committed"
+    }));
+}
+
 #[test]
 fn pricing_operation_crash_child() {
     let Some(dir) = std::env::var_os("PREPPYDB_TEST_PRICING_CRASH_DIR").map(PathBuf::from) else {
         return;
     };
     let mode = std::env::var("PREPPYDB_TEST_PRICING_CRASH_MODE").unwrap();
+    let is_mixed = mode.starts_with("mixed-");
     let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
     engine
         .create_collection(preppydb_storage::catalog::CollectionMeta::new(
@@ -934,24 +1067,63 @@ fn pricing_operation_crash_child() {
     engine
         .put("price_rules", "hat", before.clone(), Default::default())
         .unwrap();
-    let expected = Json::obj()
-        .with("item_id", Json::str("hat"))
-        .with("version", Json::uint(2))
-        .with("current_price_cents", Json::int(175));
-    let recovery = Json::obj().with(
-        "documents",
-        Json::Array(vec![Json::obj()
+    let expected = if mode == "noop" || is_mixed {
+        before.clone()
+    } else {
+        Json::obj()
+            .with("item_id", Json::str("hat"))
+            .with("version", Json::uint(2))
+            .with("current_price_cents", Json::int(175))
+    };
+    let recovery_documents = if is_mixed {
+        let glove_before = Json::obj()
+            .with("item_id", Json::str("glove"))
+            .with("version", Json::uint(1))
+            .with("current_price_cents", Json::int(80));
+        let glove_after = Json::obj()
+            .with("item_id", Json::str("glove"))
+            .with("version", Json::uint(2))
+            .with("current_price_cents", Json::int(90));
+        engine
+            .put(
+                "price_rules",
+                "glove",
+                glove_before.clone(),
+                Default::default(),
+            )
+            .unwrap();
+        vec![
+            Json::obj()
+                .with("collection", Json::str("price_rules"))
+                .with("key", Json::str("hat"))
+                .with("expected", expected.clone())
+                .with("before_exists", Json::Bool(true))
+                .with("before", before.clone()),
+            Json::obj()
+                .with("collection", Json::str("price_rules"))
+                .with("key", Json::str("glove"))
+                .with("expected", glove_after)
+                .with("before_exists", Json::Bool(true))
+                .with("before", glove_before),
+        ]
+    } else {
+        vec![Json::obj()
             .with("collection", Json::str("price_rules"))
             .with("key", Json::str("hat"))
             .with("expected", expected.clone())
             .with("before_exists", Json::Bool(true))
-            .with("before", before)]),
-    );
+            .with("before", before.clone())]
+    };
+    let recovery = Json::obj().with("documents", Json::Array(recovery_documents));
     let audit_path = dir.join("pricing-audit.log");
     let mut audit = AuditLog::open(audit_path).unwrap();
     audit
         .append_pricing_transition_with_recovery(
-            "process-crash:rule_updated",
+            if is_mixed {
+                "process-crash:mixed"
+            } else {
+                "process-crash:rule_updated"
+            },
             "started",
             1,
             "rule_updated",
@@ -959,12 +1131,32 @@ fn pricing_operation_crash_child() {
             Some(recovery),
         )
         .unwrap();
-    if mode == "after" {
+    if mode == "after" || mode == "noop" {
         engine
             .put("price_rules", "hat", expected, Default::default())
             .unwrap();
+    } else if mode == "mixed-after" {
+        let mut transaction = engine.begin();
+        transaction
+            .put("price_rules", "hat", expected, None)
+            .unwrap();
+        transaction
+            .put(
+                "price_rules",
+                "glove",
+                Json::obj()
+                    .with("item_id", Json::str("glove"))
+                    .with("version", Json::uint(2))
+                    .with("current_price_cents", Json::int(90)),
+                None,
+            )
+            .unwrap();
+        transaction.commit().unwrap();
     } else {
-        assert_eq!(mode, "before");
+        assert!(
+            mode == "before" || mode == "mixed-before",
+            "unexpected mode: {mode}"
+        );
     }
     eprintln!("PRICING_TEST_CRASH_POINT={mode}");
     std::process::abort();
