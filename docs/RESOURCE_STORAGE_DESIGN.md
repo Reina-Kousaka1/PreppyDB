@@ -8,16 +8,25 @@ does not change the current backend, on-disk format, public API, or durability c
 
 The active state is `Engine::state: RwLock<State>`, where `State` owns a `Store`. A
 `Store` owns every collection, each collection owns every full `Doc` in a
-`BTreeMap<String, Doc>`, and every secondary index owns another in-memory ordered map
-from encoded values to sets of document keys. Snapshot and WAL files are persistence and
-recovery inputs; they are not a page cache or lazy document source. Opening a database
+`BTreeMap<Arc<str>, Doc>`, and every secondary index owns another in-memory ordered map
+from encoded values to sets of shared document-key handles. Snapshot and WAL files are
+persistence and recovery inputs; they are not a page cache or lazy document source. Opening a database
 reconstructs this complete state. Secondary indexes are rebuilt from snapshot documents
 and then updated by WAL replay.
 
 Two RAM costs are consequently proportional to database size:
 
 1. the live documents and their JSON values;
-2. the in-memory index entries, including repeated key storage per index.
+2. the in-memory index entries and tree nodes. Document-key bytes are shared between
+   the primary map and all secondary-index buckets with `Arc<str>` instead of copied for
+   every index. A pointer-identity regression test verifies this invariant.
+
+Document updates now validate all index constraints before replacing the old record.
+Single-document engine writes move the displaced `Doc` into their rollback value instead
+of deep-cloning it before every update/delete; unique-index conflicts are detected before
+the current document is detached from its indexes. This also gives WAL append rollback
+ownership of the old value without copying it. Atomic multi-operation batches retain the
+old documents needed for rollback, subject to the existing undo-byte budget.
 
 Checkpointing already serializes from the locked store without cloning the whole store.
 Snapshot recovery decodes frames directly into a private `Store`, avoiding an additional
@@ -31,6 +40,43 @@ show the current scale on one x86-64 WSL2 host: idle RSS is about 3.8 MiB; the o
 verify high-water mark was 25.17 MiB at 5,000 documents, 35.05 MiB at 7,500 documents,
 and 43.98 MiB at 10,000 documents. Those are workload-specific measurements, not
 capacity guarantees or Raspberry Pi qualification.
+
+An additional paired WSL2 x86-64 comparison used the same Tiny harness, 900-byte payload,
+seed `20261108`, and release profile against clean commit `f02d80f` and this working tree.
+The 30-second idle observations were:
+
+| Documents | Build | Idle RSS | Idle CPU (% of one core) | Threads | Process peak RSS | Checkpoint RSS |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 100 | `f02d80f` | 4.10 MiB | 0.13% | 3 | 5.74 MiB | 5.25 MiB |
+| 100 | working tree | 3.85 MiB | 0.10% | 3 | 5.59 MiB | 5.11 MiB |
+| 1,000 | `f02d80f` | 4.16 MiB | 0.10% | 3 | 10.36 MiB | 8.07 MiB |
+| 1,000 | working tree | 3.90 MiB | 0.10% | 3 | 9.88 MiB | 8.02 MiB |
+| 10,000 | `f02d80f` | 4.05 MiB | 0.10% | 3 | 44.11 MiB | 25.79 MiB |
+| 10,000 | working tree | 3.93 MiB | 0.13% | 3 | 43.29 MiB | 27.86 MiB |
+
+The one-index 10,000-document peak was 1.9% lower in this sample, but RSS immediately
+after checkpoint was 2.07 MiB higher. At 100 and 1,000 documents both peak and checkpoint
+RSS were modestly lower. These are single paired runs; allocator/RSS variance is visible
+in the phase samples, so this is directional evidence rather than a portable performance
+claim. A 10,000-document run still exceeds the provisional 40 MiB process-peak target.
+
+The harness now accepts `--index-count` (1–16). A four-index stress comparison (four
+separate non-unique indexes on the same `group` field, 3-second idle sample) measured
+process peaks of 12.89 vs. 11.85 MiB at 1,000 documents, and 48.38 vs. 45.32 MiB at
+10,000 documents (`f02d80f` vs. working tree). In the latter run, the post-index RSS was
+25.77 MiB at baseline and 27.79 MiB in the working tree even though the working-tree
+whole-process high-water mark was 3.06 MiB lower. This mixed phase-RSS result needs
+repeated sampling; four identical-field indexes are a key-sharing stress case, not a
+representative production workload. The working-tree 10,000-document peak with four
+indexes was 45.32 MiB and still misses the 40 MiB objective.
+
+The working tree also moves a displaced document into the single-document rollback value
+instead of deep-cloning the old document on each update/delete. A regression test verifies
+restoration after an injected WAL append failure. This removes an extra O(document-size)
+rollback copy from that path; no update-latency claim is made. `Engine::verify` remains the
+dominant peak because it intentionally replays into a second complete store; its semantic
+check has not been weakened. All measurements are synthetic WSL2 x86-64 observations, not
+Raspberry Pi qualification.
 
 ## Target properties
 

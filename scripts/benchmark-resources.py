@@ -296,6 +296,12 @@ def main() -> int:
         type=int,
         help="write batch size (default: 500 in tiny profile, otherwise 1,000)",
     )
+    parser.add_argument(
+        "--index-count",
+        type=int,
+        default=1,
+        help="number of secondary indexes on the synthetic group field (1..16; default: 1)",
+    )
     parser.add_argument("--seed", type=int, default=20261108)
     parser.add_argument("--source-commit", default=os.environ.get("PREPPYDB_SOURCE_COMMIT"))
     parser.add_argument("--manifest", type=Path, help="optional key=value build manifest to include")
@@ -321,6 +327,8 @@ def main() -> int:
         parser.error("more than 1,000 documents requires --allow-large-test")
     if not 1 <= args.batch_size <= MAX_BATCH:
         parser.error(f"--batch-size must be between 1 and {MAX_BATCH}")
+    if not 1 <= args.index_count <= 16:
+        parser.error("--index-count must be between 1 and 16")
     if args.manifest and not args.manifest.is_file():
         parser.error("--manifest must point to an existing build manifest")
 
@@ -427,14 +435,16 @@ def main() -> int:
             sampler.set_phase("index_build")
             index_rss_before, index_hwm_before, _, _ = sampler.sample_process()
             index_started = time.perf_counter()
-            request(
-                base,
-                token,
-                "POST",
-                "/v1/collections/bench/indexes",
-                {"name": "by_group", "field": "group", "unique": False},
-                deadline,
-            )
+            for index_number in range(args.index_count):
+                index_name = "by_group" if args.index_count == 1 else f"by_group_{index_number}"
+                request(
+                    base,
+                    token,
+                    "POST",
+                    "/v1/collections/bench/indexes",
+                    {"name": index_name, "field": "group", "unique": False},
+                    deadline,
+                )
             index_build_seconds = time.perf_counter() - index_started
             index_rss_after, index_hwm_after, _, _ = sampler.sample_process()
 
@@ -551,6 +561,7 @@ def main() -> int:
                 ),
                 "batch_size": args.batch_size,
                 "profile": args.profile,
+                "index_count": args.index_count,
                 "source_commit": args.source_commit,
                 "build_manifest": (
                     dict(
@@ -562,8 +573,9 @@ def main() -> int:
                     else None
                 ),
                 "index": {
-                    "name": "by_group",
+                    "name": "by_group" if args.index_count == 1 else f"by_group_x{args.index_count}",
                     "field": "group",
+                    "count": args.index_count,
                     "build_seconds": round(index_build_seconds, 6),
                     "rss_before_bytes": index_rss_before,
                     "rss_after_bytes": index_rss_after,
