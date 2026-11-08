@@ -324,6 +324,23 @@ a post-exit `/proc` read to the server.
 | 1,000 | 3.86 MiB | 0.1% | 3 | 11.73 MiB | 9.77 MiB | 7.15 MiB | 11.81 MiB | 12.97 MiB | 0.75% |
 | 10,000 | 3.83 MiB | 0.1% | 3 | 27.59 MiB | 25.64 MiB | 23.23 MiB | 43.98 MiB | 43.98 MiB | 1.86% |
 
+Two additional one-run threshold probes used the same host, payload, seed, profile,
+batch size, and child limits, with a 1-second idle window. The shorter idle window makes
+their idle-CPU samples unsuitable for comparison with the table above; the load-phase
+memory figures are included only to narrow where the verify peak crosses 40 MiB.
+
+| Documents | Verify RSS after request | Verify HWM | Whole-process HWM | Checkpoint RSS | Idle threads |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 5,000 | 25.17 MiB | 25.17 MiB | 26.20 MiB | 16.81 MiB | 3 |
+| 7,500 | 34.17 MiB | 35.05 MiB | 35.05 MiB | 21.22 MiB | 3 |
+
+The sampled verify peak remained below 40 MiB at 7,500 documents and exceeded it at
+10,000 in the earlier run. This is a workload-specific boundary, not a capacity promise;
+document shape, indexes, and database history can change it. Tiny uses one HTTP worker;
+the three process threads also include the main server thread and the `ctrl-c` signal
+handler thread. The signal thread was confirmed from `/proc/<pid>/task/*/comm` in a
+short-lived local Tiny process.
+
 Index build took 15–20 ms. Its direct before/after `VmHWM` did not increase in these
 runs. At 10,000 documents, `POST /v1/admin/verify` increased RSS from about 23.2 MiB
 after recovery startup to about 43.1 MiB; the phase high-water mark reached 43.98 MiB.
