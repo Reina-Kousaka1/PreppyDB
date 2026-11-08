@@ -93,25 +93,25 @@ preppydb-cli:      0 tests (verified manually, see below)
 ## Current PR-head qualification (2026-11-08)
 
 PR #1 remains open on `arena/146caad2-preppydb` at
-`2544e5e6f86ed0eabdeb79e11ddb6ba3cde637fa`. GitHub Actions run [#136](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42504109330)
-is the exact-head qualification run. It covers Linux x86-64 (format, Clippy, tests,
-crash recovery, release build, bounded resource benchmark), Windows x86-64 (build, tests,
-PowerShell smoke), ARM64/QEMU, Lua/Luvit, and Docker jobs. QEMU is not real Pi hardware and
-process-kill/reopen is not power-loss durability.
+`9ba7db40cadb3756aa56dfbc515d0c48880959ef`. GitHub Actions run [#139](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42510131204)
+is the exact-head qualification run. Linux x86-64 (format, Clippy, tests, crash recovery,
+release build, bounded resource benchmark), Windows x86-64 (build, tests, PowerShell smoke),
+ARM64/QEMU, Lua/Luvit, Docker build/persistence, the CI aggregator, and Vercel all passed.
+QEMU is not real Pi hardware and process-kill/reopen is not power-loss durability.
 
-The isolated local checkout is on Windows. `cargo fmt --all -- --check` passed, but local
-Clippy/test compilation stops because MSVC `link.exe` is unavailable. The Python launcher
-in this environment is a nonfunctional WindowsApps alias, so the Linux-only resource
-benchmark was not run locally. No Pi is attached to this workspace.
+Local Rust validation ran in the existing Ubuntu WSL environment. Format, workspace check,
+Clippy, full workspace tests, release build, and the crash-recovery shell harness passed.
+The local Windows host still lacks MSVC `link.exe`; Windows qualification therefore comes
+from GitHub Actions, not a native local build. No Pi is attached to this workspace.
 
 | Item | State | Boundary |
 | --- | --- | --- |
-| Linux x86-64 format, Clippy, tests | **green on exact PR head** | CI run #136 |
-| Windows x86-64 build, full tests, smoke | **green on exact PR head** | CI run #136; does not prove power-loss behavior |
-| Linux ARM64 build and tests | **green under QEMU** | CI run #136; emulation, not physical Raspberry Pi |
-| Lua/Luvit tests | **green on exact PR head** | CI run #136 |
-| Docker multi-architecture build and persistence | **green on exact PR head** | CI run #136; images were built, not pushed |
-| 100,000-document resource benchmark | **passed on hosted Ubuntu x86-64** | Tiny profile; 289.73 MiB process high-water RSS; see the resource artifact and [measurement notes](RESOURCE_STORAGE_DESIGN.md#bounded-100000-document-ci-measurement). Not a Pi measurement or 30% baseline comparison. |
+| Linux x86-64 format, Clippy, tests, crash harness, release build | **green on exact PR head** | CI run #139 |
+| Windows x86-64 build, full tests, smoke | **green on exact PR head** | CI run #139; does not prove power-loss behavior |
+| Linux ARM64 build and tests | **green under QEMU** | CI run #139; emulation, not physical Raspberry Pi |
+| Lua/Luvit tests | **green on exact PR head** | CI run #139 |
+| Docker multi-architecture build and persistence | **green on exact PR head** | CI run #139; images were built, not pushed |
+| 100,000-document resource benchmark | **passed on hosted Ubuntu x86-64** | Tiny profile; 290.00 MiB process high-water RSS. Paired scan baseline: 333.236 ms / +178.03 MiB HWM; current: 21.622 ms / +0.13 MiB. See [run #139 artifact](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42510131204/artifacts/13629147215) and [measurement notes](RESOURCE_STORAGE_DESIGN.md#bounded-100000-document-ci-measurement). Not a Pi measurement or capacity guarantee. |
 | Raspberry Pi 4B hardware smoke | **not run** | No physical device attached |
 | 24-hour resource soak | **not run** | No result recorded |
 

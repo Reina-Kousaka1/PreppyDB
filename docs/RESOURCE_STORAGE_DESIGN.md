@@ -1,53 +1,54 @@
 # Bounded-Memory Storage Design (Proposal)
 
-## Current evidence (2026-11-08)
+## Current evidence (2026-11-08; PR head `9ba7db40`)
 
-The current PR head is `2544e5e6f86ed0eabdeb79e11ddb6ba3cde637fa`; its full GitHub CI
-run [#136](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42504109330) includes
-a bounded 100,000-document run on Ubuntu 22.04 x86-64. Earlier resource measurements below
-are synthetic WSL2 x86-64 results through 10,000 documents, plus narrowly scoped
-checkpoint serializer comparisons on single 900 KiB and 1 MiB documents. CI run #136 is
-not a Raspberry Pi measurement. Neither it nor the historical measurements establish a
-768 MiB ceiling, Raspberry Pi capacity, or physical hardware qualification. The exact-head
-ARM64 artifact is temporary CI output, not a release.
+The current PR head is `9ba7db40cadb3756aa56dfbc515d0c48880959ef`. GitHub Actions run
+[#139](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42510131204) passed on this
+exact commit, including Linux, Windows, emulated Linux ARM64, Lua/Luvit, Docker, the crash
+harness, and the bounded resource benchmark. The ARM64 job uses QEMU, not Raspberry Pi
+hardware. Earlier resource measurements below are synthetic WSL2 x86-64 results through
+10,000 documents, plus narrowly scoped checkpoint serializer comparisons on single 900 KiB
+and 1 MiB documents. No result here establishes Raspberry Pi capacity or real-device
+qualification. The exact-head ARM64 artifact is temporary CI output, not a release.
 
 ### Bounded 100,000-document CI measurement
 
-The CI benchmark used the release server, `tiny` profile, 100,000 deterministic synthetic
-documents with 1,024 payload bytes each, one scalar index, batch size 400, and seed
-`20261108`. It ran in an isolated GitHub Actions Ubuntu 22.04 x86-64 process with a
-1.5 GiB address-space limit, 15-minute CPU limit, 2 GiB per-file limit, and 128-file
-limit. The benchmark's temporary data directory was removed after results were recorded.
-The pull-request source head was `2544e5e6f86ed0eabdeb79e11ddb6ba3cde637fa`; GitHub
-checked out synthetic merge revision `0ca9d86d4e73c67e9120ffbacbccc10e487b4ce6` for
-the PR CI build. The machine-readable result is the
-[CI resource benchmark artifact](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42504109330/artifacts/13625939015)
+Run #139 used the release server, `tiny` profile, 100,000 deterministic synthetic documents
+with 1,024 payload bytes each, one scalar index, batch size 400, and seed `20261108`. It ran
+on GitHub Actions Ubuntu 22.04 x86-64 with a 1.5 GiB address-space limit, 15-minute CPU
+limit, 2 GiB per-file limit, and 128-file limit. The temporary benchmark data directory was
+removed. The PR source head was `9ba7db40cadb3756aa56dfbc515d0c48880959ef`; Actions tested
+synthetic merge revision `ab9ee0f948f4245cab30a89cc4a21c0787669b7b`. The machine-readable
+result and matching pre-optimization baseline are in the
+[run #139 benchmark artifact](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42510131204/artifacts/13629147215)
 (90-day retention).
 
 | Measurement | Result |
 | --- | ---: |
-| Whole-run wall time | 40.729 s |
-| Process peak RSS (kernel high-water mark) | 303,931,392 bytes (289.73 MiB) |
-| Idle RSS after health check (10.007 s observation) | 3.76 MiB |
-| Checkpoint RSS before → after | 207,441,920 → 207,458,304 bytes |
-| Sampled checkpoint-phase peak RSS | 207,458,304 bytes (197.85 MiB) |
-| Sampled recovery-phase peak RSS | 207,314,944 bytes (197.60 MiB) |
-| Peak-phase RSS | verify/stats/shutdown: 302,690,304 bytes (288.61 MiB) sampled; 303,931,392 bytes kernel high-water |
-| Checkpoint duration | 2.155 s |
-| Recovery startup after isolated child SIGKILL | 1.316 s |
-| Write batch p50 / p95 | 19.910 / 32.803 ms per 400-document batch |
-| Read p50 / p95 | 20.108 / 20.170 ms |
+| Whole-run wall time | 40.241 s |
+| Process peak RSS (kernel high-water mark) | 304,082,944 bytes (290.00 MiB) |
+| Idle RSS / CPU after health check (10.01 s) | 3.72 MiB / 0.2% of one core |
+| Threads at idle | 3 |
+| Checkpoint RSS before → after | 207,978,496 → 207,994,880 bytes (198.34 → 198.36 MiB) |
+| Sampled checkpoint-phase peak RSS | 207,994,880 bytes (198.36 MiB) |
+| Peak phase | Verify/stats/shutdown: about 289.8 MiB sampled; 290.00 MiB kernel high-water |
+| Checkpoint duration | 1.528 s |
+| Recovery startup after isolated child SIGKILL | 1.526 s |
+| Write batch p50 / p95 | 19.798 / 20.316 ms per 400-document batch |
+| Read p50 / p95 | 20.110 / 20.231 ms |
 | Snapshot / WAL after checkpoint | 121,347,033 / 12 bytes |
 | WAL after recovery tail writes | 443,184 bytes |
-| Idle CPU / process CPU across measured phases | 0.1% / 14.85% of one core |
-| Available system memory at start / observed minimum | 15,642,849,280 / 15,518,044,160 bytes |
+| Available system memory at start / observed minimum | 15,690,514,432 / 15,494,545,408 bytes |
 
-The observed process peak is below the provisional 768 MiB test target on this hosted
-runner, but the runner had about 14.5 GiB of available memory. This single run neither
-proves a 768 MiB cap nor predicts memory pressure on a 2 GiB or 4 GiB Pi. It also is not a
-before/after 100,000-document comparison, so it does not establish the requested 30% peak
-RSS reduction. `verify`, `stats`, and shutdown produced the largest RSS sample; those
-paths and actual Pi storage must be measured separately before setting capacity guidance.
+Run #139 also built and measured the pre-scan implementation from `f0eb9c3` under the
+same deterministic workload. A 100-document full scan took 333.236 ms and raised the
+process high-water mark by 186,675,200 bytes (178.03 MiB). The current implementation
+returned the same 100 documents in 21.622 ms and raised that high-water mark by 139,264
+bytes (0.13 MiB). This is direct evidence that pagination-before-cloning removed the
+scan-sized transient copy for this workload. The overall process peak remains about
+290 MiB, dominated by verification/stats/shutdown rather than the bounded scan. This is
+one hosted x86-64 comparison, not a 4 GiB Pi simulation or a capacity promise; the runner
+had more than 14 GiB available memory and the benchmark imposes per-process limits only.
 
 This document records the storage boundary observed in the current implementation and
 defines a migration path to a bounded-memory backend. It is a design proposal only: it
@@ -144,12 +145,17 @@ instead of deep-cloning the old document on each update/delete. A regression tes
 restoration after an injected WAL append failure. This removes an extra O(document-size)
 rollback copy from that path; no update-latency claim is made. For the verifier projection,
 the engine first scans the retained WAL for index definitions, with limits of 4,096 distinct
-field paths and 1 MiB of field-path bytes. If the WAL is damaged or the plan exceeds those
-bounds, verification falls back to the prior full-document replay path. The snapshot reader
-still validates the complete serialized snapshot and its checksum; projection occurs only
-after each document has been decoded. WAL operations are likewise decoded and validated in
-full, then only the indexed paths are retained for semantic replay. This optimization applies
-only to the read-only verifier, never to live state or recovery.
+field paths and 1 MiB of field-path bytes. The projected snapshot reader unions that plan
+with index fields declared in the snapshot itself, enforcing the same bounds while it reads
+the snapshot once. This matters when an index predates the snapshot and no retained WAL
+record repeats its definition: later WAL mutations must still be replayed with that field, or
+the verifier can miss a unique-index conflict that reopen rejects. Regression coverage now
+checks this exact case. If the WAL is damaged or the combined plan exceeds those bounds,
+verification falls back to the prior full-document replay path. The snapshot reader still
+validates the complete serialized snapshot and its checksum; projection occurs only after
+each document has been decoded. WAL operations are likewise decoded and validated in full,
+then only the indexed paths are retained for semantic replay. This optimization applies only
+to the read-only verifier, never to live state or recovery.
 
 A single paired resource run compared the exact `3da4a96` baseline with this projected
 verifier using the same Tiny workload, 10,000 documents, 900-byte payload, seed `20261108`,
