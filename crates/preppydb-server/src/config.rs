@@ -142,6 +142,20 @@ impl ServerConfig {
             .with("sync_mode", Json::str(self.sync_mode.as_str()))
             .with("read_only", Json::Bool(self.read_only))
             .with(
+                "auth_path",
+                self.auth_path
+                    .as_ref()
+                    .map(|path| Json::str(path.to_string_lossy().to_string()))
+                    .unwrap_or(Json::Null),
+            )
+            .with(
+                "pricing_audit_path",
+                self.pricing_audit_path
+                    .as_ref()
+                    .map(|path| Json::str(path.to_string_lossy().to_string()))
+                    .unwrap_or(Json::Null),
+            )
+            .with(
                 "ruby_planner_path",
                 self.ruby_planner_path
                     .as_ref()
@@ -380,6 +394,29 @@ mod tests {
         assert_eq!(config.listen, "127.0.0.1:7070");
         let bad = preppydb_json::parse(r#"{"listen":"127.0.0.1:1","bogus":1}"#).unwrap();
         assert!(config.merge_json(&bad).is_err());
+    }
+
+    #[test]
+    fn print_config_reports_effective_resource_and_path_defaults() {
+        let config = ServerConfig::new("/tmp/preppydb");
+        let json = config.to_json();
+        assert_eq!(
+            json.get("max_body_bytes").and_then(Json::as_u64),
+            Some(4 * 1024 * 1024)
+        );
+        assert_eq!(
+            json.get("ttl_sweep_interval_ms").and_then(Json::as_u64),
+            Some(30_000)
+        );
+        assert_eq!(
+            json.get("checkpoint_every_mutations")
+                .and_then(Json::as_u64),
+            Some(50_000)
+        );
+        assert_eq!(json.get("workers").and_then(Json::as_u64), Some(8));
+        assert_eq!(json.get("sync_mode").and_then(Json::as_str), Some("always"));
+        assert_eq!(json.get("auth_path"), Some(&Json::Null));
+        assert_eq!(json.get("pricing_audit_path"), Some(&Json::Null));
     }
 
     #[test]
