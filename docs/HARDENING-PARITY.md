@@ -1,7 +1,7 @@
 # PreppyDB / SeaWorld hardening parity
 
 This comparison uses SeaWorld DB main at `d6589e61564c91e2e013df69a98d0544e3026032`
-and PreppyDB PR #1 at `14b7df372f38a78e3ec88e66a64eaa21708b8be5`, inspected on
+and PreppyDB PR #1 at `0901f5692ef29e98172516ad2e0cc5de77661940`, inspected on
 2026-11-08. SeaWorld is a read-only reference; no SeaWorld files were changed.
 
 This is an engineering comparison, not a production-readiness declaration. CI proves
@@ -25,15 +25,20 @@ process.
 
 ## Current qualification snapshot
 
-- Refreshed on 2026-11-08 for code revision `14b7df372f38a78e3ec88e66a64eaa21708b8be5`.
+- Refreshed on 2026-11-08 for code revision `0901f5692ef29e98172516ad2e0cc5de77661940`.
   The comparison table reflects the current PreppyDB PR head and the SeaWorld main
   revision stated at the top.
 - PR #1 remains open and not draft. GitHub reports `mergeable=true`; that is merge
   mechanics, not a finding-closure or independent-review decision.
-- CI run [#117](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42431263713)
+- CI run [#119, attempt 2](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42434067554)
   completed successfully for Linux x86-64, Windows x86-64, ARM64/QEMU, Lua/Luvit, Docker
   image builds, Docker persistence, and the aggregate status. Vercel also reports
-  success. These checks qualify the checked-in code at `14b7df3`.
+  success. Attempt 1 had a Windows PowerShell smoke-test connection reset
+  (SocketException 10053) during collection creation. Attempt 2 reran the failed Windows
+  job; its tests, Ruby bridge, release build and smoke test all passed. Linux x86-64,
+  ARM64/QEMU, Lua/Luvit, Docker image, Docker persistence, and aggregate jobs also passed.
+  This qualifies the checked-in code at `0901f56` for those CI environments; it does not
+  prove physical Raspberry Pi or universal power-loss behavior.
 - The execution plan classifies WAL atomicity, WAL recovery, Windows manifest behavior,
   backup/restore, HTTP, authentication, pricing audit, clients, Ruby/Lua runtime paths,
   platform qualification, and performance qualification as `PARTIAL`.
