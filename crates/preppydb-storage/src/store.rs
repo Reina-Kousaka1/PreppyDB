@@ -208,29 +208,32 @@ impl Collection {
     /// Rebuild all index maps from the current documents (used after loading a
     /// snapshot, which stores documents but not index structures).
     pub fn rebuild_indexes(&mut self) -> Result<()> {
-        self.indexes.clear();
+        let mut indexes = BTreeMap::new();
         for index in self.meta.indexes.values() {
-            self.indexes
-                .insert(index.name.clone(), IndexState::new(index.clone()));
+            indexes.insert(index.name.clone(), IndexState::new(index.clone()));
         }
-        let docs: Vec<(String, Doc)> = self
-            .docs
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (key, doc) in docs {
-            self.index_document(&key, &doc)?;
+        for (key, doc) in &self.docs {
+            Self::index_document_into(&mut indexes, key, doc)?;
         }
+        self.indexes = indexes;
         Ok(())
     }
 
     fn index_document(&mut self, key: &str, doc: &Doc) -> Result<()> {
+        Self::index_document_into(&mut self.indexes, key, doc)
+    }
+
+    fn index_document_into(
+        indexes: &mut BTreeMap<String, IndexState>,
+        key: &str,
+        doc: &Doc,
+    ) -> Result<()> {
         // Validate every index before modifying any, so a later unique conflict
         // cannot leave entries in earlier indexes.
-        for index in self.indexes.values() {
+        for index in indexes.values() {
             index.validate_insert(key, doc)?;
         }
-        for index in self.indexes.values_mut() {
+        for index in indexes.values_mut() {
             index.insert(key, doc)?;
         }
         Ok(())

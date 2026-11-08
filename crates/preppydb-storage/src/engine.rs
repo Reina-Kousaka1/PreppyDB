@@ -1732,21 +1732,8 @@ impl Engine {
             })?;
         let seq = state.seq;
 
-        // 2. Serialise the state.
-        let payload: Vec<(CollectionMeta, Vec<(String, Doc)>)> = state
-            .store
-            .collections
-            .values()
-            .map(|coll| {
-                (
-                    coll.meta.clone(),
-                    coll.docs
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                )
-            })
-            .collect();
+        // 2. Serialise directly from the write-locked state. The snapshot writer
+        // only borrows documents, avoiding a second full copy of the database.
         let snapshot_path = self.paths.snapshot_file(generation);
         // A crash after snapshot publication but before manifest publication leaves
         // an unreferenced candidate. The active manifest still points elsewhere, so
@@ -1757,8 +1744,13 @@ impl Engine {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(DbError::io("inspecting snapshot destination", err)),
         }
-        let written =
-            snapshot::write_snapshot(&snapshot_path, generation, seq, now_ms(), &payload)?;
+        let written = snapshot::write_snapshot_from_store(
+            &snapshot_path,
+            generation,
+            seq,
+            now_ms(),
+            &state.store,
+        )?;
 
         // 3. Make the new snapshot authoritative.
         let previous_snapshot = manifest.snapshot.clone();

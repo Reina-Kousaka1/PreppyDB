@@ -14,7 +14,7 @@
 
 use crate::catalog::CollectionMeta;
 use crate::error::{DbError, Result};
-use crate::store::Doc;
+use crate::store::{Doc, Store};
 use preppydb_crypto::crc32c;
 use preppydb_crypto::sha256::{sha256, Sha256};
 use preppydb_json::Json;
@@ -126,6 +126,73 @@ pub fn write_snapshot(
     created_at: i64,
     collections: &[(CollectionMeta, Vec<(String, Doc)>)],
 ) -> Result<WrittenSnapshot> {
+    let doc_count = collections.iter().map(|(_, docs)| docs.len() as u64).sum();
+    let borrowed = collections.iter().map(|(meta, docs)| {
+        (
+            meta,
+            Box::new(docs.iter().map(|(key, doc)| (key, doc)))
+                as Box<dyn Iterator<Item = (&String, &Doc)> + '_>,
+        )
+    });
+    write_snapshot_iter(
+        path,
+        generation,
+        seq,
+        created_at,
+        borrowed,
+        doc_count,
+        collections.len() as u64,
+    )
+}
+
+/// Write a checkpoint directly from the locked in-memory store without cloning its
+/// documents into a second full-size collection first.
+pub fn write_snapshot_from_store(
+    path: &Path,
+    generation: u64,
+    seq: u64,
+    created_at: i64,
+    store: &Store,
+) -> Result<WrittenSnapshot> {
+    let doc_count = store
+        .collections
+        .values()
+        .map(|collection| collection.docs.len() as u64)
+        .sum();
+    let borrowed = store.collections.values().map(|collection| {
+        (
+            &collection.meta,
+            Box::new(collection.docs.iter()) as Box<dyn Iterator<Item = (&String, &Doc)> + '_>,
+        )
+    });
+    write_snapshot_iter(
+        path,
+        generation,
+        seq,
+        created_at,
+        borrowed,
+        doc_count,
+        store.collections.len() as u64,
+    )
+}
+
+fn write_snapshot_iter<'a, I>(
+    path: &Path,
+    generation: u64,
+    seq: u64,
+    created_at: i64,
+    collections: I,
+    doc_count: u64,
+    collection_count: u64,
+) -> Result<WrittenSnapshot>
+where
+    I: IntoIterator<
+        Item = (
+            &'a CollectionMeta,
+            Box<dyn Iterator<Item = (&'a String, &'a Doc)> + 'a>,
+        ),
+    >,
+{
     let tmp_path = path.with_extension("pdb.tmp");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -136,8 +203,8 @@ pub fn write_snapshot(
         generation,
         seq,
         created_at,
-        doc_count: collections.iter().map(|(_, docs)| docs.len() as u64).sum(),
-        collections: collections.len() as u64,
+        doc_count,
+        collections: collection_count,
     };
     let header_json = header.to_json().to_string();
 
@@ -185,15 +252,17 @@ pub fn write_snapshot(
                        bytes: &mut u64|
      -> Result<()> {
         let payload_len = checked_frame_len(payload.len())?;
-        let mut frame = Vec::with_capacity(payload.len() + 8);
-        frame.extend_from_slice(&payload_len.to_le_bytes());
-        frame.extend_from_slice(&crc32c(payload, 0).to_le_bytes());
-        frame.extend_from_slice(payload);
+        let len_bytes = payload_len.to_le_bytes();
+        let crc_bytes = crc32c(payload, 0).to_le_bytes();
         writer
-            .write_all(&frame)
+            .write_all(&len_bytes)
+            .and_then(|()| writer.write_all(&crc_bytes))
+            .and_then(|()| writer.write_all(payload))
             .map_err(|err| DbError::io("writing snapshot frame", err))?;
-        hasher.update(&frame);
-        *bytes += frame.len() as u64;
+        hasher.update(&len_bytes);
+        hasher.update(&crc_bytes);
+        hasher.update(payload);
+        *bytes += payload_len as u64 + 8;
         Ok(())
     };
 
@@ -494,6 +563,7 @@ pub fn bytes_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Collection;
     use preppydb_json::Json;
 
     fn tempdir(tag: &str) -> PathBuf {
@@ -538,6 +608,29 @@ mod tests {
         assert_eq!(loaded.collections[0].0.name, "profiles");
         assert_eq!(loaded.collections[0].1[0].0, "molly");
         assert_eq!(loaded.collections[0].1[0].1.version, 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn store_checkpoint_writer_preserves_snapshot_bytes() {
+        let dir = tempdir("store-writer");
+        let original_path = dir.join("original.pdb");
+        let store_path = dir.join("store.pdb");
+        let collections = sample();
+        let mut store = Store::default();
+        for (meta, docs) in &collections {
+            let mut collection = Collection::new(meta.clone());
+            collection.docs.extend(docs.iter().cloned());
+            store.collections.insert(meta.name.clone(), collection);
+        }
+
+        write_snapshot(&original_path, 7, 42, 1234, &collections).unwrap();
+        write_snapshot_from_store(&store_path, 7, 42, 1234, &store).unwrap();
+
+        assert_eq!(
+            std::fs::read(&original_path).unwrap(),
+            std::fs::read(&store_path).unwrap()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
