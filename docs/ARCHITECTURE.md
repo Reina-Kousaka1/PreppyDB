@@ -220,7 +220,12 @@ Limits that are documented rather than hidden:
 
 ## Snapshots and backups
 
-`Engine::export_snapshot` and the backup module produce a self-describing archive:
+`Engine::try_export_snapshot` returns a self-describing in-memory view only while the
+engine's commit outcome is known. `Engine::export_snapshot` is retained as a deprecated,
+infallible compatibility method; callers that need a correctness-sensitive export must
+use the checked method because the legacy method can return the rolled-back in-memory
+view after an append or sync error whose WAL outcome is unknown. The backup module uses
+the checked stable-file path and rejects a poisoned engine. Its archive format is:
 
 ```
 PPDBBAK1 | u32 header_len | header JSON | members | PPDBEND1 | sha256(all previous bytes)

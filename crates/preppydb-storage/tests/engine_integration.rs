@@ -2693,7 +2693,7 @@ fn snapshot_export_is_self_consistent() {
             PutOptions::default(),
         )
         .unwrap();
-    let snapshot = engine.export_snapshot();
+    let snapshot = engine.try_export_snapshot().unwrap();
     assert_eq!(snapshot.get_i64("revision"), Some(engine.last_seq() as i64));
     let value = snapshot
         .get_path("collections.c.documents.k.value.v")

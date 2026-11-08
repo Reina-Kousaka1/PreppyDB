@@ -2185,9 +2185,25 @@ impl Engine {
         })
     }
 
-    /// A consistent, self-contained copy of the data (used by backups and the API).
+    /// A consistent, self-contained copy of the data when the engine outcome is known.
+    pub fn try_export_snapshot(&self) -> Result<Json> {
+        let state = self.read();
+        self.check_healthy()?;
+        Ok(self.export_snapshot_from_state(&state))
+    }
+
+    /// Export the current in-memory view without checking whether the WAL outcome is known.
+    ///
+    /// This method remains for source compatibility. New callers should use
+    /// [`Engine::try_export_snapshot`], which refuses to return a possibly stale view after
+    /// a WAL append or sync failure.
+    #[deprecated(note = "use try_export_snapshot to reject unknown WAL outcomes")]
     pub fn export_snapshot(&self) -> Json {
         let state = self.read();
+        self.export_snapshot_from_state(&state)
+    }
+
+    fn export_snapshot_from_state(&self, state: &State) -> Json {
         let now = now_ms();
         let mut collections = Json::obj();
         for (name, coll) in &state.store.collections {
@@ -2558,6 +2574,49 @@ mod document_undo_tests {
             assert_eq!(first.value.as_i64(), Some(1));
             assert_eq!(second.value.as_i64(), Some(2));
         }
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checked_snapshot_export_refuses_unknown_wal_outcome() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-export-sync-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        engine
+            .put("c", "key", Json::str("old"), PutOptions::default())
+            .unwrap();
+
+        engine.lock_mutex(&engine.writer).inject_sync_failure();
+        let error = engine
+            .put("c", "key", Json::str("new"), PutOptions::default())
+            .unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::COMMIT_OUTCOME_UNKNOWN);
+        assert!(matches!(
+            engine.try_export_snapshot(),
+            Err(DbError::CommitOutcomeUnknown(_))
+        ));
+
+        drop(engine);
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        assert_eq!(
+            reopened
+                .try_export_snapshot()
+                .unwrap()
+                .get("collections")
+                .and_then(|collections| collections.get("c"))
+                .and_then(|collection| collection.get("documents"))
+                .and_then(|documents| documents.get("key"))
+                .and_then(|document| document.get("value"))
+                .and_then(Json::as_str),
+            Some("new")
+        );
         drop(reopened);
         std::fs::remove_dir_all(&dir).unwrap();
     }
