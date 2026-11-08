@@ -503,6 +503,7 @@ impl SnapshotSink for StoreSnapshotSink {
             for field in meta
                 .indexes
                 .values()
+                .filter(|index| !self.bounded_projection || index.unique)
                 .map(|index| index.field.as_str())
                 .chain(
                     self.projection
@@ -547,7 +548,11 @@ impl SnapshotSink for StoreSnapshotSink {
             }
             self.collection_fields.insert(meta.name.clone(), fields);
         }
-        self.store.create_collection(meta, ApplyMode::Replay)
+        if self.bounded_projection {
+            self.store.create_collection_for_verification(meta)
+        } else {
+            self.store.create_collection(meta, ApplyMode::Replay)
+        }
     }
 
     fn document(&mut self, collection: &str, key: String, doc: Doc) -> Result<()> {
@@ -599,7 +604,7 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
 /// trailing EOF and declared object counts have been checked. Indexes are then
 /// rebuilt from that private store before it can be published to the engine.
 pub fn read_snapshot_store(path: &Path, limits: Limits) -> Result<SnapshotStore> {
-    read_snapshot_store_inner(path, limits, None, false).map(|(snapshot, _)| snapshot)
+    read_snapshot_store_inner(path, limits, None, false, false).map(|(snapshot, _)| snapshot)
 }
 
 /// Read and fully verify a snapshot into a compact temporary store containing only
@@ -614,7 +619,8 @@ pub fn read_snapshot_store_projected(
         .iter()
         .map(|(collection, fields)| (collection.clone(), fields.iter().cloned().collect()))
         .collect();
-    read_snapshot_store_inner(path, limits, Some(projection), false).map(|(snapshot, _)| snapshot)
+    read_snapshot_store_inner(path, limits, Some(projection), false, false)
+        .map(|(snapshot, _)| snapshot)
 }
 
 /// Project a snapshot for verification and return the complete bounded field plan
@@ -628,7 +634,7 @@ pub(crate) fn read_snapshot_store_projected_with_fields(
         .iter()
         .map(|(collection, fields)| (collection.clone(), fields.iter().cloned().collect()))
         .collect();
-    read_snapshot_store_inner(path, limits, Some(projection), true)
+    read_snapshot_store_inner(path, limits, Some(projection), true, true)
 }
 
 fn read_snapshot_store_inner(
@@ -636,6 +642,7 @@ fn read_snapshot_store_inner(
     limits: Limits,
     projection: Option<BTreeMap<String, Vec<String>>>,
     bounded_projection: bool,
+    unique_indexes_only: bool,
 ) -> Result<(SnapshotStore, BTreeMap<String, BTreeSet<String>>)> {
     let mut sink = StoreSnapshotSink {
         store: Store::new(limits),
@@ -647,7 +654,7 @@ fn read_snapshot_store_inner(
     };
     let (header, body_sha256) = read_snapshot_into(path, &mut sink)?;
     for collection in sink.store.collections.values_mut() {
-        collection.rebuild_indexes()?;
+        collection.rebuild_indexes_with_unique_only(unique_indexes_only)?;
     }
     let index_fields = sink.collection_fields;
     Ok((
@@ -1075,6 +1082,58 @@ mod tests {
                 .entries
                 .contains_key(&rank)
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn verifier_snapshot_reader_builds_only_unique_index_state() {
+        let dir = tempdir("verify-unique-index-only");
+        let path = dir.join("snap-1.pdb");
+        let mut collections = sample();
+        collections[0].0.indexes.insert(
+            "unique_name".into(),
+            crate::catalog::IndexMeta {
+                name: "unique_name".into(),
+                field: "name".into(),
+                unique: true,
+                sparse: false,
+                created_at: 1234,
+            },
+        );
+        collections[0].0.indexes.insert(
+            "by_profile_rank".into(),
+            crate::catalog::IndexMeta {
+                name: "by_profile_rank".into(),
+                field: "profile.rank".into(),
+                unique: false,
+                sparse: true,
+                created_at: 1234,
+            },
+        );
+        collections[0].1[0].1.value = Json::obj()
+            .with("name", Json::str("Molly"))
+            .with("profile", Json::obj().with("rank", Json::uint(7)))
+            .with("unused", Json::str("not needed by semantic verification"));
+        let written = write_snapshot(&path, 1, 42, 1234, &collections).unwrap();
+
+        let additional = BTreeMap::new();
+        let (loaded, fields) =
+            read_snapshot_store_projected_with_fields(&path, Limits::default(), &additional)
+                .unwrap();
+        let collection = loaded.store.collection("profiles").unwrap();
+        assert_eq!(loaded.body_sha256, written.body_sha256);
+        assert!(collection.meta.indexes.contains_key("unique_name"));
+        assert!(collection.meta.indexes.contains_key("by_profile_rank"));
+        assert!(collection.indexes.contains_key("unique_name"));
+        assert!(!collection.indexes.contains_key("by_profile_rank"));
+        assert_eq!(
+            collection.docs["molly"].value,
+            Json::obj().with("name", Json::str("Molly"))
+        );
+        assert_eq!(fields["profiles"], BTreeSet::from(["name".to_string()]));
+        assert!(collection.indexes["unique_name"]
+            .entries
+            .contains_key(&Json::str("Molly").canonical_bytes()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

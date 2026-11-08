@@ -195,9 +195,15 @@ pub struct Collection {
 
 impl Collection {
     pub fn new(meta: CollectionMeta) -> Collection {
+        Self::new_with_unique_indexes_only(meta, false)
+    }
+
+    fn new_with_unique_indexes_only(meta: CollectionMeta, unique_only: bool) -> Collection {
         let mut indexes = BTreeMap::new();
         for index in meta.indexes.values() {
-            indexes.insert(index.name.clone(), IndexState::new(index.clone()));
+            if !unique_only || index.unique {
+                indexes.insert(index.name.clone(), IndexState::new(index.clone()));
+            }
         }
         Collection {
             meta,
@@ -209,9 +215,15 @@ impl Collection {
     /// Rebuild all index maps from the current documents (used after loading a
     /// snapshot, which stores documents but not index structures).
     pub fn rebuild_indexes(&mut self) -> Result<()> {
+        self.rebuild_indexes_with_unique_only(false)
+    }
+
+    pub(crate) fn rebuild_indexes_with_unique_only(&mut self, unique_only: bool) -> Result<()> {
         let mut indexes = BTreeMap::new();
         for index in self.meta.indexes.values() {
-            indexes.insert(index.name.clone(), IndexState::new(index.clone()));
+            if !unique_only || index.unique {
+                indexes.insert(index.name.clone(), IndexState::new(index.clone()));
+            }
         }
         for (key, doc) in &self.docs {
             Self::index_document_into(&mut indexes, key, doc)?;
@@ -378,6 +390,22 @@ impl Store {
 
     /// Create a collection (idempotent only when the definition is identical).
     pub fn create_collection(&mut self, meta: CollectionMeta, mode: ApplyMode) -> Result<()> {
+        self.create_collection_with_index_policy(meta, mode, false)
+    }
+
+    pub(crate) fn create_collection_for_verification(
+        &mut self,
+        meta: CollectionMeta,
+    ) -> Result<()> {
+        self.create_collection_with_index_policy(meta, ApplyMode::Replay, true)
+    }
+
+    fn create_collection_with_index_policy(
+        &mut self,
+        meta: CollectionMeta,
+        mode: ApplyMode,
+        unique_only: bool,
+    ) -> Result<()> {
         if self.collections.contains_key(&meta.name) {
             return match mode {
                 ApplyMode::Replay => Ok(()),
@@ -394,8 +422,8 @@ impl Store {
         if let Some(schema) = &meta.schema {
             schema::validate_schema(schema, &meta.name, 0)?;
         }
-        self.collections
-            .insert(meta.name.clone(), Collection::new(meta));
+        let collection = Collection::new_with_unique_indexes_only(meta.clone(), unique_only);
+        self.collections.insert(meta.name.clone(), collection);
         Ok(())
     }
 
@@ -413,6 +441,16 @@ impl Store {
         index: IndexMeta,
         mode: ApplyMode,
     ) -> Result<()> {
+        self.create_index_with_index_policy(collection, index, mode, false)
+    }
+
+    fn create_index_with_index_policy(
+        &mut self,
+        collection: &str,
+        index: IndexMeta,
+        mode: ApplyMode,
+        unique_only: bool,
+    ) -> Result<()> {
         let coll = match self.collections.get_mut(collection) {
             Some(coll) => coll,
             None if mode == ApplyMode::Replay => return Ok(()),
@@ -428,6 +466,10 @@ impl Store {
             };
         }
         let name = index.name.clone();
+        if unique_only && !index.unique {
+            coll.meta.indexes.insert(name, index);
+            return Ok(());
+        }
         let mut state = IndexState::new(index.clone());
         for (key, doc) in &coll.docs {
             state.insert(key, doc)?;
@@ -672,6 +714,26 @@ impl Store {
         revision: u64,
         mode: ApplyMode,
     ) -> Result<ApplyStats> {
+        self.apply_with_index_policy(op, now_ms, revision, mode, false)
+    }
+
+    pub(crate) fn apply_for_verification(
+        &mut self,
+        op: &Op,
+        now_ms: i64,
+        revision: u64,
+    ) -> Result<ApplyStats> {
+        self.apply_with_index_policy(op, now_ms, revision, ApplyMode::Replay, true)
+    }
+
+    fn apply_with_index_policy(
+        &mut self,
+        op: &Op,
+        now_ms: i64,
+        revision: u64,
+        mode: ApplyMode,
+        unique_only: bool,
+    ) -> Result<ApplyStats> {
         let mut stats = ApplyStats::default();
         match op {
             Op::Put {
@@ -697,7 +759,7 @@ impl Store {
                 stats.deletes += 1;
             }
             Op::CreateCollection { meta } => {
-                self.create_collection(meta.clone(), mode)?;
+                self.create_collection_with_index_policy(meta.clone(), mode, unique_only)?;
                 stats.collections_created += 1;
             }
             Op::DropCollection { collection } => {
@@ -705,7 +767,7 @@ impl Store {
                 stats.collections_dropped += 1;
             }
             Op::CreateIndex { collection, index } => {
-                self.create_index(collection, index.clone(), mode)?;
+                self.create_index_with_index_policy(collection, index.clone(), mode, unique_only)?;
             }
             Op::DropIndex { collection, name } => {
                 self.drop_index(collection, name, mode)?;
@@ -724,7 +786,14 @@ impl Store {
                 let mut undo_bytes = 0;
                 let mut staged_stats = ApplyStats::default();
                 for op in ops {
-                    match self.apply_with_undo(op, now_ms, revision, mode, &mut undo_bytes) {
+                    match self.apply_with_undo_and_index_policy(
+                        op,
+                        now_ms,
+                        revision,
+                        mode,
+                        &mut undo_bytes,
+                        unique_only,
+                    ) {
                         Ok((sub, inverse)) => {
                             staged_stats.puts += sub.puts;
                             staged_stats.deletes += sub.deletes;
@@ -752,6 +821,18 @@ impl Store {
         mode: ApplyMode,
         undo_bytes: &mut usize,
     ) -> Result<(ApplyStats, StoreUndo)> {
+        self.apply_with_undo_and_index_policy(op, now_ms, revision, mode, undo_bytes, false)
+    }
+
+    fn apply_with_undo_and_index_policy(
+        &mut self,
+        op: &Op,
+        now_ms: i64,
+        revision: u64,
+        mode: ApplyMode,
+        undo_bytes: &mut usize,
+        unique_only: bool,
+    ) -> Result<(ApplyStats, StoreUndo)> {
         match op {
             Op::Put {
                 collection, key, ..
@@ -777,7 +858,8 @@ impl Store {
                     };
                 }
                 let previous = previous_ref.cloned();
-                let stats = self.apply(op, now_ms, revision, mode)?;
+                let stats =
+                    self.apply_with_index_policy(op, now_ms, revision, mode, unique_only)?;
                 if mode == ApplyMode::Replay && !collection_exists {
                     return Ok((stats, StoreUndo::None));
                 }
@@ -792,7 +874,8 @@ impl Store {
             }
             Op::CreateCollection { meta } => {
                 let existed = self.collections.contains_key(&meta.name);
-                let stats = self.apply(op, now_ms, revision, mode)?;
+                let stats =
+                    self.apply_with_index_policy(op, now_ms, revision, mode, unique_only)?;
                 Ok((
                     stats,
                     if existed {
@@ -823,7 +906,8 @@ impl Store {
                     .collections
                     .get(collection)
                     .is_some_and(|coll| coll.meta.indexes.contains_key(&index.name));
-                let stats = self.apply(op, now_ms, revision, mode)?;
+                let stats =
+                    self.apply_with_index_policy(op, now_ms, revision, mode, unique_only)?;
                 Ok((
                     stats,
                     if existed {
@@ -873,7 +957,14 @@ impl Store {
                 let mut inverses = Vec::with_capacity(ops.len());
                 let mut stats = ApplyStats::default();
                 for item in ops {
-                    match self.apply_with_undo(item, now_ms, revision, mode, undo_bytes) {
+                    match self.apply_with_undo_and_index_policy(
+                        item,
+                        now_ms,
+                        revision,
+                        mode,
+                        undo_bytes,
+                        unique_only,
+                    ) {
                         Ok((sub, inverse)) => {
                             stats.puts += sub.puts;
                             stats.deletes += sub.deletes;
@@ -1380,6 +1471,82 @@ mod tests {
                 .with("x", Json::int(1)),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn verification_store_materializes_unique_indexes_but_preserves_other_metadata() {
+        let mut s = Store::new(Limits::default());
+        let unique = IndexMeta {
+            name: "uniq_name".into(),
+            field: "name".into(),
+            unique: true,
+            sparse: false,
+            created_at: 0,
+        };
+        let secondary = IndexMeta {
+            name: "by_group".into(),
+            field: "group".into(),
+            unique: false,
+            sparse: true,
+            created_at: 0,
+        };
+        s.apply_for_verification(
+            &Op::CreateCollection {
+                meta: CollectionMeta::new("people", 0),
+            },
+            1000,
+            1,
+        )
+        .unwrap();
+        s.apply_for_verification(
+            &Op::CreateIndex {
+                collection: "people".into(),
+                index: unique,
+            },
+            1000,
+            2,
+        )
+        .unwrap();
+        s.apply_for_verification(
+            &Op::CreateIndex {
+                collection: "people".into(),
+                index: secondary,
+            },
+            1000,
+            3,
+        )
+        .unwrap();
+
+        let collection = s.collection("people").unwrap();
+        assert!(collection.meta.indexes.contains_key("uniq_name"));
+        assert!(collection.meta.indexes.contains_key("by_group"));
+        assert!(collection.indexes.contains_key("uniq_name"));
+        assert!(!collection.indexes.contains_key("by_group"));
+
+        let put = |key: &str| Op::Put {
+            collection: "people".into(),
+            key: key.into(),
+            value: Json::obj()
+                .with("name", Json::str("Molly"))
+                .with("group", Json::str("staff")),
+            expires_at: None,
+        };
+        s.apply_for_verification(&put("a"), 1000, 4).unwrap();
+        let conflict = s.apply_for_verification(&put("b"), 1000, 5);
+        assert!(conflict.is_err(), "unique replay conflict must still fail");
+        assert_eq!(s.total_docs(), 1);
+
+        s.apply_for_verification(
+            &Op::Delete {
+                collection: "people".into(),
+                key: "a".into(),
+            },
+            1000,
+            6,
+        )
+        .unwrap();
+        s.apply_for_verification(&put("b"), 1000, 7).unwrap();
+        assert_eq!(s.total_docs(), 1);
     }
 
     #[test]

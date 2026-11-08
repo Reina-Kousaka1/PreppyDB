@@ -107,12 +107,18 @@ fn collect_verify_index_fields_from_op(
     total_count: &mut usize,
 ) -> bool {
     match op {
-        Op::CreateCollection { meta } => meta.indexes.values().all(|index| {
-            add_verify_index_meta(fields, total_bytes, total_count, &meta.name, index)
-        }),
-        Op::CreateIndex { collection, index } => {
+        Op::CreateCollection { meta } => {
+            meta.indexes
+                .values()
+                .filter(|index| index.unique)
+                .all(|index| {
+                    add_verify_index_meta(fields, total_bytes, total_count, &meta.name, index)
+                })
+        }
+        Op::CreateIndex { collection, index } if index.unique => {
             add_verify_index_meta(fields, total_bytes, total_count, collection, index)
         }
+        Op::CreateIndex { .. } => true,
         Op::Batch { ops, .. } => ops
             .iter()
             .all(|op| collect_verify_index_fields_from_op(op, fields, total_bytes, total_count)),
@@ -2302,7 +2308,7 @@ impl Engine {
                         None => Ok(()),
                     };
                     if let Err(err) = projected.and_then(|()| {
-                        replay_store.apply(&op, record.ts, record.seq, ApplyMode::Replay)
+                        replay_store.apply_for_verification(&op, record.ts, record.seq)
                     }) {
                         issues.push(format!(
                             "{name}: record sequence {} cannot be replayed: {err}",

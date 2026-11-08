@@ -443,3 +443,16 @@ A paired local WSL2 comparison used the same deterministic Tiny-profile workload
 | Whole-process peak HWM | 38.87 MiB | 33.84 MiB | 5.02 MiB lower |
 
 The endpoint returned all 100 requested documents on every run. The HWM value is the process-lifetime peak (`VmHWM`), so a zero increase means the scan did not exceed an earlier peak; it is not an independent allocator-peak measurement. These synthetic WSL2 results are diagnostic, not Raspberry Pi qualification. Unbounded full scans still materialize their requested results, and the underlying Store and indexes remain in memory.
+
+### Verification replay index-memory check (candidate based on `681e73b`)
+
+The verifier's replay state keeps all index definitions but materializes index entries only for unique indexes. Unique-index entries are required to detect invalid replayed writes; non-unique index entries do not affect replay validity. Snapshot decoding, frame checksums, WAL CRC/sequence checks, and semantic replay continue to run. Normal open/recovery and query execution still build and use all indexes.
+
+Paired runs used the same release workload on Ubuntu WSL2 (x86-64), Tiny profile, seed `20261108`, 900-byte payloads, 500-operation batches, one `group` secondary index, and a 10-second idle window. Both binaries were based on commit `681e73b52c5cc3607e5d5d2916a738c4f33aa852`; the candidate differs only by the local verifier optimization. The table compares the verifier phase's process-lifetime `VmHWM`, not an allocation-only peak:
+
+| Documents | Baseline verify HWM | Candidate verify HWM | Change | Idle RSS / threads (baseline → candidate) |
+| ---: | ---: | ---: | ---: | --- |
+| 10,000 | 34.53 MiB | 27.85 MiB | −6.69 MiB (−19.3%) | 3.85 → 3.92 MiB / 3 → 3 |
+| 100,000 | 277.52 MiB | 209.72 MiB | −67.80 MiB (−24.4%) | 3.86 → 3.89 MiB / 3 → 3 |
+
+These are single-run diagnostic measurements on the same WSL host. The candidate still retains a projected document map for replay, so the 100,000-document verifier peak remains about 210 MiB and is not bounded independently of database size. No Raspberry Pi, Windows, or ARM64 measurement is implied. The optimization does not change the disk format or the active/query index representation.
