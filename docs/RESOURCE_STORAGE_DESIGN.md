@@ -1,15 +1,17 @@
 # Bounded-Memory Storage Design (Proposal)
 
-## Current evidence (2026-11-08; PR head `b2c4f56`)
+## Resource evidence (collected 2026-11-08; code baseline `b2c4f56`)
 
-The current PR head is `b2c4f563ab40e74351666895f02ebeb881679adb`. GitHub Actions run
-[#148](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42521488292) passed on this
-commit, including Linux, Windows, emulated Linux ARM64, Lua/Luvit, Docker, the crash
-harness, and the bounded resource benchmark. The ARM64 job uses QEMU, not Raspberry Pi
-hardware. No result here establishes Raspberry Pi capacity or real-device qualification.
-The exact-head ARM64 artifact is temporary CI output, not a release.
+The measurement binaries were built from code commit
+`b2c4f563ab40e74351666895f02ebeb881679adb`. Subsequent commits through `fe85e40` changed
+this document only. GitHub Actions run [#150](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42523479376)
+passed after a targeted retry of one Windows smoke-test job. It exercised the same code
+baseline on Linux, Windows, emulated Linux ARM64, Lua/Luvit, Docker, the crash harness, and
+the bounded resource benchmark. ARM64 uses QEMU, not Raspberry Pi hardware. No result here
+establishes Raspberry Pi capacity or real-device qualification; CI artifacts are not
+releases.
 
-### Current bounded 100,000-document CI measurement (run #148)
+### Hosted bounded 100,000-document CI measurement (run #148)
 
 Run #148 used the release server, `tiny` profile, 100,000 deterministic synthetic documents
 with 1,024 payload bytes each, one scalar index, batch size 400, a 60-second idle window,
