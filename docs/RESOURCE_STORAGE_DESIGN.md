@@ -2,14 +2,52 @@
 
 ## Current evidence (2026-11-08)
 
-The current PR head is `aaeeeaf288a03cd12909341633cfc92d1c79cba9`; its full GitHub CI
-run [#134](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42502774832) passed
-Linux x86-64, Windows x86-64, ARM64/QEMU, Lua/Luvit, and Docker jobs. The current branch
-has no measured 100,000-document run. Existing resource measurements below are synthetic
-WSL2 x86-64 results through 10,000 documents, plus narrowly scoped checkpoint serializer
-comparisons on single 900 KiB and 1 MiB documents. The exact-head ARM64 archive is
-available as a CI artifact until 2026-12-08; it is not a release. These measurements do
-not establish a 768 MiB ceiling, Raspberry Pi capacity, or physical hardware qualification.
+The current PR head is `2544e5e6f86ed0eabdeb79e11ddb6ba3cde637fa`; its full GitHub CI
+run [#136](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42504109330) includes
+a bounded 100,000-document run on Ubuntu 22.04 x86-64. Earlier resource measurements below
+are synthetic WSL2 x86-64 results through 10,000 documents, plus narrowly scoped
+checkpoint serializer comparisons on single 900 KiB and 1 MiB documents. CI run #136 is
+not a Raspberry Pi measurement. Neither it nor the historical measurements establish a
+768 MiB ceiling, Raspberry Pi capacity, or physical hardware qualification. The exact-head
+ARM64 artifact is temporary CI output, not a release.
+
+### Bounded 100,000-document CI measurement
+
+The CI benchmark used the release server, `tiny` profile, 100,000 deterministic synthetic
+documents with 1,024 payload bytes each, one scalar index, batch size 400, and seed
+`20261108`. It ran in an isolated GitHub Actions Ubuntu 22.04 x86-64 process with a
+1.5 GiB address-space limit, 15-minute CPU limit, 2 GiB per-file limit, and 128-file
+limit. The benchmark's temporary data directory was removed after results were recorded.
+The pull-request source head was `2544e5e6f86ed0eabdeb79e11ddb6ba3cde637fa`; GitHub
+checked out synthetic merge revision `0ca9d86d4e73c67e9120ffbacbccc10e487b4ce6` for
+the PR CI build. The machine-readable result is the
+[CI resource benchmark artifact](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42504109330/artifacts/13625939015)
+(90-day retention).
+
+| Measurement | Result |
+| --- | ---: |
+| Whole-run wall time | 40.729 s |
+| Process peak RSS (kernel high-water mark) | 303,931,392 bytes (289.73 MiB) |
+| Idle RSS after health check (10.007 s observation) | 3.76 MiB |
+| Checkpoint RSS before → after | 207,441,920 → 207,458,304 bytes |
+| Sampled checkpoint-phase peak RSS | 207,458,304 bytes (197.85 MiB) |
+| Sampled recovery-phase peak RSS | 207,314,944 bytes (197.60 MiB) |
+| Peak-phase RSS | verify/stats/shutdown: 302,690,304 bytes (288.61 MiB) sampled; 303,931,392 bytes kernel high-water |
+| Checkpoint duration | 2.155 s |
+| Recovery startup after isolated child SIGKILL | 1.316 s |
+| Write batch p50 / p95 | 19.910 / 32.803 ms per 400-document batch |
+| Read p50 / p95 | 20.108 / 20.170 ms |
+| Snapshot / WAL after checkpoint | 121,347,033 / 12 bytes |
+| WAL after recovery tail writes | 443,184 bytes |
+| Idle CPU / process CPU across measured phases | 0.1% / 14.85% of one core |
+| Available system memory at start / observed minimum | 15,642,849,280 / 15,518,044,160 bytes |
+
+The observed process peak is below the provisional 768 MiB test target on this hosted
+runner, but the runner had about 14.5 GiB of available memory. This single run neither
+proves a 768 MiB cap nor predicts memory pressure on a 2 GiB or 4 GiB Pi. It also is not a
+before/after 100,000-document comparison, so it does not establish the requested 30% peak
+RSS reduction. `verify`, `stats`, and shutdown produced the largest RSS sample; those
+paths and actual Pi storage must be measured separately before setting capacity guidance.
 
 This document records the storage boundary observed in the current implementation and
 defines a migration path to a bounded-memory backend. It is a design proposal only: it

@@ -92,13 +92,12 @@ preppydb-cli:      0 tests (verified manually, see below)
 
 ## Current PR-head qualification (2026-11-08)
 
-PR #1 remains open on `arena/146caad2-preppydb` at `aaeeeaf288a03cd12909341633cfc92d1c79cba9`.
-GitHub Actions run [#134](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42502774832)
-completed successfully for Linux x86-64 (format, Clippy, tests), Windows x86-64 (build,
-tests and PowerShell smoke), ARM64/QEMU (build and emulated tests), Lua/Luvit, Docker
-multi-architecture build, Docker persistence, and aggregate status. This run covers the
-exact PR head; it is not evidence for real Pi hardware, 100,000-document resource use, or
-power-loss durability.
+PR #1 remains open on `arena/146caad2-preppydb` at
+`2544e5e6f86ed0eabdeb79e11ddb6ba3cde637fa`. GitHub Actions run [#136](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42504109330)
+is the exact-head qualification run. It covers Linux x86-64 (format, Clippy, tests,
+crash recovery, release build, bounded resource benchmark), Windows x86-64 (build, tests,
+PowerShell smoke), ARM64/QEMU, Lua/Luvit, and Docker jobs. QEMU is not real Pi hardware and
+process-kill/reopen is not power-loss durability.
 
 The isolated local checkout is on Windows. `cargo fmt --all -- --check` passed, but local
 Clippy/test compilation stops because MSVC `link.exe` is unavailable. The Python launcher
@@ -107,12 +106,12 @@ benchmark was not run locally. No Pi is attached to this workspace.
 
 | Item | State | Boundary |
 | --- | --- | --- |
-| Linux x86-64 format, Clippy, tests | **green on exact PR head** | CI run #134 |
-| Windows x86-64 build, full tests, smoke | **green on exact PR head** | CI run #134; does not prove power-loss behavior |
-| Linux ARM64 build and tests | **green under QEMU** | CI run #134; emulation, not physical Raspberry Pi |
-| Lua/Luvit tests | **green on exact PR head** | CI run #134 |
-| Docker multi-architecture build and persistence | **green on exact PR head** | CI run #134; images were built, not pushed |
-| 100,000-document resource benchmark | **not run** | Requires dedicated Linux host and saved JSON output |
+| Linux x86-64 format, Clippy, tests | **green on exact PR head** | CI run #136 |
+| Windows x86-64 build, full tests, smoke | **green on exact PR head** | CI run #136; does not prove power-loss behavior |
+| Linux ARM64 build and tests | **green under QEMU** | CI run #136; emulation, not physical Raspberry Pi |
+| Lua/Luvit tests | **green on exact PR head** | CI run #136 |
+| Docker multi-architecture build and persistence | **green on exact PR head** | CI run #136; images were built, not pushed |
+| 100,000-document resource benchmark | **passed on hosted Ubuntu x86-64** | Tiny profile; 289.73 MiB process high-water RSS; see the resource artifact and [measurement notes](RESOURCE_STORAGE_DESIGN.md#bounded-100000-document-ci-measurement). Not a Pi measurement or 30% baseline comparison. |
 | Raspberry Pi 4B hardware smoke | **not run** | No physical device attached |
 | 24-hour resource soak | **not run** | No result recorded |
 
@@ -239,12 +238,14 @@ defaults to 500-operation batches so its 512 KiB HTTP body bound is respected; t
 standard profile defaults to 1,000. To compare equivalent request shapes, set the same
 `--batch-size` for both profiles.
 
-The default is 1,000 documents. The requested 100,000-document profile requires
+The default is 1,000 documents. The 100,000-document profile requires
 `--allow-large-test`, at least 1 GiB of free temporary disk, and is limited to 1.5 GiB
 virtual address space, 2 GiB per file, 15 minutes of child CPU, 128 open files, and no
 core dumps. Those per-process limits do not isolate aggregate system memory or page
-cache, so do not run the large profile on shared Raspberry Pi hardware. No 100,000-row
-measurements have been captured yet; CI only checks the harness syntax and CLI help.
+cache, so do not run the large profile on shared Raspberry Pi hardware. CI now runs this
+bounded profile on a hosted Ubuntu x86-64 runner; see the exact run and machine-readable
+result under Current PR-head qualification above. It is not a Pi result and does not
+substitute for aggregate resource isolation on shared hardware.
 
 Example on a dedicated Linux host after building the release server:
 
@@ -395,7 +396,7 @@ a Raspberry Pi.
 
 ## Raspberry Pi 4 hardware validation
 
-**Real hardware has not yet been tested.** CI run [#134](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42502774832) builds and tests ARM64 under QEMU; that is emulation, not a Raspberry Pi. It also cross-builds the `preppydb-server` and `preppydb` binaries from exact PR head `aaeeeaf288a03cd12909341633cfc92d1c79cba9`, verifies their AArch64 ELF metadata, smoke-invokes both under QEMU, and publishes a commit-named artifact through 2026-12-08. The artifact manifest identifies the source commit, target, compiler and required glibc baseline (2.35). It is suitable for 64-bit Raspberry Pi OS Bookworm or newer; older glibc systems must not run it. This CI artifact is not a published release or stable download channel.
+**Real hardware has not yet been tested.** CI run [#136](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42504109330) builds and tests ARM64 under QEMU; that is emulation, not a Raspberry Pi. It also cross-builds the `preppydb-server` and `preppydb` binaries from exact PR head `2544e5e6f86ed0eabdeb79e11ddb6ba3cde637fa`, verifies their AArch64 ELF metadata, and smoke-invokes both under QEMU. The commit-named [ARM64 artifact](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42504109330/artifacts/13626861523) expires 2026-12-08 17:21 UTC. Its manifest identifies the source commit, target, compiler and required glibc baseline (2.35). It is suitable for 64-bit Raspberry Pi OS Bookworm or newer; older glibc systems must not run it. This CI artifact is not a published release or stable download channel.
 
 ### Run the bounded hardware smoke test
 

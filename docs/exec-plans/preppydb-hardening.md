@@ -5,21 +5,27 @@ This is a living plan, not a claim that the database is ready. Work only on `are
 ## Latest qualification snapshot (2026-11-08)
 
 - PR #1 is still open, not draft, and GitHub reports it mergeable. Its current head is
-  `aaeeeaf288a03cd12909341633cfc92d1c79cba9`; no local code changes were present in the
-  fresh checkout before this documentation update. There are no submitted PR reviews or
-  inline review threads.
-- GitHub Actions run [#134](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42502774832)
-  passed on that exact head: Linux x86-64, Windows x86-64, ARM64/QEMU, Lua/Luvit, Docker
-  image builds, Docker persistence, and aggregate status. This is CI evidence only; QEMU
-  does not qualify Raspberry Pi hardware or power-loss behavior.
+  `2544e5e6f86ed0eabdeb79e11ddb6ba3cde637fa`. There are no submitted PR reviews or inline
+  review threads.
+- GitHub Actions run [#136](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42504109330)
+  is the exact-head CI run for Linux x86-64, Windows x86-64, ARM64/QEMU, Lua/Luvit, Docker
+  image builds and persistence, plus the bounded resource benchmark. CI process termination
+  is not power-loss evidence; QEMU does not qualify Raspberry Pi hardware.
 - Local `cargo fmt --all -- --check` passed. Local Clippy/test compilation is blocked
   because this Windows host lacks MSVC `link.exe`; the Python launcher is unavailable.
-- The existing resource evidence reaches 10,000 synthetic documents on WSL2 x86-64. A
+- The bounded 100,000-document hosted Ubuntu x86-64 run measured a 303,931,392-byte
+  (289.73 MiB) process high-water RSS, 207.46 MB sampled checkpoint-phase RSS, a 2.155 s
+  checkpoint, and 1.316 s recovery startup after killing the isolated benchmark child.
+  The 10-second idle RSS was 3.76 MiB. The maximum was observed in verify/stats/shutdown,
+  not checkpoint. The hosted runner had at least 15.52 GB system memory available; this is
+  not a Pi capacity result and no comparable 100k baseline exists, so the 30% reduction
+  target is unproven. The earlier resource evidence reaches 10,000 synthetic documents on
+  WSL2 x86-64. A
   three-run 900 KiB single-document experiment measured a 7.2% lower checkpoint-phase
   high-water mark for the streamed snapshot writer in `aaeeeaf`; whole-process peak did
   not show a consistent reduction. A separate 1 MiB boundary smoke run also showed a
-  lower checkpoint-phase peak. No 100,000-document result or
-  physical Pi 4B test exists, and the proposed 768 MiB target remains unproven.
+  lower checkpoint-phase peak. No physical Pi 4B test exists, and the proposed 768 MiB
+  target remains unproven for Pi use.
 - Experimental `main` merge: **blocked** pending recovery or source-backed resolution of
   the missing 15th review finding and an independent review of the remaining high-risk
   storage/auth paths. Production readiness: **not ready**, with physical Pi, Windows

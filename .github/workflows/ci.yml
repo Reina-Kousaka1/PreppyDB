@@ -108,12 +108,46 @@ jobs:
             --output resource-results.json
           python3 -m json.tool resource-results.json
 
+      - name: Build pre-optimization resource baseline
+        uses: actions/checkout@v4
+        with:
+          ref: f0eb9c3678a8309308a1b6c184a92b815f566a1b
+          path: benchmark-baseline
+          persist-credentials: false
+
+      - name: Run matching benchmark on pre-optimization baseline
+        run: |
+          cargo build --manifest-path benchmark-baseline/Cargo.toml \
+            --workspace --release --locked --target-dir target/baseline
+          {
+            echo "pr_head=${{ github.event.pull_request.head.sha || github.sha }}"
+            echo "built_revision=f0eb9c3678a8309308a1b6c184a92b815f566a1b"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "target=x86_64-unknown-linux-gnu"
+          } > resource-baseline-manifest.txt
+          python3 scripts/benchmark-resources.py \
+            --server target/baseline/release/preppydb-server \
+            --profile tiny \
+            --documents 100000 \
+            --payload-bytes 1024 \
+            --batch-size 400 \
+            --index-count 1 \
+            --allow-large-test \
+            --seed 20261108 \
+            --source-commit f0eb9c3678a8309308a1b6c184a92b815f566a1b \
+            --manifest resource-baseline-manifest.txt \
+            --output resource-baseline-results.json
+          python3 -m json.tool resource-baseline-results.json
+
       - name: Upload resource benchmark JSON
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: preppydb-resource-benchmark-${{ github.event.pull_request.head.sha || github.sha }}
-          path: resource-results.json
+          path: |
+            resource-results.json
+            resource-baseline-results.json
           if-no-files-found: ignore
           retention-days: 90
 
