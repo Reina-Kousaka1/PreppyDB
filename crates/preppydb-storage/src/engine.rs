@@ -24,6 +24,7 @@ use crate::manifest::{Manifest, SnapshotRef};
 use crate::record::{Op, Record};
 use crate::snapshot::{self, WrittenSnapshot};
 use crate::store::{reserve_undo_bytes, ApplyMode, Collection, Doc, Limits, Store, StoreUndo};
+use crate::verify_store::VerifyStore;
 use crate::wal::{self, SyncMode, WalWriter};
 use preppydb_json::Json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +37,26 @@ use std::time::Duration;
 
 type IndexEntryIter<'a> =
     dyn Iterator<Item = (&'a Vec<u8>, &'a std::collections::BTreeSet<Arc<str>>)> + 'a;
+
+enum VerifyReplayStore {
+    Compact(VerifyStore),
+    Full(Store),
+}
+
+impl VerifyReplayStore {
+    fn apply(&mut self, op: &Op, ts: i64, seq: u64) -> Result<()> {
+        match self {
+            Self::Compact(store) => store.apply(op),
+            Self::Full(store) => store.apply_for_verification(op, ts, seq).map(|_| ()),
+        }
+    }
+}
+
+struct VerifySnapshotData {
+    header: snapshot::SnapshotHeader,
+    body_sha256: String,
+    store: VerifyReplayStore,
+}
 
 const MAX_VERIFY_INDEX_FIELDS: usize = snapshot::MAX_VERIFY_INDEX_FIELDS;
 const MAX_VERIFY_INDEX_FIELD_BYTES: usize = snapshot::MAX_VERIFY_INDEX_FIELD_BYTES;
@@ -2159,7 +2180,11 @@ impl Engine {
         // can still be impossible to apply (for example, a unique index that conflicts
         // with existing documents). Reconstruct the snapshot baseline and replay the
         // retained suffix just as open() does, so a clean report predicts reopenability.
-        let mut replay_store = Store::new(self.cfg.limits.clone());
+        let mut replay_store = if verify_index_fields.is_some() {
+            VerifyReplayStore::Compact(VerifyStore::new(self.cfg.limits.clone()))
+        } else {
+            VerifyReplayStore::Full(Store::new(self.cfg.limits.clone()))
+        };
         let mut replay_state_valid = manifest.snapshot.is_none();
         let mut snapshot_json = None;
         if let Some(snap_ref) = &manifest.snapshot {
@@ -2186,30 +2211,45 @@ impl Engine {
                             .with("error", Json::str(err.to_string())),
                     );
                 } else {
-                    let snapshot_result = match verify_index_fields.take() {
-                        Some(fields) => match snapshot::read_snapshot_store_projected_with_fields(
-                            &path,
-                            self.cfg.limits.clone(),
-                            &fields,
-                        ) {
-                            Ok((data, complete_fields)) => {
-                                verify_index_fields = Some(complete_fields);
-                                Ok(data)
-                            }
-                            Err(DbError::LimitExceeded {
-                                limit: "verify_index_field_plan",
-                                ..
-                            }) => {
-                                // Snapshot and WAL metadata together exceeded the
-                                // bounded projection plan. Fall back to the established
-                                // full-document replay instead of omitting index fields.
-                                verify_index_fields = None;
-                                snapshot::read_snapshot_store(&path, self.cfg.limits.clone())
-                            }
-                            Err(err) => Err(err),
-                        },
-                        None => snapshot::read_snapshot_store(&path, self.cfg.limits.clone()),
-                    };
+                    let snapshot_result =
+                        match verify_index_fields.take() {
+                            Some(fields) => match snapshot::read_snapshot_verification_projected(
+                                &path,
+                                self.cfg.limits.clone(),
+                                &fields,
+                            ) {
+                                Ok(data) => {
+                                    verify_index_fields = Some(data.index_fields);
+                                    Ok(VerifySnapshotData {
+                                        header: data.header,
+                                        body_sha256: data.body_sha256,
+                                        store: VerifyReplayStore::Compact(data.store),
+                                    })
+                                }
+                                Err(DbError::LimitExceeded {
+                                    limit: "verify_index_field_plan",
+                                    ..
+                                }) => {
+                                    // Snapshot and WAL metadata together exceeded the
+                                    // bounded projection plan. Fall back to the established
+                                    // full-document replay instead of omitting index fields.
+                                    verify_index_fields = None;
+                                    snapshot::read_snapshot_store(&path, self.cfg.limits.clone())
+                                        .map(|data| VerifySnapshotData {
+                                            header: data.header,
+                                            body_sha256: data.body_sha256,
+                                            store: VerifyReplayStore::Full(data.store),
+                                        })
+                                }
+                                Err(err) => Err(err),
+                            },
+                            None => snapshot::read_snapshot_store(&path, self.cfg.limits.clone())
+                                .map(|data| VerifySnapshotData {
+                                    header: data.header,
+                                    body_sha256: data.body_sha256,
+                                    store: VerifyReplayStore::Full(data.store),
+                                }),
+                        };
                     match snapshot_result {
                         Ok(data) => {
                             let mut ok = true;
@@ -2307,9 +2347,9 @@ impl Engine {
                         Some(fields) => project_verification_op(&mut op, fields),
                         None => Ok(()),
                     };
-                    if let Err(err) = projected.and_then(|()| {
-                        replay_store.apply_for_verification(&op, record.ts, record.seq)
-                    }) {
+                    if let Err(err) =
+                        projected.and_then(|()| replay_store.apply(&op, record.ts, record.seq))
+                    {
                         issues.push(format!(
                             "{name}: record sequence {} cannot be replayed: {err}",
                             record.seq

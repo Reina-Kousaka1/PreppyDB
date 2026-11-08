@@ -147,7 +147,9 @@ decodes frames directly into a private `Store`, avoiding an additional full-docu
 vector. Before `f0eb9c3`, `Engine::verify` also reconstructed every full document in a
 second `Store`, making verification approach the memory cost of two stores. At `f0eb9c3`,
 the verifier was changed to retain only document keys, versions, collection metadata, and
-all fields used by snapshot or WAL index definitions. It still decodes and checksum-validates
+all fields used by snapshot or WAL index definitions. The compact replay state described
+below further avoids retaining versions, timestamps, and non-unique index state while
+checking transaction replay and unique constraints. It still decodes and checksum-validates
 the complete persisted snapshot and WAL; only its private semantic replay state is
 projected. If the bounded index-field plan cannot be built safely, verification uses the
 original full-document fallback.
@@ -224,6 +226,30 @@ Idle CPU sampled at 0.0% of one core, with three threads and about 3.9 MiB idle 
 normal read/write path does not run the projection scan; the extra scan and projection cost
 is paid only by explicit verification. Independent repeated runs and real-hardware tests
 remain necessary before making broader performance claims.
+
+### Compact semantic verifier comparison
+
+Two paired WSL2 x86-64 runs per build used the same release benchmark, Tiny profile,
+100,000 synthetic documents, 1,024-byte payload, one scalar index, batch size 400, seed
+`20261108`, and 3-second idle observation. The baseline was clean commit
+`b2c4f563ab40e74351666895f02ebeb881679adb`; the candidate changed only the read-only
+semantic replay state used by `Engine::verify`. Both runs include checkpoint, recovery,
+queries, verification, and shutdown. Temporary database directories were removed.
+
+| Build | Process peak RSS, run 1 | Process peak RSS, run 2 | Peak phase | Write batch p50 range |
+| --- | ---: | ---: | --- | ---: |
+| Baseline | 232,124,416 bytes | 232,132,608 bytes | stats/shutdown | 20.06–20.10 ms |
+| Compact verifier | 223,236,096 bytes | 223,313,920 bytes | stats/shutdown | 20.09–20.10 ms |
+
+The paired process high-water mark fell by about 8.4 MiB (3.8%) in these four runs.
+Idle RSS remained about 4 MiB and idle CPU sampled at 0.0% of one core; checkpoint and
+recovery timings were effectively unchanged in these short runs. The verifier keeps the
+document keys, bounded fields needed by unique indexes, and unique-index entries; it does
+not retain full documents or MVCC metadata in this private replay store. Snapshot and WAL
+records are still fully parsed and integrity-checked. If the field-plan bound is exceeded,
+the established full-store verifier path remains the fallback. This is a targeted reduction
+of verification memory on one synthetic workload, not a bound on database RSS, a real
+Raspberry Pi result, or evidence that the in-memory storage architecture has been replaced.
 
 All measurements are synthetic WSL2 x86-64 observations, not Raspberry Pi qualification.
 

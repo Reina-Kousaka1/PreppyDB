@@ -15,6 +15,7 @@
 use crate::catalog::CollectionMeta;
 use crate::error::{DbError, Result};
 use crate::store::{ApplyMode, Doc, Limits, Store};
+use crate::verify_store::VerifyStore;
 use preppydb_crypto::crc32c::{crc32c, Crc32c};
 use preppydb_crypto::sha256::{sha256, Sha256};
 use preppydb_json::Json;
@@ -128,6 +129,14 @@ pub struct SnapshotStore {
     pub header: SnapshotHeader,
     pub body_sha256: String,
     pub store: Store,
+}
+
+/// Snapshot metadata and compact unique-index state for semantic verification.
+pub(crate) struct VerificationSnapshot {
+    pub header: SnapshotHeader,
+    pub body_sha256: String,
+    pub store: VerifyStore,
+    pub index_fields: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Write `collections` to `path` atomically (write to `.tmp`, fsync, rename).
@@ -587,6 +596,116 @@ impl SnapshotSink for StoreSnapshotSink {
     }
 }
 
+struct VerifySnapshotSink {
+    store: VerifyStore,
+    projection: BTreeMap<String, Vec<String>>,
+    collection_fields: BTreeMap<String, BTreeSet<String>>,
+    field_count: usize,
+    field_bytes: usize,
+}
+
+impl SnapshotSink for VerifySnapshotSink {
+    fn collection(&mut self, meta: CollectionMeta) -> Result<()> {
+        let mut fields = BTreeSet::new();
+        for field in meta
+            .indexes
+            .values()
+            .filter(|index| index.unique)
+            .map(|index| index.field.as_str())
+            .chain(
+                self.projection
+                    .get(&meta.name)
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            )
+        {
+            if fields.insert(field.to_string()) {
+                self.field_count =
+                    self.field_count
+                        .checked_add(1)
+                        .ok_or(DbError::LimitExceeded {
+                            limit: "verify_index_field_plan",
+                            max: MAX_VERIFY_INDEX_FIELDS as u64,
+                            actual: u64::MAX,
+                        })?;
+                self.field_bytes = self.field_bytes.checked_add(field.len()).ok_or({
+                    DbError::LimitExceeded {
+                        limit: "verify_index_field_plan",
+                        max: MAX_VERIFY_INDEX_FIELD_BYTES as u64,
+                        actual: u64::MAX,
+                    }
+                })?;
+                if self.field_count > MAX_VERIFY_INDEX_FIELDS {
+                    return Err(DbError::LimitExceeded {
+                        limit: "verify_index_field_plan",
+                        max: MAX_VERIFY_INDEX_FIELDS as u64,
+                        actual: u64::try_from(self.field_count).unwrap_or(u64::MAX),
+                    });
+                }
+                if self.field_bytes > MAX_VERIFY_INDEX_FIELD_BYTES {
+                    return Err(DbError::LimitExceeded {
+                        limit: "verify_index_field_plan",
+                        max: MAX_VERIFY_INDEX_FIELD_BYTES as u64,
+                        actual: u64::try_from(self.field_bytes).unwrap_or(u64::MAX),
+                    });
+                }
+            }
+        }
+        self.collection_fields.insert(meta.name.clone(), fields);
+        self.store.create_collection(meta)
+    }
+
+    fn document(&mut self, collection: &str, key: String, doc: Doc) -> Result<()> {
+        let fields = self.collection_fields.get(collection).ok_or_else(|| {
+            DbError::corrupt(
+                "snapshot",
+                format!("document for unknown collection '{collection}'"),
+            )
+        })?;
+        let mut projected = Json::obj();
+        for field in fields {
+            if let Some(value) = doc.value.get_path(field) {
+                projected.set_path(field, value.clone()).map_err(|error| {
+                    DbError::corrupt(
+                        "snapshot",
+                        format!("cannot project indexed field '{field}': {error}"),
+                    )
+                })?;
+            }
+        }
+        self.store
+            .insert_snapshot_document(collection, key, projected)
+    }
+}
+
+/// Stream a fully validated snapshot into the compact semantic verifier state.
+/// The returned state contains only the bounded unique-index field projection.
+pub(crate) fn read_snapshot_verification_projected(
+    path: &Path,
+    limits: Limits,
+    additional_index_fields: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<VerificationSnapshot> {
+    let projection = additional_index_fields
+        .iter()
+        .map(|(collection, fields)| (collection.clone(), fields.iter().cloned().collect()))
+        .collect();
+    let mut sink = VerifySnapshotSink {
+        store: VerifyStore::new(limits),
+        projection,
+        collection_fields: BTreeMap::new(),
+        field_count: 0,
+        field_bytes: 0,
+    };
+    let (header, body_sha256) = read_snapshot_into(path, &mut sink)?;
+    Ok(VerificationSnapshot {
+        header,
+        body_sha256,
+        store: sink.store,
+        index_fields: sink.collection_fields,
+    })
+}
+
 /// Read and fully verify a snapshot file into its compatibility representation.
 pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
     let mut sink = VecSnapshotSink::default();
@@ -625,6 +744,7 @@ pub fn read_snapshot_store_projected(
 
 /// Project a snapshot for verification and return the complete bounded field plan
 /// used by the reader. This includes index definitions stored in the snapshot itself.
+#[cfg(test)]
 pub(crate) fn read_snapshot_store_projected_with_fields(
     path: &Path,
     limits: Limits,
