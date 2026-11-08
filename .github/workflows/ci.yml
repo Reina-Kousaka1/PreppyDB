@@ -99,6 +99,7 @@ jobs:
             --profile tiny \
             --documents 100000 \
             --payload-bytes 1024 \
+            --idle-seconds 60 \
             --batch-size 400 \
             --index-count 1 \
             --allow-large-test \
@@ -131,6 +132,7 @@ jobs:
             --profile tiny \
             --documents 100000 \
             --payload-bytes 1024 \
+            --idle-seconds 60 \
             --batch-size 400 \
             --index-count 1 \
             --allow-large-test \
