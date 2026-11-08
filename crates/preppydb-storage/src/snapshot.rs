@@ -18,7 +18,7 @@ use crate::store::{ApplyMode, Doc, Limits, Store};
 use preppydb_crypto::crc32c;
 use preppydb_crypto::sha256::{sha256, Sha256};
 use preppydb_json::Json;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -382,10 +382,26 @@ impl SnapshotSink for VecSnapshotSink {
 
 struct StoreSnapshotSink {
     store: Store,
+    projection: Option<BTreeMap<String, Vec<String>>>,
+    collection_fields: BTreeMap<String, Vec<String>>,
 }
 
 impl SnapshotSink for StoreSnapshotSink {
     fn collection(&mut self, meta: CollectionMeta) -> Result<()> {
+        if self.projection.is_some() {
+            let mut fields: BTreeSet<String> = meta
+                .indexes
+                .values()
+                .map(|index| index.field.clone())
+                .collect();
+            if let Some(additional) = self.projection.as_ref().and_then(|map| map.get(&meta.name)) {
+                fields.extend(additional.iter().cloned());
+            }
+            let mut fields: Vec<_> = fields.into_iter().collect();
+            fields
+                .sort_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
+            self.collection_fields.insert(meta.name.clone(), fields);
+        }
         self.store.create_collection(meta, ApplyMode::Replay)
     }
 
@@ -396,6 +412,21 @@ impl SnapshotSink for StoreSnapshotSink {
                 format!("document for unknown collection '{collection}'"),
             )
         })?;
+        let mut doc = doc;
+        if let Some(fields) = self.collection_fields.get(collection) {
+            let mut projected = Json::obj();
+            for field in fields {
+                if let Some(value) = doc.value.get_path(field) {
+                    projected.set_path(field, value.clone()).map_err(|error| {
+                        DbError::corrupt(
+                            "snapshot",
+                            format!("cannot project indexed field '{field}': {error}"),
+                        )
+                    })?;
+                }
+            }
+            doc.value = projected;
+        }
         if coll.docs.insert(key.into(), doc).is_some() {
             return Err(DbError::corrupt(
                 "snapshot",
@@ -423,8 +454,33 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
 /// trailing EOF and declared object counts have been checked. Indexes are then
 /// rebuilt from that private store before it can be published to the engine.
 pub fn read_snapshot_store(path: &Path, limits: Limits) -> Result<SnapshotStore> {
+    read_snapshot_store_inner(path, limits, None)
+}
+
+/// Read and fully verify a snapshot into a compact temporary store containing only
+/// fields needed by the supplied index definitions. This is for semantic WAL replay
+/// during `Engine::verify`; it must never be used as the live or recovered store.
+pub fn read_snapshot_store_projected(
+    path: &Path,
+    limits: Limits,
+    additional_index_fields: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<SnapshotStore> {
+    let projection = additional_index_fields
+        .iter()
+        .map(|(collection, fields)| (collection.clone(), fields.iter().cloned().collect()))
+        .collect();
+    read_snapshot_store_inner(path, limits, Some(projection))
+}
+
+fn read_snapshot_store_inner(
+    path: &Path,
+    limits: Limits,
+    projection: Option<BTreeMap<String, Vec<String>>>,
+) -> Result<SnapshotStore> {
     let mut sink = StoreSnapshotSink {
         store: Store::new(limits),
+        projection,
+        collection_fields: BTreeMap::new(),
     };
     let (header, body_sha256) = read_snapshot_into(path, &mut sink)?;
     for collection in sink.store.collections.values_mut() {
@@ -732,6 +788,59 @@ mod tests {
         assert_eq!(collection.docs["molly"].version, 3);
         let key = Json::str("Molly").canonical_bytes();
         assert!(collection.indexes["by_name"].entries.contains_key(&key));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn projected_store_reader_preserves_index_paths_and_snapshot_integrity() {
+        let dir = tempdir("projected-store-reader");
+        let path = dir.join("snap-1.pdb");
+        let mut collections = sample();
+        collections[0].0.indexes.insert(
+            "by_profile_rank".into(),
+            crate::catalog::IndexMeta {
+                name: "by_profile_rank".into(),
+                field: "profile.rank".into(),
+                unique: false,
+                sparse: true,
+                created_at: 1234,
+            },
+        );
+        collections[0].1[0].1.value = Json::obj()
+            .with(
+                "profile",
+                Json::obj()
+                    .with("name", Json::str("Molly"))
+                    .with("rank", Json::uint(7))
+                    .with("unindexed", Json::str("large payload")),
+            )
+            .with("unindexed", Json::str("discard me"));
+        let written = write_snapshot(&path, 1, 42, 1234, &collections).unwrap();
+
+        // `profile.name` represents an index introduced by the WAL after this
+        // snapshot. The projected reader must keep both that value and the
+        // snapshot's existing index value while dropping unrelated payload.
+        let additional = BTreeMap::from([(
+            "profiles".to_string(),
+            BTreeSet::from(["profile.name".to_string()]),
+        )]);
+        let loaded = read_snapshot_store_projected(&path, Limits::default(), &additional).unwrap();
+
+        assert_eq!(loaded.body_sha256, written.body_sha256);
+        let doc = &loaded.store.collection("profiles").unwrap().docs["molly"];
+        assert_eq!(
+            doc.value.get_path("profile.name"),
+            Some(&Json::str("Molly"))
+        );
+        assert_eq!(doc.value.get_path("profile.rank"), Some(&Json::uint(7)));
+        assert_eq!(doc.value.get("unindexed"), None);
+        assert_eq!(doc.value.get_path("profile.unindexed"), None);
+        let rank = Json::uint(7).canonical_bytes();
+        assert!(
+            loaded.store.collection("profiles").unwrap().indexes["by_profile_rank"]
+                .entries
+                .contains_key(&rank)
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -84,9 +84,28 @@ The working tree also moves a displaced document into the single-document rollba
 instead of deep-cloning the old document on each update/delete. A regression test verifies
 restoration after an injected WAL append failure. This removes an extra O(document-size)
 rollback copy from that path; no update-latency claim is made. `Engine::verify` remains the
-dominant peak because it intentionally replays into a second complete store; its semantic
-check has not been weakened. All measurements are synthetic WSL2 x86-64 observations, not
-Raspberry Pi qualification.
+dominant peak, so verification now builds its private replay store from only the document
+keys, versions, collection metadata, and values needed to reconstruct every persisted index.
+It first scans the retained WAL for index definitions, with limits of 4,096 distinct field
+paths and 1 MiB of field-path bytes. If the WAL is damaged or the plan exceeds those bounds,
+verification falls back to the prior full-document replay path. The snapshot reader still
+validates the complete serialized snapshot and its checksum; projection occurs only after
+each document has been decoded. WAL operations are likewise decoded and validated in full,
+then only the indexed paths are retained for semantic replay. This optimization applies only
+to the read-only verifier, never to live state or recovery.
+
+A single paired resource run compared the exact `3da4a96` baseline with this projected
+verifier using the same Tiny workload, 10,000 documents, 900-byte payload, seed `20261108`,
+release profile, and 3-second idle observation. With one secondary index, process high-water
+RSS fell from 43.50 MiB to 34.55 MiB; with four same-field indexes, it fell from 45.16 MiB
+to 36.50 MiB. The verifier remained the peak phase. These are directional results from one
+synthetic WSL2 x86-64 run per case, not a portable guarantee or Raspberry Pi qualification.
+Idle CPU sampled at 0.0% of one core, with three threads and about 3.9 MiB idle RSS. The
+normal read/write path does not run the projection scan; the extra scan and projection cost
+is paid only by explicit verification. Independent repeated runs and real-hardware tests
+remain necessary before making broader performance claims.
+
+All measurements are synthetic WSL2 x86-64 observations, not Raspberry Pi qualification.
 
 ## Target properties
 

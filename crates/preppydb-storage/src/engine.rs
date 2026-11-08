@@ -26,6 +26,7 @@ use crate::snapshot::{self, WrittenSnapshot};
 use crate::store::{reserve_undo_bytes, ApplyMode, Collection, Doc, Limits, Store, StoreUndo};
 use crate::wal::{self, SyncMode, WalWriter};
 use preppydb_json::Json;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -34,6 +35,140 @@ use std::time::Duration;
 
 type IndexEntryIter<'a> =
     dyn Iterator<Item = (&'a Vec<u8>, &'a std::collections::BTreeSet<Arc<str>>)> + 'a;
+
+const MAX_VERIFY_INDEX_FIELDS: usize = 4096;
+const MAX_VERIFY_INDEX_FIELD_BYTES: usize = 1024 * 1024;
+
+fn add_verify_index_field(
+    fields: &mut BTreeMap<String, BTreeSet<String>>,
+    total_bytes: &mut usize,
+    collection: &str,
+    field: &str,
+) -> bool {
+    if fields
+        .get(collection)
+        .is_some_and(|collection_fields| collection_fields.contains(field))
+    {
+        return true;
+    }
+    let Some(next_bytes) = total_bytes.checked_add(field.len()) else {
+        return false;
+    };
+    let next_count: usize = fields.values().map(BTreeSet::len).sum::<usize>() + 1;
+    if next_count > MAX_VERIFY_INDEX_FIELDS || next_bytes > MAX_VERIFY_INDEX_FIELD_BYTES {
+        return false;
+    }
+    fields
+        .entry(collection.to_string())
+        .or_default()
+        .insert(field.to_string());
+    *total_bytes = next_bytes;
+    true
+}
+
+fn add_verify_index_meta(
+    fields: &mut BTreeMap<String, BTreeSet<String>>,
+    total_bytes: &mut usize,
+    collection: &str,
+    index: &IndexMeta,
+) -> bool {
+    add_verify_index_field(fields, total_bytes, collection, &index.field)
+}
+
+fn collect_verify_index_fields_from_op(
+    op: &Op,
+    fields: &mut BTreeMap<String, BTreeSet<String>>,
+    total_bytes: &mut usize,
+) -> bool {
+    match op {
+        Op::CreateCollection { meta } => meta
+            .indexes
+            .values()
+            .all(|index| add_verify_index_meta(fields, total_bytes, &meta.name, index)),
+        Op::CreateIndex { collection, index } => {
+            add_verify_index_meta(fields, total_bytes, collection, index)
+        }
+        Op::Batch { ops, .. } => ops
+            .iter()
+            .all(|op| collect_verify_index_fields_from_op(op, fields, total_bytes)),
+        _ => true,
+    }
+}
+
+/// Collect every index field used by the retained WAL so verification can replay
+/// documents without retaining unrelated payload fields. If metadata exceeds the
+/// explicit budget, callers use the established full-store verifier instead.
+fn collect_verify_index_fields(
+    segments: &[PathBuf],
+) -> Result<Option<BTreeMap<String, BTreeSet<String>>>> {
+    let mut fields = BTreeMap::new();
+    let mut total_bytes = 0usize;
+    for segment in segments {
+        let scan = wal::scan_segment_visit(segment, |record| {
+            if !collect_verify_index_fields_from_op(&record.op, &mut fields, &mut total_bytes) {
+                return Err(DbError::LimitExceeded {
+                    limit: "verify_index_field_plan",
+                    max: MAX_VERIFY_INDEX_FIELD_BYTES as u64,
+                    actual: u64::try_from(total_bytes.saturating_add(1)).unwrap_or(u64::MAX),
+                });
+            }
+            Ok(())
+        });
+        match scan {
+            Ok(summary) if summary.corruption.is_none() && summary.torn_tail.is_none() => {}
+            Ok(_) => return Ok(None),
+            Err(DbError::LimitExceeded {
+                limit: "verify_index_field_plan",
+                ..
+            }) => return Ok(None),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(Some(fields))
+}
+
+fn project_verification_value(value: &mut Json, fields: &BTreeSet<String>) -> Result<()> {
+    let full_value = std::mem::replace(value, Json::Null);
+    let mut projected = Json::obj();
+    let mut ordered_fields: Vec<_> = fields.iter().collect();
+    ordered_fields
+        .sort_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
+    for field in ordered_fields {
+        if let Some(index_value) = full_value.get_path(field) {
+            projected
+                .set_path(field, index_value.clone())
+                .map_err(|error| {
+                    DbError::corrupt(
+                        "WAL verification",
+                        format!("cannot project indexed field '{field}': {error}"),
+                    )
+                })?;
+        }
+    }
+    *value = projected;
+    Ok(())
+}
+
+fn project_verification_op(op: &mut Op, fields: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
+    match op {
+        Op::Put {
+            collection, value, ..
+        } => {
+            if let Some(fields) = fields.get(collection) {
+                project_verification_value(value, fields)?;
+            } else {
+                *value = Json::obj();
+            }
+        }
+        Op::Batch { ops, .. } => {
+            for op in ops {
+                project_verification_op(op, fields)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 /// What to do when recovery finds corruption that is not a torn tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1956,6 +2091,12 @@ impl Engine {
         let _writer = self.lock_mutex(&self.writer);
         let mut issues = Vec::new();
         let manifest = self.lock_mutex(&self.manifest).clone();
+        let wal_segments = wal::list_segments(&self.paths.wal_dir)?;
+        // Verification is an administrative path, so a streaming metadata prepass
+        // is preferable to keeping a second full document store beside the live one.
+        // If metadata is damaged or exceeds the bounded plan, retain the established
+        // full replay path so the report can still diagnose the original condition.
+        let verify_index_fields = collect_verify_index_fields(&wal_segments)?;
         // Framing and sequence checks alone are insufficient: a checksummed record
         // can still be impossible to apply (for example, a unique index that conflicts
         // with existing documents). Reconstruct the snapshot baseline and replay the
@@ -1987,7 +2128,15 @@ impl Engine {
                             .with("error", Json::str(err.to_string())),
                     );
                 } else {
-                    match snapshot::read_snapshot_store(&path, self.cfg.limits.clone()) {
+                    let snapshot_result = match verify_index_fields.as_ref() {
+                        Some(fields) => snapshot::read_snapshot_store_projected(
+                            &path,
+                            self.cfg.limits.clone(),
+                            fields,
+                        ),
+                        None => snapshot::read_snapshot_store(&path, self.cfg.limits.clone()),
+                    };
+                    match snapshot_result {
                         Ok(data) => {
                             let mut ok = true;
                             if let Err(err) =
@@ -2044,7 +2193,6 @@ impl Engine {
             .map_or(0, |snapshot| snapshot.seq);
         let mut previous_seq = snapshot_seq;
         let mut replay_started = false;
-        let wal_segments = wal::list_segments(&self.paths.wal_dir)?;
         for (position, segment) in wal_segments.iter().enumerate() {
             let name = segment
                 .file_name()
@@ -2080,9 +2228,14 @@ impl Engine {
                 }
                 previous_seq = record.seq;
                 if replay_state_valid {
-                    if let Err(err) =
-                        replay_store.apply(&record.op, record.ts, record.seq, ApplyMode::Replay)
-                    {
+                    let mut op = record.op;
+                    let projected = match verify_index_fields.as_ref() {
+                        Some(fields) => project_verification_op(&mut op, fields),
+                        None => Ok(()),
+                    };
+                    if let Err(err) = projected.and_then(|()| {
+                        replay_store.apply(&op, record.ts, record.seq, ApplyMode::Replay)
+                    }) {
                         issues.push(format!(
                             "{name}: record sequence {} cannot be replayed: {err}",
                             record.seq
@@ -2332,6 +2485,44 @@ pub fn collection_ref<'a>(store: &'a Store, name: &str) -> Result<&'a Collection
 #[cfg(test)]
 mod document_undo_tests {
     use super::*;
+
+    #[test]
+    fn verifier_index_projection_plan_is_bounded() {
+        let mut fields = BTreeMap::new();
+        let mut total_bytes = 0;
+        for index in 0..MAX_VERIFY_INDEX_FIELDS {
+            assert!(add_verify_index_field(
+                &mut fields,
+                &mut total_bytes,
+                "c",
+                &format!("field_{index}")
+            ));
+        }
+        let bounded_bytes = total_bytes;
+        assert!(!add_verify_index_field(
+            &mut fields,
+            &mut total_bytes,
+            "c",
+            "one_more_field"
+        ));
+        assert_eq!(total_bytes, bounded_bytes);
+        assert_eq!(
+            fields.values().map(BTreeSet::len).sum::<usize>(),
+            MAX_VERIFY_INDEX_FIELDS
+        );
+
+        let mut byte_limited = BTreeMap::new();
+        let mut byte_count = 0;
+        let too_long = "x".repeat(MAX_VERIFY_INDEX_FIELD_BYTES + 1);
+        assert!(!add_verify_index_field(
+            &mut byte_limited,
+            &mut byte_count,
+            "c",
+            &too_long
+        ));
+        assert!(byte_limited.is_empty());
+        assert_eq!(byte_count, 0);
+    }
 
     #[test]
     fn drop_collection_sequence_overflow_preserves_live_collection() {

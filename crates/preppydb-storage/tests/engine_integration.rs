@@ -2609,6 +2609,64 @@ fn verify_reports_healthy_database() {
 }
 
 #[test]
+fn verify_replays_snapshot_and_later_nested_index_without_full_documents() {
+    let dir = tempdir("verify-projected-index-replay");
+    let engine = open(&dir);
+    engine
+        .create_collection(CollectionMeta::new("profiles", 0))
+        .unwrap();
+    engine
+        .put(
+            "profiles",
+            "molly",
+            Json::obj()
+                .with(
+                    "profile",
+                    Json::obj()
+                        .with("rank", Json::uint(7))
+                        .with("unused", Json::str("snapshot payload")),
+                )
+                .with("unused", Json::str("snapshot payload")),
+            PutOptions::default(),
+        )
+        .unwrap();
+    engine.checkpoint().unwrap();
+    engine
+        .create_index(
+            "profiles",
+            IndexMeta {
+                name: "by_rank".into(),
+                field: "profile.rank".into(),
+                unique: true,
+                sparse: true,
+                created_at: 0,
+            },
+        )
+        .unwrap();
+    engine
+        .put(
+            "profiles",
+            "charlotte",
+            Json::obj()
+                .with(
+                    "profile",
+                    Json::obj()
+                        .with("rank", Json::uint(8))
+                        .with("unused", Json::str("WAL payload")),
+                )
+                .with("unused", Json::str("WAL payload")),
+            PutOptions::default(),
+        )
+        .unwrap();
+
+    let report = engine.verify().unwrap();
+    assert!(report.ok, "issues: {:?}", report.issues);
+    assert_eq!(engine.count("profiles").unwrap(), 2);
+    drop(engine);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn scan_orders_and_paginates() {
     let dir = tempdir("scan");
     let engine = open(&dir);
