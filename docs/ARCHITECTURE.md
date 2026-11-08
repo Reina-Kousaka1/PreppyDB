@@ -115,7 +115,8 @@ after those checks. This avoids keeping a second full document vector alongside 
 recovery store. The active document set and its indexes still reside in memory, so this
 reduces recovery-time duplication but does not make database RAM use independent of data
 size. `read_snapshot` remains available for compatibility callers that need the vector
-representation.
+representation. The measured memory boundary and a migration proposal for a future
+bounded page cache are documented in [RESOURCE_STORAGE_DESIGN.md](RESOURCE_STORAGE_DESIGN.md).
 
 ### Checkpointing
 
