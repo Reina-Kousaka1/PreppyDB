@@ -27,6 +27,8 @@ pub const SNAPSHOT_MAGIC: &[u8; 9] = b"PPDBSNAP1";
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 const FOOTER_MARKER: u32 = 0xFFFF_FFFF;
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
+pub(crate) const MAX_VERIFY_INDEX_FIELDS: usize = 4096;
+pub(crate) const MAX_VERIFY_INDEX_FIELD_BYTES: usize = 1024 * 1024;
 
 fn checked_frame_len(payload_len: usize) -> Result<u32> {
     let actual = u64::try_from(payload_len).unwrap_or(u64::MAX);
@@ -488,23 +490,61 @@ impl SnapshotSink for VecSnapshotSink {
 struct StoreSnapshotSink {
     store: Store,
     projection: Option<BTreeMap<String, Vec<String>>>,
-    collection_fields: BTreeMap<String, Vec<String>>,
+    collection_fields: BTreeMap<String, BTreeSet<String>>,
+    bounded_projection: bool,
+    field_count: usize,
+    field_bytes: usize,
 }
 
 impl SnapshotSink for StoreSnapshotSink {
     fn collection(&mut self, meta: CollectionMeta) -> Result<()> {
         if self.projection.is_some() {
-            let mut fields: BTreeSet<String> = meta
+            let mut fields = BTreeSet::new();
+            for field in meta
                 .indexes
                 .values()
-                .map(|index| index.field.clone())
-                .collect();
-            if let Some(additional) = self.projection.as_ref().and_then(|map| map.get(&meta.name)) {
-                fields.extend(additional.iter().cloned());
+                .map(|index| index.field.as_str())
+                .chain(
+                    self.projection
+                        .as_ref()
+                        .and_then(|map| map.get(&meta.name))
+                        .into_iter()
+                        .flatten()
+                        .map(String::as_str),
+                )
+            {
+                if fields.insert(field.to_string()) && self.bounded_projection {
+                    self.field_count =
+                        self.field_count
+                            .checked_add(1)
+                            .ok_or(DbError::LimitExceeded {
+                                limit: "verify_index_field_plan",
+                                max: MAX_VERIFY_INDEX_FIELDS as u64,
+                                actual: u64::MAX,
+                            })?;
+                    self.field_bytes = self.field_bytes.checked_add(field.len()).ok_or({
+                        DbError::LimitExceeded {
+                            limit: "verify_index_field_plan",
+                            max: MAX_VERIFY_INDEX_FIELD_BYTES as u64,
+                            actual: u64::MAX,
+                        }
+                    })?;
+                    if self.field_count > MAX_VERIFY_INDEX_FIELDS {
+                        return Err(DbError::LimitExceeded {
+                            limit: "verify_index_field_plan",
+                            max: MAX_VERIFY_INDEX_FIELDS as u64,
+                            actual: u64::try_from(self.field_count).unwrap_or(u64::MAX),
+                        });
+                    }
+                    if self.field_bytes > MAX_VERIFY_INDEX_FIELD_BYTES {
+                        return Err(DbError::LimitExceeded {
+                            limit: "verify_index_field_plan",
+                            max: MAX_VERIFY_INDEX_FIELD_BYTES as u64,
+                            actual: u64::try_from(self.field_bytes).unwrap_or(u64::MAX),
+                        });
+                    }
+                }
             }
-            let mut fields: Vec<_> = fields.into_iter().collect();
-            fields
-                .sort_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
             self.collection_fields.insert(meta.name.clone(), fields);
         }
         self.store.create_collection(meta, ApplyMode::Replay)
@@ -559,7 +599,7 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
 /// trailing EOF and declared object counts have been checked. Indexes are then
 /// rebuilt from that private store before it can be published to the engine.
 pub fn read_snapshot_store(path: &Path, limits: Limits) -> Result<SnapshotStore> {
-    read_snapshot_store_inner(path, limits, None)
+    read_snapshot_store_inner(path, limits, None, false).map(|(snapshot, _)| snapshot)
 }
 
 /// Read and fully verify a snapshot into a compact temporary store containing only
@@ -574,28 +614,50 @@ pub fn read_snapshot_store_projected(
         .iter()
         .map(|(collection, fields)| (collection.clone(), fields.iter().cloned().collect()))
         .collect();
-    read_snapshot_store_inner(path, limits, Some(projection))
+    read_snapshot_store_inner(path, limits, Some(projection), false).map(|(snapshot, _)| snapshot)
+}
+
+/// Project a snapshot for verification and return the complete bounded field plan
+/// used by the reader. This includes index definitions stored in the snapshot itself.
+pub(crate) fn read_snapshot_store_projected_with_fields(
+    path: &Path,
+    limits: Limits,
+    additional_index_fields: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<(SnapshotStore, BTreeMap<String, BTreeSet<String>>)> {
+    let projection = additional_index_fields
+        .iter()
+        .map(|(collection, fields)| (collection.clone(), fields.iter().cloned().collect()))
+        .collect();
+    read_snapshot_store_inner(path, limits, Some(projection), true)
 }
 
 fn read_snapshot_store_inner(
     path: &Path,
     limits: Limits,
     projection: Option<BTreeMap<String, Vec<String>>>,
-) -> Result<SnapshotStore> {
+    bounded_projection: bool,
+) -> Result<(SnapshotStore, BTreeMap<String, BTreeSet<String>>)> {
     let mut sink = StoreSnapshotSink {
         store: Store::new(limits),
         projection,
         collection_fields: BTreeMap::new(),
+        bounded_projection,
+        field_count: 0,
+        field_bytes: 0,
     };
     let (header, body_sha256) = read_snapshot_into(path, &mut sink)?;
     for collection in sink.store.collections.values_mut() {
         collection.rebuild_indexes()?;
     }
-    Ok(SnapshotStore {
-        header,
-        body_sha256,
-        store: sink.store,
-    })
+    let index_fields = sink.collection_fields;
+    Ok((
+        SnapshotStore {
+            header,
+            body_sha256,
+            store: sink.store,
+        },
+        index_fields,
+    ))
 }
 
 fn read_snapshot_into(

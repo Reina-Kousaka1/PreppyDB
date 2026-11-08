@@ -1931,6 +1931,78 @@ fn verify_rejects_semantically_unreplayable_but_checksummed_wal_record() {
 }
 
 #[test]
+fn verify_uses_snapshot_index_fields_for_later_wal_mutations() {
+    let dir = tempdir("verify-snapshot-index-fields");
+    let cfg = EngineConfig::new(&dir);
+    let engine = Engine::open(cfg.clone()).unwrap();
+    engine
+        .create_collection(CollectionMeta::new("c", 0))
+        .unwrap();
+    engine
+        .create_index(
+            "c",
+            IndexMeta {
+                name: "unique_value".into(),
+                field: "value".into(),
+                unique: true,
+                sparse: false,
+                created_at: 0,
+            },
+        )
+        .unwrap();
+    for (key, value) in [("a", 1), ("b", 2)] {
+        engine
+            .put(
+                "c",
+                key,
+                Json::obj().with("value", Json::int(value)),
+                PutOptions::default(),
+            )
+            .unwrap();
+    }
+    engine.checkpoint().unwrap();
+
+    let wal_dir = dir.join("wal");
+    let segments = wal::list_segments(&wal_dir).unwrap();
+    let current = segments.last().unwrap();
+    let index = current
+        .file_name()
+        .and_then(|name| wal::parse_segment_name(&name.to_string_lossy()))
+        .unwrap();
+    let mut writer = wal::WalWriter::open(&wal_dir, index, 1024 * 1024, SyncMode::Always).unwrap();
+    writer
+        .append(&Record::new(
+            engine.last_seq() + 1,
+            0,
+            Op::Put {
+                collection: "c".into(),
+                key: "b".into(),
+                value: Json::obj().with("value", Json::int(1)),
+                expires_at: None,
+            },
+        ))
+        .unwrap();
+    drop(writer);
+
+    let report = engine.verify().unwrap();
+    assert!(
+        !report.ok,
+        "verification must retain unique-index fields declared by the snapshot"
+    );
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.contains("unique index")));
+    drop(engine);
+
+    assert!(
+        Engine::open(cfg).is_err(),
+        "reopen must reject the same semantically invalid WAL suffix"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn interrupted_final_wal_segment_header_preserves_prior_commits() {
     let dir = tempdir("torn-final-wal-header");
     let cfg = EngineConfig::new(&dir);

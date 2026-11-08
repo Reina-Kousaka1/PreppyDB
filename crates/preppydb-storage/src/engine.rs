@@ -37,8 +37,8 @@ use std::time::Duration;
 type IndexEntryIter<'a> =
     dyn Iterator<Item = (&'a Vec<u8>, &'a std::collections::BTreeSet<Arc<str>>)> + 'a;
 
-const MAX_VERIFY_INDEX_FIELDS: usize = 4096;
-const MAX_VERIFY_INDEX_FIELD_BYTES: usize = 1024 * 1024;
+const MAX_VERIFY_INDEX_FIELDS: usize = snapshot::MAX_VERIFY_INDEX_FIELDS;
+const MAX_VERIFY_INDEX_FIELD_BYTES: usize = snapshot::MAX_VERIFY_INDEX_FIELD_BYTES;
 
 fn prefix_upper_bound(prefix: &str) -> Option<String> {
     for (index, ch) in prefix.char_indices().rev() {
@@ -2126,7 +2126,17 @@ impl Engine {
         // is preferable to keeping a second full document store beside the live one.
         // If metadata is damaged or exceeds the bounded plan, retain the established
         // full replay path so the report can still diagnose the original condition.
-        let verify_index_fields = collect_verify_index_fields(&wal_segments)?;
+        let snapshot_path = manifest.snapshot.as_ref().and_then(|snapshot| {
+            validate_snapshot_reference(&manifest, snapshot).ok()?;
+            let path = self.paths.snap_dir.join(&snapshot.file);
+            ensure_regular_snapshot_file(&path).ok()?;
+            Some(path)
+        });
+        let mut verify_index_fields = if manifest.snapshot.is_none() || snapshot_path.is_some() {
+            collect_verify_index_fields(&wal_segments)?
+        } else {
+            None
+        };
         // Framing and sequence checks alone are insufficient: a checksummed record
         // can still be impossible to apply (for example, a unique index that conflicts
         // with existing documents). Reconstruct the snapshot baseline and replay the
@@ -2158,12 +2168,28 @@ impl Engine {
                             .with("error", Json::str(err.to_string())),
                     );
                 } else {
-                    let snapshot_result = match verify_index_fields.as_ref() {
-                        Some(fields) => snapshot::read_snapshot_store_projected(
+                    let snapshot_result = match verify_index_fields.take() {
+                        Some(fields) => match snapshot::read_snapshot_store_projected_with_fields(
                             &path,
                             self.cfg.limits.clone(),
-                            fields,
-                        ),
+                            &fields,
+                        ) {
+                            Ok((data, complete_fields)) => {
+                                verify_index_fields = Some(complete_fields);
+                                Ok(data)
+                            }
+                            Err(DbError::LimitExceeded {
+                                limit: "verify_index_field_plan",
+                                ..
+                            }) => {
+                                // Snapshot and WAL metadata together exceeded the
+                                // bounded projection plan. Fall back to the established
+                                // full-document replay instead of omitting index fields.
+                                verify_index_fields = None;
+                                snapshot::read_snapshot_store(&path, self.cfg.limits.clone())
+                            }
+                            Err(err) => Err(err),
+                        },
                         None => snapshot::read_snapshot_store(&path, self.cfg.limits.clone()),
                     };
                     match snapshot_result {
