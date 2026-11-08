@@ -1,9 +1,9 @@
 # Bounded-Memory Storage Design (Proposal)
 
-## Current evidence (2026-11-08; PR head `9ba7db40`)
+## Current evidence (2026-11-08; PR head `f98ba65`)
 
-The current PR head is `9ba7db40cadb3756aa56dfbc515d0c48880959ef`. GitHub Actions run
-[#139](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42510131204) passed on this
+The current PR head is `f98ba65c3023e5641e35f0939ca03bf3831fd4ac`. GitHub Actions run
+[#140](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42512188019) passed on this
 exact commit, including Linux, Windows, emulated Linux ARM64, Lua/Luvit, Docker, the crash
 harness, and the bounded resource benchmark. The ARM64 job uses QEMU, not Raspberry Pi
 hardware. Earlier resource measurements below are synthetic WSL2 x86-64 results through
@@ -13,42 +13,44 @@ qualification. The exact-head ARM64 artifact is temporary CI output, not a relea
 
 ### Bounded 100,000-document CI measurement
 
-Run #139 used the release server, `tiny` profile, 100,000 deterministic synthetic documents
-with 1,024 payload bytes each, one scalar index, batch size 400, and seed `20261108`. It ran
-on GitHub Actions Ubuntu 22.04 x86-64 with a 1.5 GiB address-space limit, 15-minute CPU
-limit, 2 GiB per-file limit, and 128-file limit. The temporary benchmark data directory was
-removed. The PR source head was `9ba7db40cadb3756aa56dfbc515d0c48880959ef`; Actions tested
-synthetic merge revision `ab9ee0f948f4245cab30a89cc4a21c0787669b7b`. The machine-readable
-result and matching pre-optimization baseline are in the
-[run #139 benchmark artifact](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42510131204/artifacts/13629147215)
+Run #140 used the release server, `tiny` profile, 100,000 deterministic synthetic documents
+with 1,024 payload bytes each, one scalar index, batch size 400, a 60-second idle window,
+and seed `20261108`. It ran on GitHub Actions Ubuntu 22.04 x86-64 with a 1.5 GiB
+address-space limit, 15-minute CPU limit, 2 GiB per-file limit, and 128-file limit. The
+temporary benchmark data directory was removed. The PR source head was
+`f98ba65c3023e5641e35f0939ca03bf3831fd4ac`; Actions tested synthetic merge revision
+`4923079ea7b7d8a835a254de8d6c57b258bbe577`. The machine-readable current and matching
+pre-optimization results are in the
+[run #140 benchmark artifact](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42512188019/artifacts/13629009734)
 (90-day retention).
 
 | Measurement | Result |
 | --- | ---: |
-| Whole-run wall time | 40.241 s |
-| Process peak RSS (kernel high-water mark) | 304,082,944 bytes (290.00 MiB) |
-| Idle RSS / CPU after health check (10.01 s) | 3.72 MiB / 0.2% of one core |
+| Whole-run wall time | 90.255 s |
+| Process peak RSS (kernel high-water mark) | 304,009,216 bytes (289.93 MiB) |
+| Idle RSS / CPU after health check (60.06 s) | 3.74 MiB / 0.1% of one core |
 | Threads at idle | 3 |
-| Checkpoint RSS before → after | 207,978,496 → 207,994,880 bytes (198.34 → 198.36 MiB) |
-| Sampled checkpoint-phase peak RSS | 207,994,880 bytes (198.36 MiB) |
-| Peak phase | Verify/stats/shutdown: about 289.8 MiB sampled; 290.00 MiB kernel high-water |
-| Checkpoint duration | 1.528 s |
-| Recovery startup after isolated child SIGKILL | 1.526 s |
-| Write batch p50 / p95 | 19.798 / 20.316 ms per 400-document batch |
-| Read p50 / p95 | 20.110 / 20.231 ms |
+| Checkpoint RSS before → after | 207,953,920 → 207,970,304 bytes (198.32 → 198.34 MiB) |
+| Sampled checkpoint-phase peak RSS | 208,056,320 bytes (198.42 MiB) |
+| Peak phase | Verify/stats/shutdown: about 289.93 MiB sampled and kernel high-water |
+| Checkpoint duration | 1.917 s |
+| Recovery startup after isolated child SIGKILL | 1.412 s |
+| Write batch p50 / p95 | 19.814 / 20.835 ms per 400-document batch |
+| Read p50 / p95 | 20.109 / 20.408 ms |
 | Snapshot / WAL after checkpoint | 121,347,033 / 12 bytes |
 | WAL after recovery tail writes | 443,184 bytes |
 | Available system memory at start / observed minimum | 15,690,514,432 / 15,494,545,408 bytes |
 
-Run #139 also built and measured the pre-scan implementation from `f0eb9c3` under the
-same deterministic workload. A 100-document full scan took 333.236 ms and raised the
-process high-water mark by 186,675,200 bytes (178.03 MiB). The current implementation
-returned the same 100 documents in 21.622 ms and raised that high-water mark by 139,264
-bytes (0.13 MiB). This is direct evidence that pagination-before-cloning removed the
-scan-sized transient copy for this workload. The overall process peak remains about
-290 MiB, dominated by verification/stats/shutdown rather than the bounded scan. This is
-one hosted x86-64 comparison, not a 4 GiB Pi simulation or a capacity promise; the runner
-had more than 14 GiB available memory and the benchmark imposes per-process limits only.
+The earlier paired scan comparison in run #139 built the pre-scan implementation from
+`f0eb9c3`: a 100-document full scan took 333.236 ms and raised the process high-water mark
+by 186,675,200 bytes (178.03 MiB). The then-current implementation returned the same 100
+documents in 21.622 ms and raised that high-water mark by 139,264 bytes (0.13 MiB). This
+is evidence that pagination-before-cloning removed the scan-sized transient copy for that
+workload. Run #140 rechecked the same code path: current took 20.975 ms and did not exceed
+the process high-water mark already reached during loading. Verify/stats/shutdown still
+dominate the total peak near 290 MiB. These are hosted x86-64 comparisons, not a 4 GiB Pi
+simulation or a capacity promise; the runner had more than 14 GiB available memory and the
+benchmark imposes per-process limits only.
 
 This document records the storage boundary observed in the current implementation and
 defines a migration path to a bounded-memory backend. It is a design proposal only: it
