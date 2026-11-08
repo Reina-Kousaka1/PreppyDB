@@ -605,76 +605,22 @@ jobs:
           python3 - <<'PY'
           import ast
           from pathlib import Path
-          for name in ("stress-isolation-check.py", "stress-load.py", "stress-sequence.py"):
+          for name in ("stress-isolation-check.py", "stress-load.py", "stress-sequence.py", "test_stress_sequence.py"):
               ast.parse(Path("scripts", name).read_text(encoding="utf-8"), filename=name)
               print(f"syntax ok: {name}")
           PY
+          python3 -m unittest scripts/test_stress_sequence.py
 
-      - name: Create, inspect, and run the capped isolation self-test
+      - name: Qualify the capped isolation self-test without load
+        timeout-minutes: 5
         env:
           PREPPYDB_COMMIT: ${{ github.sha }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          IMAGE=python:3.12-slim-bookworm
-          REPORT="$RUNNER_TEMP/preppydb-isolation-report.json"
-          CID="preppydb-isolation-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          cleanup() {
-            docker rm --force "$CID" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT INT TERM
-          docker pull "$IMAGE"
-          docker create --name "$CID" --init --cgroupns private --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --memory 2g --memory-swap 2g --cpus 2 --pids-limit 512 --ulimit nofile=512:512 --shm-size=16m \
-            --tmpfs /stress-data:rw,size=512m,mode=1777,nosuid,nodev,noexec \
-            --tmpfs /tmp:rw,size=64m,mode=1777,nosuid,nodev \
-            --user 10001:10001 \
-            --env PREPPYDB_COMMIT="$PREPPYDB_COMMIT" \
-            --env PREPPYDB_RUSTC="$PREPPYDB_RUSTC" \
-            --env PREPPYDB_CARGO="$PREPPYDB_CARGO" \
-            --env PREPPYDB_RUNNER="$RUNNER_NAME" \
-            --env PREPPYDB_DOCKER_CGROUP="$PREPPYDB_DOCKER_CGROUP" \
-            --env PREPPYDB_TEST_IMAGE="$IMAGE" \
-            --env PYTHONDONTWRITEBYTECODE=1 \
-            --volume "$GITHUB_WORKSPACE/target/release/preppydb-server:/usr/local/bin/preppydb-server:ro" \
-            --volume "$GITHUB_WORKSPACE/scripts/stress-isolation-check.py:/opt/stress-isolation-check.py:ro" \
-            --volume "$GITHUB_WORKSPACE/scripts/stress-load.py:/opt/stress-load.py:ro" \
-            "$IMAGE" python3 -B /opt/stress-isolation-check.py --server /usr/local/bin/preppydb-server --load-script /opt/stress-load.py
-          docker inspect "$CID" | python3 -c '
-          import json, re, sys
-          c = json.load(sys.stdin)[0]
-          h = c["HostConfig"]
-          assert h["Memory"] == 2 * 1024**3, h["Memory"]
-          assert h["MemorySwap"] == 2 * 1024**3, h["MemorySwap"]
-          assert h["NanoCpus"] == 2_000_000_000, h["NanoCpus"]
-          assert h["PidsLimit"] == 512, h["PidsLimit"]
-          assert h["ShmSize"] == 16 * 1024**2, h["ShmSize"]
-          assert h["NetworkMode"] == "none", h["NetworkMode"]
-          assert h["ReadonlyRootfs"] is True
-          tmpfs_options = h["Tmpfs"].get("/stress-data", "")
-          match = re.search(r"(?:^|,)size=(\d+)([kKmMgG]?)", tmpfs_options)
-          assert match, h["Tmpfs"]
-          factors = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
-          assert int(match.group(1)) * factors[match.group(2).lower()] == 512 * 1024**2, tmpfs_options
-          other_tmpfs = h["Tmpfs"].get("/tmp", "")
-          tmp_match = re.search(r"(?:^|,)size=(\d+)([kKmMgG]?)", other_tmpfs)
-          assert tmp_match and int(tmp_match.group(1)) * factors[tmp_match.group(2).lower()] == 64 * 1024**2, other_tmpfs
-          print(json.dumps({"image": c["Config"]["Image"], "memory_bytes": h["Memory"], "memory_swap_bytes": h["MemorySwap"], "nano_cpus": h["NanoCpus"], "pids_limit": h["PidsLimit"], "shm_bytes": h["ShmSize"], "network": h["NetworkMode"], "read_only_root": h["ReadonlyRootfs"], "tmpfs": h["Tmpfs"]}, sort_keys=True))
-          ' | tee "$RUNNER_TEMP/preppydb-docker-config.json"
-          if timeout --signal=TERM --kill-after=10s 180s docker start --attach "$CID" | tee "$REPORT"; then
-            :
-          else
-            echo "Isolation container failed or exceeded its 180-second watchdog." >&2
-            exit 1
-          fi
-          docker inspect "$CID" | python3 -c 'import json,sys; c=json.load(sys.stdin)[0]; assert c["State"]["Status"] == "exited" and c["State"]["ExitCode"] == 0, c["State"]'
-          python3 - "$REPORT" "$PREPPYDB_COMMIT" <<'PY'
-          import json, sys
-          report = json.load(open(sys.argv[1], encoding="utf-8"))
-          assert report["status"] == "passed", report
-          assert report["test"] == "isolation-only", report
-          assert report["load_test_started"] is False, report
-          assert report["commit"] == sys.argv[2], report
-          print("Isolation-only report validated.")
-          PY
+          docker_cgroup=$(docker info --format '{{.CgroupVersion}}')
+          PREPPYDB_DOCKER_CGROUP="$docker_cgroup" PREPPYDB_COMMIT="$GITHUB_SHA" \
+            python3 scripts/stress-sequence.py --isolation-only
 
       - name: Upload isolation report
         if: always()
@@ -756,12 +702,14 @@ jobs:
           python3 - <<'PY'
           import ast
           from pathlib import Path
-          for name in ("stress-isolation-check.py", "stress-load.py", "stress-sequence.py"):
+          for name in ("stress-isolation-check.py", "stress-load.py", "stress-sequence.py", "test_stress_sequence.py"):
               ast.parse(Path("scripts", name).read_text(encoding="utf-8"), filename=name)
               print(f"syntax ok: {name}")
           PY
+          python3 -m unittest scripts/test_stress_sequence.py
 
       - name: Qualify isolation, then run the bounded synthetic ladder
+        timeout-minutes: 5
         env:
           PREPPYDB_COMMIT: ${{ github.sha }}
           PREPPYDB_ENABLE_STRESS: I_APPROVE_BOUNDED_PREPPYDB_STRESS

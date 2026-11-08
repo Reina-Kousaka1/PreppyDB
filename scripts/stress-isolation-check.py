@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -59,6 +60,17 @@ def read_kv(path: pathlib.Path) -> dict[str, int]:
         key, value = line.split()
         result[key] = int(value)
     return result
+
+
+def phase_event(phase: str, started: float) -> None:
+    if os.environ.get("PREPPYDB_DIAGNOSTICS") != "1":
+        return
+    event = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "phase": phase,
+    }
+    print("ISOLATION_PHASE " + json.dumps(event, sort_keys=True), file=sys.stderr, flush=True)
 
 
 def assert_data_tmpfs(path: pathlib.Path) -> dict[str, int | str]:
@@ -119,7 +131,12 @@ def main() -> int:
     parser.add_argument("--load-script", type=pathlib.Path, required=True)
     args = parser.parse_args()
     checks: dict[str, Any] = {}
+    started = time.monotonic()
+    phase = "startup"
     try:
+        phase_event(phase, started)
+        phase = "cgroup-limits"
+        phase_event(phase, started)
         if not pathlib.Path("/sys/fs/cgroup/cgroup.controllers").is_file():
             raise RuntimeError("cgroup v2 is required; refusing to qualify an unknown controller mode")
         group = cgroup_v2_dir()
@@ -151,6 +168,8 @@ def main() -> int:
             "pids_max": pids_max,
         }
 
+        phase = "memory-accounting"
+        phase_event(phase, started)
         before = int((group / "memory.current").read_text().strip())
         sample = bytearray(32 * 1024**2)
         for offset in range(0, len(sample), 4096):
@@ -163,6 +182,8 @@ def main() -> int:
         gc.collect()
         checks["memory_charge"] = {"touched_bytes": 32 * 1024**2, "observed_delta_bytes": charged}
 
+        phase = "cpu-throttling"
+        phase_event(phase, started)
         cpu_stat_path = group / "cpu.stat"
         initial_cpu = read_kv(cpu_stat_path)
         worker_code = "import time; end=time.monotonic()+1.5; x=1\nwhile time.monotonic()<end: x=(x*48271+1)%2147483647"
@@ -189,6 +210,8 @@ def main() -> int:
             raise RuntimeError("CPU quota is configured but did not throttle a brief four-process probe")
         checks["cpu_enforcement"] = {"probe_processes": 4, "throttled_periods_delta": throttled}
 
+        phase = "process-accounting"
+        phase_event(phase, started)
         before_pids = int((group / "pids.current").read_text().strip())
         sleepers = [subprocess.Popen(["sleep", "30"], start_new_session=True) for _ in range(8)]
         try:
@@ -210,6 +233,8 @@ def main() -> int:
                         child.wait(timeout=2)
         checks["process_accounting"] = {"configured_max": pids_max, "synthetic_children": len(sleepers)}
 
+        phase = "temporary-data-filesystem"
+        phase_event(phase, started)
         data_dir = pathlib.Path("/stress-data")
         checks["data_directory"] = assert_data_tmpfs(data_dir)
         probe = data_dir / "quota-probe.bin"
@@ -218,8 +243,12 @@ def main() -> int:
             raise RuntimeError("temporary data write did not round-trip")
         probe.unlink()
         checks["data_probe_bytes"] = 8 * 1024**2
+        phase = "watchdog-child-cleanup"
+        phase_event(phase, started)
         checks["watchdog"] = watchdog_check(data_dir)
 
+        phase = "release-binary-smoke"
+        phase_event(phase, started)
         if not args.server.is_file() or not os.access(args.server, os.X_OK):
             raise RuntimeError("release server binary is not mounted executable")
         result = subprocess.run([str(args.server), "--help"], capture_output=True, text=True, timeout=10, check=False)
@@ -227,6 +256,8 @@ def main() -> int:
             raise RuntimeError("release server binary failed its bounded --help smoke check")
         checks["release_binary"] = {"path": str(args.server), "help_exit_code": result.returncode}
 
+        phase = "load-generator-gate"
+        phase_event(phase, started)
         if not args.load_script.is_file():
             raise RuntimeError("locked load generator is not mounted read-only")
         gate_env = os.environ.copy()
@@ -253,6 +284,8 @@ def main() -> int:
             raise RuntimeError("load generator did not fail closed before starting a server or load")
         checks["load_generator_gate"] = {"refused_without_qualification_and_approval": True, "exit_code": gated.returncode}
 
+        phase = "complete"
+        phase_event(phase, started)
         payload = {
             "status": "passed",
             "test": "isolation-only",
@@ -271,7 +304,9 @@ def main() -> int:
         print(json.dumps(payload, sort_keys=True))
         return 0
     except Exception as error:
-        print(json.dumps({"status": "failed", "test": "isolation-only", "error": str(error), "checks_completed": checks, "load_test_started": False}, sort_keys=True))
+        phase_event("failed:" + phase, started)
+        print(json.dumps({"status": "failed", "test": "isolation-only", "phase": phase,
+                          "error": str(error), "checks_completed": checks, "load_test_started": False}, sort_keys=True))
         return 1
 
 
