@@ -97,21 +97,37 @@ storage engine. SIGKILL cannot be handled; the WAL recovery path still protects
 acknowledged writes, which `scripts/crash-recovery-test.sh` checks. For a clean checkpoint
 before a maintenance window, call `POST /v1/admin/checkpoint`.
 
-#### Raspberry Pi 4 / ARM64 Linux
+#### Raspberry Pi and Linux ARM64
 
-Build natively on the Pi (`cargo build --release`, ~6–10 minutes) or cross-compile:
+The checked-in CI currently builds a commit-named `aarch64-unknown-linux-gnu` archive
+on Ubuntu 22.04 and smoke-runs it under QEMU. Its manifest records the workspace version,
+commit, target, Rust compiler, cross-compiler, and glibc baseline. CI checks that the
+binary's dynamic GLIBC symbol requirements do not exceed 2.35; use a 64-bit ARM Linux
+distribution with glibc 2.35 or newer. This is an emulated CI build,
+not qualification on a Raspberry Pi. Raspberry Pi 4B is the intended initial hardware
+target; Pi 5 and other boards have not been qualified. This CI artifact is not published
+as a release, so do not treat it as a stable download.
+
+For a local native build on the Pi, install Rust 1.89+ and the locked crate dependencies,
+then run:
 
 ```bash
-rustup target add aarch64-unknown-linux-gnu
-sudo apt-get install -y gcc-aarch64-linux-gnu
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-  cargo build --release --target aarch64-unknown-linux-gnu
+cargo build --release --locked --bin preppydb-server --bin preppydb
 ```
 
-Use a USB SSD rather than an SD card for the data directory: the engine calls `fsync` on
-every mutation by default, which SD cards handle poorly. If the workload tolerates it,
-`"sync_mode": "interval"` reduces write amplification at the cost of durability of
-the last few writes (see §3).
+The commands above compile natively and do not need an ARM cross-compiler. On an x86-64
+Linux build host, use the checked-in ARM64 CI job or install the Rust AArch64 target and
+`gcc-aarch64-linux-gnu`; the resulting GNU/Linux binary still requires the documented
+glibc baseline. Do not use the current CI smoke artifact as a production release: no
+stable Pi release or supported upgrade channel has been published.
+
+The tested ARM64 CI environment is Ubuntu 22.04 with QEMU user-mode emulation and the
+stable Rust toolchain selected by `rust-toolchain.toml`; the workflow uses the Ubuntu
+`aarch64-linux-gnu-gcc` cross-compiler. QEMU results do not establish real-hardware
+performance or durability. No Pi 4B/5 OS image has been hardware-qualified yet. Preserve
+`"sync_mode": "always"` for data that needs the documented per-write sync behavior.
+`interval` acknowledges writes before the corresponding sync and may lose recent commits
+after a failure.
 
 #### Windows x86-64
 
@@ -150,14 +166,14 @@ Precedence: CLI flag > config file > default.
   "read_only": false,
   "cors_origins": [],
   "pricing_seed": null,
-  "ttl_sweep_interval_ms": 60000,
-  "checkpoint_every_mutations": 10000,
+  "ttl_sweep_interval_ms": 30000,
+  "checkpoint_every_mutations": 50000,
   "repair": "strict",
   "auth_path": null,
   "pricing_audit_path": null,
   "ruby_planner_path": null,
   "lua_execution_enabled": false,
-  "workers": 4
+  "workers": 8
 }
 ```
 
@@ -179,7 +195,7 @@ exits; unknown keys in the file are rejected so typos cannot silently change beh
 | `checkpoint_every_mutations` | automatic checkpoint threshold; `null` disables it |
 | `repair` | `strict` (abort on mid-WAL corruption) or `truncate` (destructive, for recovery) |
 | `auth_path` / `pricing_audit_path` | override the default locations inside the data dir |
-| `workers` | HTTP worker threads (1–512) |
+| `workers` | HTTP worker threads (1–512; default 8) |
 
 When enabled, `POST /v1/lua/execute` runs one caller-supplied Lua chunk without a
 database handle, then validates and atomically submits its `put`/`delete` result through
@@ -377,7 +393,7 @@ After a process crash such as `kill -9`, startup validates and replays the persi
 | Batch / transaction operations | 1 000 | server handler (fixed) |
 | Scan / index page | 1 000 keys | `limit` query parameter |
 | Collection size | per model (see [DATA-MODEL.md](DATA-MODEL.md)) | `max_docs` per collection |
-| Concurrent HTTP workers | 4 | `workers` |
+| Concurrent HTTP workers | 8 by default | `workers` |
 | Rate limit | 50/s, burst 100 | `rate_limit_per_second`, `rate_limit_burst` |
 
 The working set lives in memory: size the host so the whole dataset fits with headroom.

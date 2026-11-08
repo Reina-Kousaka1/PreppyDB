@@ -198,6 +198,39 @@ store. It uses `sync_mode = never` to isolate in-process commit work from fsync 
 it is not a durability benchmark and its results are not cross-machine performance
 claims.
 
+## Raspberry Pi resource benchmark
+
+`scripts/benchmark-resources.py` runs a synthetic workload against only the server
+binary supplied with `--server`. It creates a temporary data directory, binds to an
+OS-assigned loopback port, seeds deterministic ~1 KiB documents, builds one scalar
+index, checkpoints, adds a WAL tail, kills only that child process, verifies recovery,
+and emits JSON. It records sampled RSS and available RAM, CPU, WAL/snapshot bytes,
+startup/recovery/shutdown times, write/read p50 and p95, checkpoint duration, and index
+build timing. The temporary database is removed on completion.
+
+The default is 1,000 documents. The requested 100,000-document profile requires
+`--allow-large-test`, at least 1 GiB of free temporary disk, and is limited to 1.5 GiB
+virtual address space, 2 GiB per file, 15 minutes of child CPU, 128 open files, and no
+core dumps. Those per-process limits do not isolate aggregate system memory or page
+cache, so do not run the large profile on shared Raspberry Pi hardware. No 100,000-row
+measurements have been captured yet; CI only checks the harness syntax and CLI help.
+
+Example on a dedicated Linux host after building the release server:
+
+```bash
+cargo build --release --locked -p preppydb-server
+python3 scripts/benchmark-resources.py \
+  --server target/release/preppydb-server \
+  --documents 100000 --allow-large-test --seed 20261108 \
+  --source-commit "$(git rev-parse HEAD)" \
+  --output resource-results.json
+```
+
+Treat the resulting JSON as a measurement of that binary and host only. Compare changes
+with the same binary flags, seed, OS, storage device, and workload. The sampler polls
+every 50 ms and can miss shorter RSS spikes; its peak value is a lower bound, not an
+exact process high-water mark.
+
 Two local runs on Ubuntu under WSL2 (Linux 6.18.33.2, x86_64, 12th Gen Intel Core
 i5-12450H, rustc 1.99.1, release profile) reported median times of 2,146/2,522/2,579 ns
 and 2,141/2,566/2,615 ns respectively for the three store sizes. The corresponding p95
