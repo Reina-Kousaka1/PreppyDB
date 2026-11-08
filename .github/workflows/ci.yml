@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Choose the full CI suite or only the resource-isolation qualification"
+        required: true
+        type: choice
+        options:
+          - isolation-only
+          - full-ci
+        default: isolation-only
 
 permissions:
   contents: read
@@ -21,6 +30,7 @@ env:
 jobs:
   # ------------------------------------------------------------------ Linux x86-64
   linux-x86_64:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
     name: Linux x86-64 (fmt, clippy, tests)
     runs-on: ubuntu-22.04
     timeout-minutes: 60
@@ -165,6 +175,7 @@ jobs:
 
   # ----------------------------------------------------------------- Windows x86-64
   windows-x86_64:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
     name: Windows x86-64 (build + tests)
     runs-on: windows-2022
     steps:
@@ -276,6 +287,7 @@ jobs:
 
   # -------------------------------------------------- Linux ARM64 (build + emulated tests)
   linux-arm64:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
     name: Linux ARM64 (build, emulated tests)
     runs-on: ubuntu-22.04
     steps:
@@ -404,6 +416,7 @@ jobs:
 
   # ------------------------------------------------------------------- Lua client
   lua-client:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
     name: Lua/Luvit client (offline + live)
     runs-on: ubuntu-22.04
     steps:
@@ -491,6 +504,7 @@ jobs:
 
   # --------------------------------------------------------------------- Docker
   docker-images:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
     name: Docker images (amd64 + arm64, never pushed)
     runs-on: ubuntu-22.04
     steps:
@@ -511,6 +525,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   docker-persistence:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
     name: Docker persistence (restart + recreate)
     runs-on: ubuntu-22.04
     steps:
@@ -537,13 +552,141 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # This qualification is opt-in on manual dispatch only. It intentionally does
+  # not invoke the prepared load generator.
+  stress-isolation:
+    name: Stress test isolation qualification (no load)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_mode == 'isolation-only' && github.ref == 'refs/heads/arena/146caad2-preppydb'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check isolated hosted runner capacity
+        run: |
+          set -euo pipefail
+          echo "runner=${RUNNER_NAME}"
+          echo "image=${ImageOS:-unknown}/${ImageVersion:-unknown}"
+          uname -a
+          docker info --format 'docker={{.ServerVersion}} storage={{.Driver}} cgroup={{.CgroupVersion}}'
+          echo "PREPPYDB_DOCKER_CGROUP=$(docker info --format '{{.CgroupVersion}}')" >> "$GITHUB_ENV"
+          available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+          free_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+          test "$available_kib" -ge 4194304
+          test "$free_kib" -ge 5242880
+          echo "host_available_memory_kib=$available_kib"
+          echo "runner_temp_free_kib=$free_kib"
+
+      - name: Build release server binary
+        run: |
+          rustc --version
+          cargo --version
+          echo "PREPPYDB_RUSTC=$(rustc --version)" >> "$GITHUB_ENV"
+          echo "PREPPYDB_CARGO=$(cargo --version)" >> "$GITHUB_ENV"
+          cargo build --locked --release -p preppydb-server
+
+      - name: Parse test scripts without running a workload
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          for name in ("stress-isolation-check.py", "stress-load.py"):
+              ast.parse(Path("scripts", name).read_text(encoding="utf-8"), filename=name)
+              print(f"syntax ok: {name}")
+          PY
+
+      - name: Create, inspect, and run the capped isolation self-test
+        env:
+          PREPPYDB_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE=python:3.12-slim-bookworm
+          REPORT="$RUNNER_TEMP/preppydb-isolation-report.json"
+          CID="preppydb-isolation-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cleanup() {
+            docker rm --force "$CID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT INT TERM
+          docker pull "$IMAGE"
+          docker create --name "$CID" --init --cgroupns private --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --memory 2g --memory-swap 2g --cpus 2 --pids-limit 512 --ulimit nofile=512:512 --shm-size=16m \
+            --tmpfs /stress-data:rw,size=512m,mode=1777,nosuid,nodev,noexec \
+            --tmpfs /tmp:rw,size=64m,mode=1777,nosuid,nodev \
+            --user 10001:10001 \
+            --env PREPPYDB_COMMIT="$PREPPYDB_COMMIT" \
+            --env PREPPYDB_RUSTC="$PREPPYDB_RUSTC" \
+            --env PREPPYDB_CARGO="$PREPPYDB_CARGO" \
+            --env PREPPYDB_RUNNER="$RUNNER_NAME" \
+            --env PREPPYDB_DOCKER_CGROUP="$PREPPYDB_DOCKER_CGROUP" \
+            --env PREPPYDB_TEST_IMAGE="$IMAGE" \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --volume "$GITHUB_WORKSPACE/target/release/preppydb-server:/usr/local/bin/preppydb-server:ro" \
+            --volume "$GITHUB_WORKSPACE/scripts/stress-isolation-check.py:/opt/stress-isolation-check.py:ro" \
+            --volume "$GITHUB_WORKSPACE/scripts/stress-load.py:/opt/stress-load.py:ro" \
+            "$IMAGE" python3 -B /opt/stress-isolation-check.py --server /usr/local/bin/preppydb-server --load-script /opt/stress-load.py
+          docker inspect "$CID" | python3 -c '
+          import json, re, sys
+          c = json.load(sys.stdin)[0]
+          h = c["HostConfig"]
+          assert h["Memory"] == 2 * 1024**3, h["Memory"]
+          assert h["MemorySwap"] == 2 * 1024**3, h["MemorySwap"]
+          assert h["NanoCpus"] == 2_000_000_000, h["NanoCpus"]
+          assert h["PidsLimit"] == 512, h["PidsLimit"]
+          assert h["ShmSize"] == 16 * 1024**2, h["ShmSize"]
+          assert h["NetworkMode"] == "none", h["NetworkMode"]
+          assert h["ReadonlyRootfs"] is True
+          tmpfs_options = h["Tmpfs"].get("/stress-data", "")
+          match = re.search(r"(?:^|,)size=(\d+)([kKmMgG]?)", tmpfs_options)
+          assert match, h["Tmpfs"]
+          factors = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
+          assert int(match.group(1)) * factors[match.group(2).lower()] == 512 * 1024**2, tmpfs_options
+          other_tmpfs = h["Tmpfs"].get("/tmp", "")
+          tmp_match = re.search(r"(?:^|,)size=(\d+)([kKmMgG]?)", other_tmpfs)
+          assert tmp_match and int(tmp_match.group(1)) * factors[tmp_match.group(2).lower()] == 64 * 1024**2, other_tmpfs
+          print(json.dumps({"image": c["Config"]["Image"], "memory_bytes": h["Memory"], "memory_swap_bytes": h["MemorySwap"], "nano_cpus": h["NanoCpus"], "pids_limit": h["PidsLimit"], "shm_bytes": h["ShmSize"], "network": h["NetworkMode"], "read_only_root": h["ReadonlyRootfs"], "tmpfs": h["Tmpfs"]}, sort_keys=True))
+          ' | tee "$RUNNER_TEMP/preppydb-docker-config.json"
+          if timeout --signal=TERM --kill-after=10s 180s docker start --attach "$CID" | tee "$REPORT"; then
+            :
+          else
+            echo "Isolation container failed or exceeded its 180-second watchdog." >&2
+            exit 1
+          fi
+          docker inspect "$CID" | python3 -c 'import json,sys; c=json.load(sys.stdin)[0]; assert c["State"]["Status"] == "exited" and c["State"]["ExitCode"] == 0, c["State"]'
+          python3 - "$REPORT" "$PREPPYDB_COMMIT" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert report["status"] == "passed", report
+          assert report["test"] == "isolation-only", report
+          assert report["load_test_started"] is False, report
+          assert report["commit"] == sys.argv[2], report
+          print("Isolation-only report validated.")
+          PY
+
+      - name: Upload isolation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-stress-isolation-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/preppydb-isolation-report.json
+            ${{ runner.temp }}/preppydb-docker-config.json
+          if-no-files-found: ignore
+          retention-days: 30
+
   # --------------------------------------------------------------------- summary
   ci-status:
     name: CI status
     runs-on: ubuntu-22.04
-    needs: [linux-x86_64, windows-x86_64, linux-arm64, lua-client, docker-images, docker-persistence]
+    needs: [linux-x86_64, windows-x86_64, linux-arm64, lua-client, docker-images, docker-persistence, stress-isolation]
     if: always()
     steps:
+      - name: Reject an unknown manual mode
+        if: github.event_name == 'workflow_dispatch' && inputs.run_mode != 'isolation-only' && inputs.run_mode != 'full-ci'
+        run: |
+          echo "::error::Select isolation-only or full-ci."
+          exit 1
+
       - name: Fail if any job failed
         run: |
           if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
