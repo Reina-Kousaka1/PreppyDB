@@ -32,6 +32,9 @@ use std::sync::{mpsc, Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWri
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+type IndexEntryIter<'a> =
+    dyn Iterator<Item = (&'a Vec<u8>, &'a std::collections::BTreeSet<Arc<str>>)> + 'a;
+
 /// What to do when recovery finds corruption that is not a torn tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairPolicy {
@@ -996,17 +999,17 @@ impl Engine {
     }
 
     /// Mutate one document under the write lock and restore it if WAL append fails.
+    /// The displaced document is moved into the undo value rather than cloned.
     fn commit_document<F>(&self, collection: &str, key: &str, mutate: F) -> Result<u64>
     where
-        F: FnOnce(&mut Store, u64, i64) -> Result<Op>,
+        F: FnOnce(&mut Store, u64, i64) -> Result<(Op, Option<Doc>)>,
     {
         self.check_writable("write")?;
         let mut state = self.write();
         self.check_writable("write")?;
         let seq = next_sequence(state.seq)?;
         let now = now_ms();
-        let previous = state.store.collection(collection)?.docs.get(key).cloned();
-        let op = mutate(&mut state.store, seq, now)?;
+        let (op, previous) = mutate(&mut state.store, seq, now)?;
         let record = Record::new(seq, now, op);
         let mut writer = self.lock_mutex(&self.writer);
         if let Err(err) = writer.append(&record) {
@@ -1071,7 +1074,7 @@ impl Engine {
     ) -> Result<u64> {
         let version = std::cell::Cell::new(0u64);
         self.commit_document(collection, key, |store, seq, now| {
-            let written = store.put(
+            let (written, previous) = store.put_with_undo(
                 collection,
                 key,
                 value.clone(),
@@ -1082,12 +1085,15 @@ impl Engine {
                 ApplyMode::Live,
             )?;
             version.set(written);
-            Ok(Op::Put {
-                collection: collection.to_string(),
-                key: key.to_string(),
-                value,
-                expires_at: options.expires_at,
-            })
+            Ok((
+                Op::Put {
+                    collection: collection.to_string(),
+                    key: key.to_string(),
+                    value,
+                    expires_at: options.expires_at,
+                },
+                previous,
+            ))
         })?;
         self.metrics.puts.fetch_add(1, Ordering::Relaxed);
         Ok(version.get())
@@ -1096,11 +1102,15 @@ impl Engine {
     /// Delete a document. `expected_version` implements compare-and-delete.
     pub fn delete(&self, collection: &str, key: &str, expected_version: Option<u64>) -> Result<()> {
         self.commit_document(collection, key, |store, _seq, _now| {
-            store.delete(collection, key, expected_version, ApplyMode::Live)?;
-            Ok(Op::Delete {
-                collection: collection.to_string(),
-                key: key.to_string(),
-            })
+            let (_, previous) =
+                store.delete_with_undo(collection, key, expected_version, ApplyMode::Live)?;
+            Ok((
+                Op::Delete {
+                    collection: collection.to_string(),
+                    key: key.to_string(),
+                },
+                previous,
+            ))
         })?;
         self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1205,7 +1215,7 @@ impl Engine {
                         ))
                     }
                 };
-                let previous_ref = state.store.collection(collection)?.docs.get(key);
+                let previous_ref = state.store.collection(collection)?.docs.get(key.as_str());
                 if let Some(previous) = previous_ref {
                     undo_bytes =
                         reserve_undo_bytes(undo_bytes, previous.to_json().to_string().len())?;
@@ -1505,7 +1515,7 @@ impl Engine {
             DocumentAccess::FullScan => {
                 for (key, doc) in &coll.docs {
                     if !doc.is_expired(now) && matches_document_filter(doc, filter) {
-                        output.push((key.clone(), doc.clone()));
+                        output.push((key.to_string(), doc.clone()));
                         if output.len() == limit {
                             break;
                         }
@@ -1532,9 +1542,9 @@ impl Engine {
                 }
                 if let Some(keys) = index.entries.get(&filter.value.canonical_bytes()) {
                     for key in keys {
-                        if let Some(doc) = coll.docs.get(key) {
+                        if let Some(doc) = coll.docs.get(key.as_ref()) {
                             if !doc.is_expired(now) && matches_document_filter(doc, Some(filter)) {
-                                output.push((key.clone(), doc.clone()));
+                                output.push((key.to_string(), doc.clone()));
                                 if output.len() == limit {
                                     break;
                                 }
@@ -1556,16 +1566,16 @@ impl Engine {
         let mut items: Vec<(String, Doc)> = match &options.prefix {
             Some(prefix) => coll
                 .docs
-                .range(prefix.clone()..)
+                .range(std::sync::Arc::<str>::from(prefix.as_str())..)
                 .take_while(|(key, _)| key.starts_with(prefix))
                 .filter(|(_, doc)| options.include_expired || !doc.is_expired(now))
-                .map(|(key, doc)| (key.clone(), doc.clone()))
+                .map(|(key, doc)| (key.to_string(), doc.clone()))
                 .collect(),
             None => coll
                 .docs
                 .iter()
                 .filter(|(_, doc)| options.include_expired || !doc.is_expired(now))
-                .map(|(key, doc)| (key.clone(), doc.clone()))
+                .map(|(key, doc)| (key.to_string(), doc.clone()))
                 .collect(),
         };
         if options.reverse {
@@ -1603,7 +1613,7 @@ impl Engine {
             for key in keys {
                 if let Some(doc) = coll.docs.get(key) {
                     if !doc.is_expired(now) {
-                        out.push((key.clone(), doc.clone()));
+                        out.push((key.to_string(), doc.clone()));
                     }
                 }
                 if limit != 0 && out.len() >= limit {
@@ -1636,17 +1646,16 @@ impl Engine {
             })?;
         let start = from.map(|v| v.canonical_bytes());
         let end = to.map(|v| v.canonical_bytes());
-        let iter: Box<dyn Iterator<Item = (&Vec<u8>, &std::collections::BTreeSet<String>)>> =
-            match (start, end) {
-                (Some(start), Some(end)) => Box::new(index_state.entries.range(start..=end)),
-                (Some(start), None) => Box::new(index_state.entries.range(start..)),
-                (None, Some(end)) => Box::new(index_state.entries.range(..=end)),
-                (None, None) => Box::new(index_state.entries.iter()),
-            };
+        let iter: Box<IndexEntryIter<'_>> = match (start, end) {
+            (Some(start), Some(end)) => Box::new(index_state.entries.range(start..=end)),
+            (Some(start), None) => Box::new(index_state.entries.range(start..)),
+            (None, Some(end)) => Box::new(index_state.entries.range(..=end)),
+            (None, None) => Box::new(index_state.entries.iter()),
+        };
         let mut out = Vec::new();
         for (_, keys) in iter {
             for key in keys {
-                if let Some(doc) = coll.docs.get(key) {
+                if let Some(doc) = coll.docs.get(key.as_ref()) {
                     if doc.is_expired(now) {
                         continue;
                     }
@@ -1655,7 +1664,7 @@ impl Engine {
                         .get_path(&index_state.meta.field)
                         .cloned()
                         .unwrap_or(Json::Null);
-                    out.push((key.clone(), value, doc.clone()));
+                    out.push((key.to_string(), value, doc.clone()));
                     if limit != 0 && out.len() >= limit {
                         return Ok(out);
                     }
@@ -2164,7 +2173,7 @@ impl Engine {
                 if doc.is_expired(now) {
                     continue;
                 }
-                docs.set(key.clone(), doc.to_json());
+                docs.set(key.to_string(), doc.to_json());
             }
             collections.set(
                 name.clone(),
@@ -2350,6 +2359,49 @@ mod document_undo_tests {
         let mut config = EngineConfig::new(dir);
         config.sync_mode = SyncMode::Interval(20);
         config
+    }
+
+    #[test]
+    fn single_document_append_failure_restores_moved_previous_value() {
+        let dir = std::env::temp_dir().join(format!(
+            "preppydb-single-document-undo-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("c", 0))
+            .unwrap();
+        let old_value = Json::obj()
+            .with("payload", Json::str("old"))
+            .with("revision", Json::int(1));
+        engine
+            .put("c", "key", old_value.clone(), PutOptions::default())
+            .unwrap();
+
+        engine.lock_mutex(&engine.writer).inject_append_failure();
+        assert!(engine
+            .put(
+                "c",
+                "key",
+                Json::obj()
+                    .with("payload", Json::str("new"))
+                    .with("revision", Json::int(2)),
+                PutOptions::default(),
+            )
+            .is_err());
+
+        let state = engine.read();
+        assert_eq!(
+            state.store.collection("c").unwrap().docs["key"].value,
+            old_value
+        );
+        drop(state);
+        drop(engine);
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        assert_eq!(reopened.get("c", "key").unwrap().value, old_value);
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

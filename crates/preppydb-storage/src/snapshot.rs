@@ -140,8 +140,8 @@ pub fn write_snapshot(
     let borrowed = collections.iter().map(|(meta, docs)| {
         (
             meta,
-            Box::new(docs.iter().map(|(key, doc)| (key, doc)))
-                as Box<dyn Iterator<Item = (&String, &Doc)> + '_>,
+            Box::new(docs.iter().map(|(key, doc)| (key.as_str(), doc)))
+                as Box<dyn Iterator<Item = (&str, &Doc)> + '_>,
         )
     });
     write_snapshot_iter(
@@ -172,7 +172,8 @@ pub fn write_snapshot_from_store(
     let borrowed = store.collections.values().map(|collection| {
         (
             &collection.meta,
-            Box::new(collection.docs.iter()) as Box<dyn Iterator<Item = (&String, &Doc)> + '_>,
+            Box::new(collection.docs.iter().map(|(key, doc)| (key.as_ref(), doc)))
+                as Box<dyn Iterator<Item = (&str, &Doc)> + '_>,
         )
     });
     write_snapshot_iter(
@@ -199,7 +200,7 @@ where
     I: IntoIterator<
         Item = (
             &'a CollectionMeta,
-            Box<dyn Iterator<Item = (&'a String, &'a Doc)> + 'a>,
+            Box<dyn Iterator<Item = (&'a str, &'a Doc)> + 'a>,
         ),
     >,
 {
@@ -291,7 +292,7 @@ where
             let payload = Json::obj()
                 .with("t", Json::str("doc"))
                 .with("c", Json::str(meta.name.clone()))
-                .with("k", Json::str(key.clone()))
+                .with("k", Json::str(key))
                 .with("d", doc.to_json())
                 .to_string();
             write_frame(
@@ -395,7 +396,7 @@ impl SnapshotSink for StoreSnapshotSink {
                 format!("document for unknown collection '{collection}'"),
             )
         })?;
-        if coll.docs.insert(key, doc).is_some() {
+        if coll.docs.insert(key.into(), doc).is_some() {
             return Err(DbError::corrupt(
                 "snapshot",
                 format!("duplicate document key in collection '{collection}'"),
@@ -760,7 +761,11 @@ mod tests {
         let mut store = Store::default();
         for (meta, docs) in &collections {
             let mut collection = Collection::new(meta.clone());
-            collection.docs.extend(docs.iter().cloned());
+            collection.docs.extend(
+                docs.iter()
+                    .cloned()
+                    .map(|(key, doc)| (std::sync::Arc::<str>::from(key), doc)),
+            );
             store.collections.insert(meta.name.clone(), collection);
         }
 

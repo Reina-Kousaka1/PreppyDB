@@ -10,6 +10,7 @@ use crate::record::Op;
 use crate::schema;
 use preppydb_json::Json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Maximum serialized old-document data retained for rollback by one batch.
 pub(crate) const MAX_BATCH_UNDO_BYTES: usize = 32 * 1024 * 1024;
@@ -117,7 +118,7 @@ impl Doc {
 #[derive(Clone, Debug)]
 pub struct IndexState {
     pub meta: IndexMeta,
-    pub entries: BTreeMap<Vec<u8>, BTreeSet<String>>,
+    pub entries: BTreeMap<Vec<u8>, BTreeSet<Arc<str>>>,
 }
 
 impl IndexState {
@@ -148,13 +149,13 @@ impl IndexState {
                 "unique index '{}' already contains value {} for key '{}'",
                 self.meta.name,
                 value,
-                bucket.iter().next().unwrap_or(&String::new())
+                bucket.iter().next().map(AsRef::as_ref).unwrap_or("")
             )));
         }
         Ok(())
     }
 
-    fn insert(&mut self, doc_key: &str, doc: &Doc) -> Result<()> {
+    fn insert(&mut self, doc_key: &Arc<str>, doc: &Doc) -> Result<()> {
         self.validate_insert(doc_key, doc)?;
         let value = match doc.value.get_path(&self.meta.field) {
             Some(value) => value,
@@ -162,11 +163,11 @@ impl IndexState {
             None => &Json::Null,
         };
         let bucket = self.entries.entry(value.canonical_bytes()).or_default();
-        bucket.insert(doc_key.to_string());
+        bucket.insert(Arc::clone(doc_key));
         Ok(())
     }
 
-    fn remove(&mut self, doc_key: &str, doc: &Doc) {
+    fn remove(&mut self, doc_key: &Arc<str>, doc: &Doc) {
         let value = match doc.value.get_path(&self.meta.field) {
             Some(value) => value,
             None if self.meta.sparse => return,
@@ -175,7 +176,7 @@ impl IndexState {
         {
             let encoded = value.canonical_bytes();
             if let Some(bucket) = self.entries.get_mut(&encoded) {
-                bucket.remove(doc_key);
+                bucket.remove(doc_key.as_ref());
                 if bucket.is_empty() {
                     self.entries.remove(&encoded);
                 }
@@ -188,7 +189,7 @@ impl IndexState {
 #[derive(Clone, Debug)]
 pub struct Collection {
     pub meta: CollectionMeta,
-    pub docs: BTreeMap<String, Doc>,
+    pub docs: BTreeMap<Arc<str>, Doc>,
     pub indexes: BTreeMap<String, IndexState>,
 }
 
@@ -219,13 +220,20 @@ impl Collection {
         Ok(())
     }
 
-    fn index_document(&mut self, key: &str, doc: &Doc) -> Result<()> {
+    fn index_document(&mut self, key: &Arc<str>, doc: &Doc) -> Result<()> {
         Self::index_document_into(&mut self.indexes, key, doc)
+    }
+
+    fn validate_index_document(&self, key: &Arc<str>, doc: &Doc) -> Result<()> {
+        for index in self.indexes.values() {
+            index.validate_insert(key, doc)?;
+        }
+        Ok(())
     }
 
     fn index_document_into(
         indexes: &mut BTreeMap<String, IndexState>,
-        key: &str,
+        key: &Arc<str>,
         doc: &Doc,
     ) -> Result<()> {
         // Validate every index before modifying any, so a later unique conflict
@@ -239,7 +247,7 @@ impl Collection {
         Ok(())
     }
 
-    fn unindex_document(&mut self, key: &str, doc: &Doc) {
+    fn unindex_document(&mut self, key: &Arc<str>, doc: &Doc) {
         for index in self.indexes.values_mut() {
             index.remove(key, doc);
         }
@@ -353,12 +361,13 @@ impl Store {
         previous: Option<Doc>,
     ) -> Result<()> {
         let coll = self.collection_mut(collection)?;
-        if let Some(current) = coll.docs.remove(key) {
-            coll.unindex_document(key, &current);
+        if let Some((stored_key, current)) = coll.docs.remove_entry(key) {
+            coll.unindex_document(&stored_key, &current);
         }
         if let Some(doc) = previous {
-            coll.index_document(key, &doc)?;
-            coll.docs.insert(key.to_string(), doc);
+            let stored_key = Arc::<str>::from(key);
+            coll.index_document(&stored_key, &doc)?;
+            coll.docs.insert(stored_key, doc);
         }
         Ok(())
     }
@@ -461,10 +470,38 @@ impl Store {
         revision: u64,
         mode: ApplyMode,
     ) -> Result<u64> {
+        self.put_with_undo(
+            collection,
+            key,
+            value,
+            expires_at,
+            expected_version,
+            now_ms,
+            revision,
+            mode,
+        )
+        .map(|(version, _previous)| version)
+    }
+
+    /// Apply a put and return the displaced document for an in-memory rollback.
+    /// Moving the old value out avoids a full document clone on the engine's
+    /// single-document WAL path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn put_with_undo(
+        &mut self,
+        collection: &str,
+        key: &str,
+        value: Json,
+        expires_at: Option<i64>,
+        expected_version: Option<u64>,
+        now_ms: i64,
+        revision: u64,
+        mode: ApplyMode,
+    ) -> Result<(u64, Option<Doc>)> {
         validate_key(key, self.limits.max_key_len)?;
         let coll = match self.collections.get_mut(collection) {
             Some(coll) => coll,
-            None if mode == ApplyMode::Replay => return Ok(0),
+            None if mode == ApplyMode::Replay => return Ok((0, None)),
             None => return Err(DbError::CollectionNotFound(collection.to_string())),
         };
         if mode == ApplyMode::Live {
@@ -481,31 +518,34 @@ impl Store {
                 });
             }
         }
-        let existing = coll.docs.get(key).cloned();
+        let (stored_key, existing_version, created_at) = match coll.docs.get_key_value(key) {
+            Some((stored_key, doc)) => (Arc::clone(stored_key), Some(doc.version), doc.created_at),
+            None => (Arc::<str>::from(key), None, now_ms),
+        };
         if mode == ApplyMode::Live {
             match expected_version {
-                Some(0) if existing.is_some() => {
+                Some(0) if existing_version.is_some() => {
                     return Err(DbError::Conflict {
                         collection: collection.to_string(),
                         key: key.to_string(),
                         expected: Some(0),
-                        actual: existing.as_ref().map(|doc| doc.version),
+                        actual: existing_version,
                     })
                 }
                 Some(expected) if expected > 0 => {
-                    let actual = existing.as_ref().map(|doc| doc.version).unwrap_or(0);
+                    let actual = existing_version.unwrap_or(0);
                     if actual != expected {
                         return Err(DbError::Conflict {
                             collection: collection.to_string(),
                             key: key.to_string(),
                             expected: Some(expected),
-                            actual: existing.as_ref().map(|doc| doc.version),
+                            actual: existing_version,
                         });
                     }
                 }
                 _ => {}
             }
-            if existing.is_none() {
+            if existing_version.is_none() {
                 let max_docs = coll
                     .meta
                     .max_docs
@@ -519,16 +559,13 @@ impl Store {
                 }
             }
         }
-        let (version, created_at) = match &existing {
-            Some(doc) => (
-                doc.version.checked_add(1).ok_or(DbError::LimitExceeded {
-                    limit: "document_version",
-                    max: u64::MAX,
-                    actual: u64::MAX,
-                })?,
-                doc.created_at,
-            ),
-            None => (1, now_ms),
+        let version = match existing_version {
+            Some(current) => current.checked_add(1).ok_or(DbError::LimitExceeded {
+                limit: "document_version",
+                max: u64::MAX,
+                actual: u64::MAX,
+            })?,
+            None => 1,
         };
         let expires_at = match (expires_at, coll.meta.default_ttl_ms) {
             (Some(expires_at), _) => Some(expires_at),
@@ -539,9 +576,6 @@ impl Store {
             ),
             (None, None) => None,
         };
-        if let Some(old) = &existing {
-            coll.unindex_document(key, old);
-        }
         let doc = Doc {
             value,
             version,
@@ -550,15 +584,24 @@ impl Store {
             updated_at: now_ms,
             expires_at,
         };
-        // Index maintenance can fail (unique constraint); roll back cleanly.
-        if let Err(err) = coll.index_document(key, &doc) {
-            if let Some(old) = existing {
-                let _ = coll.index_document(key, &old);
+        // Validate before removing the old document. This lets the update path
+        // avoid cloning the prior document while preserving failed-write atomicity.
+        coll.validate_index_document(&stored_key, &doc)?;
+        let previous = coll.docs.remove_entry(key).map(|(stored, old)| {
+            coll.unindex_document(&stored, &old);
+            old
+        });
+        // A second validation cannot fail after the same key was removed; keep a
+        // defensive restoration path so the old value survives any future change.
+        if let Err(err) = coll.index_document(&stored_key, &doc) {
+            if let Some(old) = previous {
+                let _ = coll.index_document(&stored_key, &old);
+                coll.docs.insert(Arc::clone(&stored_key), old);
             }
             return Err(err);
         }
-        coll.docs.insert(key.to_string(), doc);
-        Ok(version)
+        coll.docs.insert(stored_key, doc);
+        Ok((version, previous))
     }
 
     pub fn delete(
@@ -568,26 +611,38 @@ impl Store {
         expected_version: Option<u64>,
         mode: ApplyMode,
     ) -> Result<bool> {
+        self.delete_with_undo(collection, key, expected_version, mode)
+            .map(|(deleted, _previous)| deleted)
+    }
+
+    /// Apply a delete and return the removed document for an in-memory rollback.
+    pub(crate) fn delete_with_undo(
+        &mut self,
+        collection: &str,
+        key: &str,
+        expected_version: Option<u64>,
+        mode: ApplyMode,
+    ) -> Result<(bool, Option<Doc>)> {
         let coll = match self.collections.get_mut(collection) {
             Some(coll) => coll,
-            None if mode == ApplyMode::Replay => return Ok(false),
+            None if mode == ApplyMode::Replay => return Ok((false, None)),
             None => return Err(DbError::CollectionNotFound(collection.to_string())),
         };
-        let existing = coll.docs.get(key).cloned();
+        let actual_version = coll.docs.get(key).map(|doc| doc.version);
         if mode == ApplyMode::Live {
-            match (expected_version, &existing) {
+            match (expected_version, actual_version) {
                 (None, None) => {
                     return Err(DbError::NotFound {
                         collection: collection.to_string(),
                         key: key.to_string(),
                     })
                 }
-                (Some(expected), Some(doc)) if expected != doc.version => {
+                (Some(expected), Some(actual)) if expected != actual => {
                     return Err(DbError::Conflict {
                         collection: collection.to_string(),
                         key: key.to_string(),
                         expected: Some(expected),
-                        actual: Some(doc.version),
+                        actual: Some(actual),
                     })
                 }
                 (Some(_), None) => {
@@ -601,13 +656,11 @@ impl Store {
                 _ => {}
             }
         }
-        match existing {
-            Some(doc) => {
-                coll.unindex_document(key, &doc);
-                coll.docs.remove(key);
-                Ok(true)
-            }
-            None => Ok(false),
+        if let Some((stored_key, removed)) = coll.docs.remove_entry(key) {
+            coll.unindex_document(&stored_key, &removed);
+            Ok((true, Some(removed)))
+        } else {
+            Ok((false, None))
         }
     }
 
@@ -708,7 +761,7 @@ impl Store {
                 let previous_ref = self
                     .collections
                     .get(collection)
-                    .and_then(|coll| coll.docs.get(key));
+                    .and_then(|coll| coll.docs.get(key.as_str()));
                 if let Some(previous) = previous_ref {
                     let additional = previous.to_json().to_string().len();
                     *undo_bytes = if mode == ApplyMode::Live {
@@ -920,7 +973,7 @@ impl Store {
         'collections: for (name, coll) in &self.collections {
             for (key, doc) in &coll.docs {
                 if doc.is_expired(now_ms) {
-                    out.push((name.clone(), key.clone()));
+                    out.push((name.clone(), key.to_string()));
                     if out.len() == limit {
                         break 'collections;
                     }
@@ -1262,6 +1315,43 @@ mod tests {
     }
 
     #[test]
+    fn secondary_index_keys_share_primary_key_allocation() {
+        let mut s = store();
+        s.create_index(
+            "people",
+            IndexMeta {
+                name: "by_name".into(),
+                field: "name".into(),
+                unique: false,
+                sparse: false,
+                created_at: 0,
+            },
+            ApplyMode::Live,
+        )
+        .unwrap();
+        put(
+            &mut s,
+            "a-long-document-key",
+            Json::obj().with("name", Json::str("Molly")),
+        )
+        .unwrap();
+
+        let collection = s.collection("people").unwrap();
+        let primary_key = collection
+            .docs
+            .get_key_value("a-long-document-key")
+            .unwrap()
+            .0;
+        let index_key = collection.indexes["by_name"].entries
+            [&Json::str("Molly").canonical_bytes()]
+            .iter()
+            .next()
+            .unwrap();
+
+        assert!(std::sync::Arc::ptr_eq(primary_key, index_key));
+    }
+
+    #[test]
     fn unique_index_rejects_duplicates() {
         let mut s = store();
         s.create_index(
@@ -1293,6 +1383,47 @@ mod tests {
     }
 
     #[test]
+    fn unique_conflicting_update_preserves_document_and_index_without_mutation() {
+        let mut s = store();
+        s.create_index(
+            "people",
+            IndexMeta {
+                name: "uniq_name".into(),
+                field: "name".into(),
+                unique: true,
+                sparse: false,
+                created_at: 0,
+            },
+            ApplyMode::Live,
+        )
+        .unwrap();
+        put(&mut s, "a", Json::obj().with("name", Json::str("Molly"))).unwrap();
+        put(&mut s, "b", Json::obj().with("name", Json::str("Tori"))).unwrap();
+
+        assert!(put(&mut s, "a", Json::obj().with("name", Json::str("Tori"))).is_err());
+
+        assert_eq!(
+            s.get("people", "a", 1000).unwrap().unwrap().value,
+            Json::obj().with("name", Json::str("Molly"))
+        );
+        let index = &s.collection("people").unwrap().indexes["uniq_name"];
+        assert_eq!(
+            index.entries[&Json::str("Molly").canonical_bytes()]
+                .iter()
+                .map(|key| key.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(
+            index.entries[&Json::str("Tori").canonical_bytes()]
+                .iter()
+                .map(|key| key.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
+    }
+
+    #[test]
     fn non_sparse_missing_value_is_removed_from_null_index() {
         let mut s = store();
         s.create_index(
@@ -1313,7 +1444,7 @@ mod tests {
         let index = &s.collection("people").unwrap().indexes["by_name"];
         let bucket = &index.entries[&Json::Null.canonical_bytes()];
         assert_eq!(
-            bucket.iter().map(String::as_str).collect::<Vec<_>>(),
+            bucket.iter().map(|key| key.as_ref()).collect::<Vec<_>>(),
             vec!["b"]
         );
     }
