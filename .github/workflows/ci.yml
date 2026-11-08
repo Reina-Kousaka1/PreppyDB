@@ -7,16 +7,28 @@ on:
   workflow_dispatch:
     inputs:
       run_mode:
-        description: "Choose the full CI suite or only the resource-isolation qualification"
+        description: "Choose full CI, isolation-only, or the separately approved bounded stress workflow"
         required: true
         type: choice
         options:
           - isolation-only
           - full-ci
+          - bounded-stress
         default: isolation-only
+      stress_approval:
+        description: "Explicitly authorize the bounded 1/10/25/50/100-client synthetic test (leave unchecked for isolation-only)"
+        required: false
+        type: boolean
+        default: false
+      isolation_run_id:
+        description: "Successful isolation-only Actions run ID for this exact commit (required only for a later bounded-stress dispatch)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -576,6 +588,7 @@ jobs:
           free_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
           test "$available_kib" -ge 4194304
           test "$free_kib" -ge 5242880
+
           echo "host_available_memory_kib=$available_kib"
           echo "runner_temp_free_kib=$free_kib"
 
@@ -592,7 +605,7 @@ jobs:
           python3 - <<'PY'
           import ast
           from pathlib import Path
-          for name in ("stress-isolation-check.py", "stress-load.py"):
+          for name in ("stress-isolation-check.py", "stress-load.py", "stress-sequence.py"):
               ast.parse(Path("scripts", name).read_text(encoding="utf-8"), filename=name)
               print(f"syntax ok: {name}")
           PY
@@ -674,17 +687,111 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  # This mode requires both a manual dispatch and an unchecked-by-default
+  # approval input. It repeats isolation qualification for the same commit
+  # before any synthetic load and never runs on push or pull_request events.
+  bounded-stress:
+    name: First controlled stress ladder (manual approval only)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_mode == 'bounded-stress' && inputs.stress_approval == true && github.ref == 'refs/heads/arena/146caad2-preppydb'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check isolated hosted runner capacity
+        run: |
+          set -euo pipefail
+          uname -a
+          docker info --format 'docker={{.ServerVersion}} storage={{.Driver}} cgroup={{.CgroupVersion}}'
+          available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+          free_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+          test "$available_kib" -ge 4194304
+          test "$free_kib" -ge 5242880
+
+      - name: Verify a prior successful isolation-only run for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALIFICATION_RUN_ID: ${{ inputs.isolation_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$QUALIFICATION_RUN_ID" =~ ^[0-9]+$ ]] || {
+            echo "A successful isolation-only Actions run ID is required." >&2
+            exit 1
+          }
+          RUN_JSON=$(gh run view "$QUALIFICATION_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json event,conclusion,headSha,headBranch,jobs)
+          printf '%s' "$RUN_JSON" | jq -e --arg sha "$GITHUB_SHA" \
+            --arg branch "$GITHUB_REF_NAME" '
+              .event == "workflow_dispatch" and
+              .conclusion == "success" and
+              .headSha == $sha and
+              .headBranch == $branch and
+              any(.jobs[]; .name == "Stress test isolation qualification (no load)" and .conclusion == "success")
+            ' >/dev/null
+          ARTIFACT_NAME="preppydb-stress-isolation-${GITHUB_SHA}-${QUALIFICATION_RUN_ID}"
+          ARTIFACT_DIR="$RUNNER_TEMP/prior-isolation"
+          mkdir -p "$ARTIFACT_DIR"
+          gh run download "$QUALIFICATION_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" --dir "$ARTIFACT_DIR"
+          python3 - "$ARTIFACT_DIR/preppydb-isolation-report.json" "$GITHUB_SHA" <<'PY'
+          import json, pathlib, sys
+          report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert report["status"] == "passed", report
+          assert report["test"] == "isolation-only", report
+          assert report["commit"] == sys.argv[2], report
+          assert report["load_test_started"] is False, report
+          assert report["checks"]["cgroup"]["memory_max_bytes"] == 2 * 1024**3, report
+          assert report["checks"]["cgroup"]["swap_max_bytes"] == 0, report
+          assert report["checks"]["cgroup"]["pids_max"] == 512, report
+          assert report["checks"]["cgroup"]["cpu_max"]["cores"] == 2, report
+          print("Prior same-commit isolation report verified.")
+          PY
+
+      - name: Build release server binary
+        run: cargo build --locked --release -p preppydb-server
+
+      - name: Verify scripts parse without running a workload
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          for name in ("stress-isolation-check.py", "stress-load.py", "stress-sequence.py"):
+              ast.parse(Path("scripts", name).read_text(encoding="utf-8"), filename=name)
+              print(f"syntax ok: {name}")
+          PY
+
+      - name: Qualify isolation, then run the bounded synthetic ladder
+        env:
+          PREPPYDB_COMMIT: ${{ github.sha }}
+          PREPPYDB_ENABLE_STRESS: I_APPROVE_BOUNDED_PREPPYDB_STRESS
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          echo "rustc=$(rustc --version)"
+          echo "cargo=$(cargo --version)"
+          PREPPYDB_COMMIT="$GITHUB_SHA" python3 scripts/stress-sequence.py
+
+      - name: Upload bounded stress report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-first-stress-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/preppydb-first-stress-report.json
+          if-no-files-found: ignore
+          retention-days: 30
+
   # --------------------------------------------------------------------- summary
   ci-status:
     name: CI status
     runs-on: ubuntu-22.04
-    needs: [linux-x86_64, windows-x86_64, linux-arm64, lua-client, docker-images, docker-persistence, stress-isolation]
+    needs: [linux-x86_64, windows-x86_64, linux-arm64, lua-client, docker-images, docker-persistence, stress-isolation, bounded-stress]
     if: always()
     steps:
       - name: Reject an unknown manual mode
-        if: github.event_name == 'workflow_dispatch' && inputs.run_mode != 'isolation-only' && inputs.run_mode != 'full-ci'
+        if: github.event_name == 'workflow_dispatch' && inputs.run_mode != 'isolation-only' && inputs.run_mode != 'full-ci' && inputs.run_mode != 'bounded-stress'
         run: |
-          echo "::error::Select isolation-only or full-ci."
+          echo "::error::Select isolation-only, full-ci, or bounded-stress."
           exit 1
 
       - name: Fail if any job failed

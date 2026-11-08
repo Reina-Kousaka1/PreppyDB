@@ -229,6 +229,9 @@ def main() -> int:
 
         if not args.load_script.is_file():
             raise RuntimeError("locked load generator is not mounted read-only")
+        gate_env = os.environ.copy()
+        gate_env.pop("PREPPYDB_ISOLATION_QUALIFIED_COMMIT", None)
+        gate_env.pop("PREPPYDB_ENABLE_STRESS", None)
         gated = subprocess.run(
             [
                 sys.executable,
@@ -244,6 +247,7 @@ def main() -> int:
             text=True,
             timeout=5,
             check=False,
+            env=gate_env,
         )
         if gated.returncode != 2 or "load is disabled" not in gated.stderr:
             raise RuntimeError("load generator did not fail closed before starting a server or load")

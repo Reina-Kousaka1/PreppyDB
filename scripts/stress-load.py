@@ -24,11 +24,11 @@ import urllib.request
 from typing import Any
 
 
-# Unlock only after a successful isolation-only workflow run has been independently
-# reviewed. The workflow in this commit never sets this value or invokes this file.
-QUALIFIED_COMMIT = ""
+# The workflow sets this only for the separately approved bounded-stress mode, and
+# only after its isolation check has passed for the same exact commit.
+QUALIFIED_COMMIT = os.environ.get("PREPPYDB_ISOLATION_QUALIFIED_COMMIT", "")
 ENABLE_PHRASE = "I_APPROVE_BOUNDED_PREPPYDB_STRESS"
-CLIENT_LEVELS = (1, 10, 50, 100, 250)
+CLIENT_LEVELS = (1, 10, 25, 50, 100)
 MEMORY_LIMIT_BYTES = 2 * 1024**3
 MEMORY_STOP_BYTES = int(MEMORY_LIMIT_BYTES * 0.80)
 DATA_LIMIT_BYTES = 512 * 1024**2
@@ -40,6 +40,7 @@ MAX_TOTAL_RUNTIME_SECONDS = 10 * 60
 MAX_DOCUMENTS = 2_000
 MAX_PAYLOAD_BYTES = 4_096
 PID_LIMIT = 512
+TASKS_STOP_COUNT = int(PID_LIMIT * 0.80)
 
 
 def cgroup_v2_dir() -> pathlib.Path:
@@ -135,6 +136,7 @@ def main() -> int:
     parser.add_argument("--payload-bytes", type=int, default=512)
     parser.add_argument("--duration-seconds", type=int, default=15)
     parser.add_argument("--seed", type=int, default=20261108)
+    parser.add_argument("--data-dir", type=pathlib.Path, default=pathlib.Path("/stress-data/database"))
     args = parser.parse_args()
 
     qualified = os.environ.get("PREPPYDB_ISOLATION_QUALIFIED_COMMIT", "")
@@ -185,7 +187,10 @@ def main() -> int:
     if not server.is_file() or not os.access(server, os.X_OK):
         parser.error("--server must be an executable release server binary")
     total_deadline = time.monotonic() + MAX_TOTAL_RUNTIME_SECONDS
-    data_dir = pathlib.Path("/stress-data") / "database"
+    data_root = pathlib.Path("/stress-data").resolve()
+    data_dir = args.data_dir.resolve()
+    if data_root not in data_dir.parents:
+        parser.error("--data-dir must be a new child directory of the bounded /stress-data tmpfs")
     data_dir.mkdir(parents=True, exist_ok=False)
     init = subprocess.run(
         [str(server), "--data-dir", str(data_dir), "--bootstrap-token", "synthetic-stress-only", "--init-only"],
@@ -292,8 +297,18 @@ def main() -> int:
                     last_progress = time.monotonic()
 
         started = time.monotonic()
-        cpu_start = int(read_kv(group / "cpu.stat").get("usage_usec", 0))
-        peak_memory = int((group / "memory.current").read_text().strip())
+        cpu_stats_start = read_kv(group / "cpu.stat")
+        cpu_start = int(cpu_stats_start.get("usage_usec", 0))
+        cpu_throttled_start = int(cpu_stats_start.get("nr_throttled", 0))
+        memory_peak_path = group / "memory.peak"
+        peak_memory = int(memory_peak_path.read_text().strip()) if memory_peak_path.is_file() else int((group / "memory.current").read_text().strip())
+        peak_tasks = int((group / "pids.current").read_text().strip())
+        tasks_peak_path = group / "pids.peak"
+        if tasks_peak_path.is_file():
+            peak_tasks = max(peak_tasks, int(tasks_peak_path.read_text().strip()))
+        if peak_memory >= MEMORY_STOP_BYTES:
+            stop_reason = "memory reached 80 percent of cgroup limit before workload"
+            stop.set()
         samples: list[dict[str, float | int]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.clients) as pool:
             futures = [pool.submit(worker, index) for index in range(args.clients)]
@@ -306,15 +321,27 @@ def main() -> int:
                 now = time.monotonic()
                 current_memory = int((group / "memory.current").read_text().strip())
                 peak_memory = max(peak_memory, current_memory)
+                if memory_peak_path.is_file():
+                    peak_memory = max(peak_memory, int(memory_peak_path.read_text().strip()))
+                peak_tasks = max(peak_tasks, int((group / "pids.current").read_text().strip()))
+                if tasks_peak_path.is_file():
+                    peak_tasks = max(peak_tasks, int(tasks_peak_path.read_text().strip()))
                 cpu_now = int(read_kv(group / "cpu.stat").get("usage_usec", 0))
                 cpu_pct = 100 * (cpu_now - previous_cpu) / max(1, (now - previous_sample) * 1_000_000 * CPU_LIMIT)
-                samples.append({"elapsed_seconds": now - started, "memory_bytes": current_memory, "cpu_percent_of_limit": cpu_pct})
+                samples.append({
+                    "elapsed_seconds": now - started,
+                    "memory_bytes": current_memory,
+                    "cpu_percent_of_limit": cpu_pct,
+                    "tasks": int((group / "pids.current").read_text().strip()),
+                })
                 previous_sample, previous_cpu = now, cpu_now
-                if current_memory >= MEMORY_STOP_BYTES:
+                if peak_memory >= MEMORY_STOP_BYTES:
                     stop_reason = "memory reached 80 percent of cgroup limit"
+                elif peak_tasks >= TASKS_STOP_COUNT:
+                    stop_reason = "task count reached 80 percent of cgroup pids limit"
                 elif shutil.disk_usage("/stress-data").free < DISK_RESERVE_BYTES:
                     stop_reason = "temporary data free space fell below 128 MiB"
-                elif len(latencies) >= 50 and (percentile(latencies[-100:], 0.95) or 0) > P95_STOP_SECONDS:
+                elif latencies and (percentile(latencies[-100:], 0.95) or 0) > P95_STOP_SECONDS:
                     stop_reason = "p95 latency exceeded 1 second"
                 elif len(latencies) > 0 and len(errors) / len(latencies) > ERROR_STOP_RATE:
                     stop_reason = "error rate exceeded 1 percent"
@@ -333,6 +360,23 @@ def main() -> int:
                 future.result(timeout=5)
 
         elapsed = time.monotonic() - started
+        integrity_before_recovery = verify_documents(base, token, args.documents, payload)
+        stop_server(server_process)
+        server_process = None
+        server_process = subprocess.Popen(
+            [str(server), "--data-dir", str(data_dir), "--listen", "127.0.0.1:17077", "--profile", "tiny"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        wait_ready(server_process, base)
+        integrity_after_recovery = verify_documents(base, token, args.documents, payload)
+        cpu_final = read_kv(group / "cpu.stat")
+        if memory_peak_path.is_file():
+            peak_memory = max(peak_memory, int(memory_peak_path.read_text().strip()))
+        if tasks_peak_path.is_file():
+            peak_tasks = max(peak_tasks, int(tasks_peak_path.read_text().strip()))
         total = sum(counts.values()) + len(errors)
         report = {
             "status": "aborted_at_threshold" if stop_reason else "completed",
@@ -344,6 +388,12 @@ def main() -> int:
             "seed": args.seed,
             "elapsed_seconds": round(elapsed, 3),
             "requests": {**counts, "errors": len(errors), "total": total},
+            "seeded_documents": args.documents,
+            "integrity_verification_reads": integrity_before_recovery["verified_documents"]
+            + integrity_after_recovery["verified_documents"],
+            "integrity_before_recovery": integrity_before_recovery,
+            "integrity_after_recovery": integrity_after_recovery,
+            "confirmed_write_operations": counts["write"],
             "requests_per_second": round(total / max(elapsed, 0.001), 2),
             "error_rate": round(len(errors) / max(total, 1), 5),
             "latency_ms": {
@@ -353,24 +403,48 @@ def main() -> int:
             },
             "resources": {
                 "peak_cgroup_memory_mb": round(peak_memory / 1024**2, 2),
+                "peak_tasks": peak_tasks,
+                "cpu_throttled_periods_delta": cpu_final.get("nr_throttled", 0) - cpu_throttled_start,
                 "cpu_percent_of_two_core_limit_samples": samples,
                 "data_used_mb": round(shutil.disk_usage("/stress-data").used / 1024**2, 2),
             },
             "sample_errors": errors[:5],
         }
         print(json.dumps(report, sort_keys=True))
-        return 0
+        return 0 if stop_reason is None and integrity_after_recovery["passed"] else 2
     finally:
-        if server_process.poll() is None:
-            try:
-                os.killpg(server_process.pid, signal.SIGTERM)
-                server_process.wait(timeout=10)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(server_process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                server_process.wait(timeout=2)
+        if server_process is not None and server_process.poll() is None:
+            stop_server(server_process)
+
+
+def stop_server(process: subprocess.Popen[bytes] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=10)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=2)
+
+
+def verify_documents(base: str, token: str, documents: int, payload: str) -> dict[str, Any]:
+    for index in range(documents):
+        key = f"doc-{index:06d}"
+        status, raw = request(base, token, "GET", f"/v1/collections/stress/documents/{key}")
+        if status != 200:
+            raise RuntimeError(f"integrity verification failed for {key}: HTTP {status}")
+        try:
+            data = json.loads(raw).get("data", {})
+            value = data.get("value", {})
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            raise RuntimeError(f"integrity verification returned invalid JSON for {key}") from None
+        if data.get("key") != key or value.get("group") != index % 16 or value.get("payload") != payload:
+            raise RuntimeError(f"integrity verification found mismatched content for {key}")
+    return {"verified_documents": documents, "passed": True}
 
 
 def read_kv(path: pathlib.Path) -> dict[str, int]:

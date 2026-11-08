@@ -8,12 +8,12 @@ request events skip this job. The job builds the release server and performs a
 short container-isolation self-test; it does **not** start PreppyDB with a data
 load, and it does not invoke the load generator.
 
-The prepared generator at `scripts/stress-load.py` is locked. It requires the
-exact qualified source commit, a matching qualification value, and an explicit
-approval phrase. The workflow supplies none of the qualification or approval
-values. Do not unlock it based on a successful build or a passing regular CI
-run. Review the isolation artifact first and make a separate decision to enable
-load testing.
+The prepared generator at `scripts/stress-load.py` requires the exact source
+commit, a matching qualification value, and an explicit approval phrase. The
+isolation-only mode supplies none of the approval values. The bounded-stress
+mode is separately manual, requires an unchecked-by-default approval input and
+the successful isolation-only run ID for the same commit, and repeats the
+isolation probe before starting load. A regular CI pass alone never enables load.
 
 ## Manual isolation qualification
 
@@ -29,8 +29,22 @@ load testing.
 The existing `CI` workflow already supports `workflow_dispatch` on the
 default branch. Select the PR branch so the run uses that branch's workflow
 version and the branch guard allows only its isolation-only job to start.
-The PR itself must remain open and unmerged; do not push this change if doing
-so would create an unapproved Vercel preview.
+The PR itself must remain open and unmerged. Push workflow changes only when the
+resulting PR preview is explicitly authorized.
+
+## First controlled load (separate approval)
+
+The workflow has a separate `bounded-stress` mode and an unchecked approval
+box. Leaving the box unchecked starts no load. When deliberately approved in a
+later dispatch, the job verifies the successful isolation-only report for that
+exact commit, then reruns the isolation checker for the same commit.
+Only after that check passes does it run the serial client ladder. The current
+ladder is 1, 10, 25, 50, and 100 clients; 250 is excluded from this first test.
+Each level gets a fresh, independently capped container and synthetic database,
+with a 15-second measurement window and a 170-second overall watchdog. A
+threshold stop ends the ladder and still triggers a document-integrity and
+restart/recovery check for that stage. The approval box must remain unchecked
+for an isolation-only dispatch.
 
 ## Isolation contract
 
@@ -73,12 +87,16 @@ cancellation; GitHub destroys the hosted runner after the job.
 
 ## Prepared load generator
 
-`scripts/stress-load.py` supports the planned client levels 1, 10, 50, 100 and
-250; read, write, mixed and indexed-query operations; deterministic synthetic
-documents; request rate, p50/p95/p99 latency, error-rate, cgroup memory, CPU,
-and temporary-disk measurements. Its safety stops include:
+`scripts/stress-load.py` supports client levels 1, 10, 25, 50 and 100; read,
+write, mixed and indexed-query operations; deterministic synthetic documents;
+request rate, p50/p95/p99 latency, error-rate, cgroup memory, CPU throttling,
+task counts and temporary-disk measurements. The first controlled ladder uses
+mixed operations against 500 synthetic documents with 512-byte payloads. After
+each stage it verifies every document, restarts the server on the same temporary
+database, and verifies the documents again. Its safety stops include:
 
 - 80% of the 2 GiB memory cap.
+- 80% of the 512-task cgroup cap.
 - Less than 128 MiB free in the bounded data tmpfs.
 - p95 latency over one second.
 - Error rate over 1%.
@@ -86,12 +104,13 @@ and temporary-disk measurements. Its safety stops include:
 - CPU above 95% of the two-core quota for ten seconds.
 - The configured per-run duration or outer watchdog.
 
-The generator is intentionally not invoked by Actions and refuses to start until
-the source contains an explicitly reviewed qualified commit and the caller
-supplies the separate approval phrase. Do not use it until the isolation
-artifact has passed and has been reviewed. Qualification proves the container
-limits for that runner execution; it does not establish a production capacity
-or justify an unbounded soak.
+The generator refuses to start unless the source and qualification commits
+match and the manual workflow supplies its approval gate. The host-side ladder
+runner also checks the approval input, inspects each Docker configuration before
+starting it, and refuses to continue if the initial isolation-only probe fails.
+The normal isolation-only path never supplies the approval gate or invokes the
+ladder. Qualification proves containment for that runner execution; it does not
+establish production capacity or justify an unbounded soak.
 
 ## Artifacts and interpretation
 
