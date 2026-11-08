@@ -15,12 +15,12 @@
 use crate::catalog::CollectionMeta;
 use crate::error::{DbError, Result};
 use crate::store::{ApplyMode, Doc, Limits, Store};
-use preppydb_crypto::crc32c;
+use preppydb_crypto::crc32c::{crc32c, Crc32c};
 use preppydb_crypto::sha256::{sha256, Sha256};
 use preppydb_json::Json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const SNAPSHOT_MAGIC: &[u8; 9] = b"PPDBSNAP1";
@@ -187,32 +187,107 @@ pub fn write_snapshot_from_store(
     )
 }
 
-/// Serialize a document frame without cloning its complete JSON value into the
-/// temporary `Doc::to_json()` object. Field order matches the ordered `Json::Object`
-/// representation, preserving the existing on-disk bytes.
-fn snapshot_doc_payload(collection: &str, key: &str, doc: &Doc) -> String {
-    let mut payload = String::new();
-    payload.push_str("{\"c\":");
-    Json::str(collection).write_compact(&mut payload);
-    payload.push_str(",\"d\":{\"created_at\":");
-    Json::int(doc.created_at).write_compact(&mut payload);
-    payload.push_str(",\"expires_at\":");
+/// Stream one document payload directly to its frame without a per-document encoded
+/// `String` or cloned `Doc::to_json()` value. Field order matches `Json::Object`.
+fn write_snapshot_doc_payload<W: Write>(
+    out: &mut W,
+    collection: &str,
+    key: &str,
+    doc: &Doc,
+) -> std::io::Result<()> {
+    out.write_all(b"{\"c\":")?;
+    Json::str(collection).write_compact_to(out)?;
+    out.write_all(b",\"d\":{\"created_at\":")?;
+    Json::int(doc.created_at).write_compact_to(out)?;
+    out.write_all(b",\"expires_at\":")?;
     doc.expires_at
         .map(Json::int)
         .unwrap_or(Json::Null)
-        .write_compact(&mut payload);
-    payload.push_str(",\"revision\":");
-    Json::uint(doc.revision).write_compact(&mut payload);
-    payload.push_str(",\"updated_at\":");
-    Json::int(doc.updated_at).write_compact(&mut payload);
-    payload.push_str(",\"value\":");
-    doc.value.write_compact(&mut payload);
-    payload.push_str(",\"version\":");
-    Json::uint(doc.version).write_compact(&mut payload);
-    payload.push_str("},\"k\":");
-    Json::str(key).write_compact(&mut payload);
-    payload.push_str(",\"t\":\"doc\"}");
-    payload
+        .write_compact_to(out)?;
+    out.write_all(b",\"revision\":")?;
+    Json::uint(doc.revision).write_compact_to(out)?;
+    out.write_all(b",\"updated_at\":")?;
+    Json::int(doc.updated_at).write_compact_to(out)?;
+    out.write_all(b",\"value\":")?;
+    doc.value.write_compact_to(out)?;
+    out.write_all(b",\"version\":")?;
+    Json::uint(doc.version).write_compact_to(out)?;
+    out.write_all(b"},\"k\":")?;
+    Json::str(key).write_compact_to(out)?;
+    out.write_all(b",\"t\":\"doc\"}")
+}
+
+struct FramePayloadWriter<'a, W> {
+    inner: &'a mut W,
+    bytes: u64,
+    checksum: Crc32c,
+}
+
+impl<'a, W> FramePayloadWriter<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            bytes: 0,
+            checksum: Crc32c::new(),
+        }
+    }
+}
+
+impl<W: Write> Write for FramePayloadWriter<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        let next = self.bytes.checked_add(written as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "frame length overflow")
+        })?;
+        self.checksum.update(&buffer[..written]);
+        self.bytes = next;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_document_frame<W: Write + Seek>(
+    writer: &mut W,
+    collection: &str,
+    key: &str,
+    doc: &Doc,
+    bytes: &mut u64,
+) -> Result<()> {
+    let frame_start = writer
+        .stream_position()
+        .map_err(|err| DbError::io("locating snapshot frame", err))?;
+    writer
+        .write_all(&[0; 8])
+        .map_err(|err| DbError::io("reserving snapshot frame header", err))?;
+
+    let (payload_bytes, checksum) = {
+        let mut payload = FramePayloadWriter::new(writer);
+        write_snapshot_doc_payload(&mut payload, collection, key, doc)
+            .map_err(|err| DbError::io("writing snapshot document", err))?;
+        (payload.bytes, payload.checksum.finish())
+    };
+    let payload_len = checked_frame_len(usize::try_from(payload_bytes).unwrap_or(usize::MAX))?;
+    let payload_end = writer
+        .stream_position()
+        .map_err(|err| DbError::io("locating snapshot frame end", err))?;
+    writer
+        .seek(SeekFrom::Start(frame_start))
+        .and_then(|_| writer.write_all(&payload_len.to_le_bytes()))
+        .and_then(|_| writer.write_all(&checksum.to_le_bytes()))
+        .and_then(|_| writer.seek(SeekFrom::Start(payload_end)).map(|_| ()))
+        .map_err(|err| DbError::io("publishing snapshot frame header", err))?;
+    *bytes = bytes
+        .checked_add(payload_bytes)
+        .and_then(|total| total.checked_add(8))
+        .ok_or(DbError::LimitExceeded {
+            limit: "snapshot_file_bytes",
+            max: u64::MAX,
+            actual: u64::MAX,
+        })?;
+    Ok(())
 }
 
 fn write_snapshot_iter<'a, I>(
@@ -259,7 +334,7 @@ where
         }
     }
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -269,7 +344,6 @@ where
         .open(&tmp_path)
         .map_err(|err| DbError::io(format!("creating {}", tmp_path.display()), err))?;
     let mut writer = BufWriter::new(file);
-    let mut body_hasher = Sha256::new();
     let mut bytes: u64 = 0;
 
     writer
@@ -284,63 +358,71 @@ where
         .write_all(header_bytes)
         .map_err(|err| DbError::io("writing snapshot header", err))?;
     bytes += 4 + header_bytes.len() as u64;
+    let body_start = writer
+        .stream_position()
+        .map_err(|err| DbError::io("locating snapshot body", err))?;
 
-    let write_frame = |writer: &mut BufWriter<File>,
-                       hasher: &mut Sha256,
-                       payload: &[u8],
-                       bytes: &mut u64|
-     -> Result<()> {
-        let payload_len = checked_frame_len(payload.len())?;
-        let len_bytes = payload_len.to_le_bytes();
-        let crc_bytes = crc32c(payload, 0).to_le_bytes();
-        writer
-            .write_all(&len_bytes)
-            .and_then(|()| writer.write_all(&crc_bytes))
-            .and_then(|()| writer.write_all(payload))
-            .map_err(|err| DbError::io("writing snapshot frame", err))?;
-        hasher.update(&len_bytes);
-        hasher.update(&crc_bytes);
-        hasher.update(payload);
-        *bytes += payload_len as u64 + 8;
-        Ok(())
-    };
+    let write_frame =
+        |writer: &mut BufWriter<File>, payload: &[u8], bytes: &mut u64| -> Result<()> {
+            let payload_len = checked_frame_len(payload.len())?;
+            let len_bytes = payload_len.to_le_bytes();
+            let crc_bytes = crc32c(payload, 0).to_le_bytes();
+            writer
+                .write_all(&len_bytes)
+                .and_then(|()| writer.write_all(&crc_bytes))
+                .and_then(|()| writer.write_all(payload))
+                .map_err(|err| DbError::io("writing snapshot frame", err))?;
+            *bytes += payload_len as u64 + 8;
+            Ok(())
+        };
 
     for (meta, docs) in collections {
         let payload = Json::obj()
             .with("t", Json::str("coll"))
             .with("meta", meta.to_json())
             .to_string();
-        write_frame(
-            &mut writer,
-            &mut body_hasher,
-            payload.as_bytes(),
-            &mut bytes,
-        )?;
+        write_frame(&mut writer, payload.as_bytes(), &mut bytes)?;
         for (key, doc) in docs {
-            let payload = snapshot_doc_payload(&meta.name, key, doc);
-            write_frame(
-                &mut writer,
-                &mut body_hasher,
-                payload.as_bytes(),
-                &mut bytes,
-            )?;
+            write_document_frame(&mut writer, &meta.name, key, doc, &mut bytes)?;
         }
     }
 
-    let body_digest = body_hasher.finish();
-    writer
-        .write_all(&FOOTER_MARKER.to_le_bytes())
-        .map_err(|err| DbError::io("writing snapshot footer", err))?;
-    writer
-        .write_all(&body_digest)
-        .map_err(|err| DbError::io("writing snapshot digest", err))?;
-    bytes += 4 + 32;
+    let body_end = writer
+        .stream_position()
+        .map_err(|err| DbError::io("locating snapshot body end", err))?;
     writer
         .flush()
-        .map_err(|err| DbError::io("flushing snapshot", err))?;
-    let file = writer
+        .map_err(|err| DbError::io("flushing snapshot frames", err))?;
+    let mut file = writer
         .into_inner()
-        .map_err(|err| DbError::io("flushing snapshot", err.into_error()))?;
+        .map_err(|err| DbError::io("flushing snapshot frames", err.into_error()))?;
+    file.seek(SeekFrom::Start(body_start))
+        .map_err(|err| DbError::io("seeking to snapshot body for checksum", err))?;
+    let mut body_hasher = Sha256::new();
+    let mut remaining = body_end.saturating_sub(body_start);
+    let mut checksum_buffer = [0u8; 16 * 1024];
+    while remaining > 0 {
+        let read_len = usize::try_from(remaining.min(checksum_buffer.len() as u64))
+            .unwrap_or(checksum_buffer.len());
+        let read = file
+            .read(&mut checksum_buffer[..read_len])
+            .map_err(|err| DbError::io("reading snapshot body for checksum", err))?;
+        if read == 0 {
+            return Err(DbError::corrupt(
+                "snapshot body",
+                "unexpected end while calculating checksum",
+            ));
+        }
+        body_hasher.update(&checksum_buffer[..read]);
+        remaining -= read as u64;
+    }
+    let body_digest = body_hasher.finish();
+    file.seek(SeekFrom::Start(body_end))
+        .map_err(|err| DbError::io("seeking to snapshot footer", err))?;
+    file.write_all(&FOOTER_MARKER.to_le_bytes())
+        .and_then(|()| file.write_all(&body_digest))
+        .map_err(|err| DbError::io("writing snapshot footer", err))?;
+    bytes += 4 + 32;
     file.sync_all()
         .map_err(|err| DbError::io("syncing snapshot", err))?;
     drop(file);
@@ -786,7 +868,53 @@ mod tests {
             .with("d", doc.to_json())
             .to_string();
 
-        assert_eq!(snapshot_doc_payload("profiles", "key/\"🌊", &doc), expected);
+        let mut streamed = Vec::new();
+        write_snapshot_doc_payload(&mut streamed, "profiles", "key/\"🌊", &doc).unwrap();
+        assert_eq!(String::from_utf8(streamed).unwrap(), expected);
+    }
+
+    #[test]
+    fn streaming_snapshot_writer_preserves_legacy_file_bytes() {
+        let dir = tempdir("legacy-byte-identity");
+        let path = dir.join("snapshot.pdb");
+        let collections = sample();
+        let written = write_snapshot(&path, 7, 11, 22, &collections).unwrap();
+
+        let header = written.header.to_json().to_string();
+        let mut body = Vec::new();
+        let mut push_frame = |payload: &[u8]| {
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(&crc32c(payload, 0).to_le_bytes());
+            body.extend_from_slice(payload);
+        };
+        let (meta, docs) = &collections[0];
+        let collection_payload = Json::obj()
+            .with("t", Json::str("coll"))
+            .with("meta", meta.to_json())
+            .to_string();
+        push_frame(collection_payload.as_bytes());
+        for (key, doc) in docs {
+            let legacy_doc_payload = Json::obj()
+                .with("t", Json::str("doc"))
+                .with("c", Json::str(meta.name.clone()))
+                .with("k", Json::str(key))
+                .with("d", doc.to_json())
+                .to_string();
+            push_frame(legacy_doc_payload.as_bytes());
+        }
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(SNAPSHOT_MAGIC);
+        expected.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        expected.extend_from_slice(header.as_bytes());
+        expected.extend_from_slice(&body);
+        expected.extend_from_slice(&FOOTER_MARKER.to_le_bytes());
+        let digest = sha256(&body);
+        expected.extend_from_slice(&digest);
+
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert_eq!(written.body_sha256, preppydb_crypto::hex_encode(&digest));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

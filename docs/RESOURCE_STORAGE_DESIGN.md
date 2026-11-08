@@ -29,10 +29,13 @@ ownership of the old value without copying it. Atomic multi-operation batches re
 old documents needed for rollback, subject to the existing undo-byte budget.
 
 Checkpointing serializes from the locked store without cloning it. Snapshot document
-frames now serialize `Doc.value` by reference rather than cloning it into an intermediate
-`Json` document. The remaining per-frame encoded string is bounded by the serialized
-document limit plus bounded collection/key/metadata overhead. A byte-identity regression
-test compares it with the previous serializer. Snapshot recovery
+frames stream JSON directly through the snapshot writer: checkpointing no longer clones
+`Doc.value` into a `Doc::to_json()` object or materializes a complete encoded document
+string. A fixed 16 KiB buffer is used for the final streaming body-hash pass; the frame
+length and CRC are backpatched without changing the snapshot bytes. This trades one
+sequential read of the just-written snapshot body for less transient per-document RAM.
+Byte-identity tests compare the streamed payload and complete file with the prior format.
+Snapshot recovery
 decodes frames directly into a private `Store`, avoiding an additional full-document
 vector. Before `f0eb9c3`, `Engine::verify` also reconstructed every full document in a
 second `Store`, making verification approach the memory cost of two stores. At `f0eb9c3`,
@@ -112,23 +115,26 @@ remain necessary before making broader performance claims.
 
 All measurements are synthetic WSL2 x86-64 observations, not Raspberry Pi qualification.
 
-### Checkpoint serializer allocation comparison
+### Streamed checkpoint frame allocation comparison
 
-The snapshot serializer change was separately measured on Ubuntu WSL2 x86-64 with the
-same resource benchmark driver and a single 900 KiB ASCII document. The baseline release
-binary was built from clean commit `9cf324a`; the candidate release binary used that same
-source plus the uncommitted direct-by-reference snapshot serializer change. Each binary
-was run three times with the standard profile, one-document batch, and a one-second idle
-sample. The checkpoint-phase kernel high-water samples were 13.38, 13.52, and 13.49 MiB
-for baseline, versus 12.14, 12.16, and 12.20 MiB for the candidate. Median checkpoint
-high-water fell from 13.49 MiB to 12.16 MiB (about 1.33 MiB, or 9.9%).
+The streamed snapshot writer was measured on Ubuntu WSL2 x86-64 with the same benchmark
+driver and one 900 KiB ASCII document. The baseline release binary was built from clean
+commit `0aa628f` (the preceding direct-by-reference serializer); the candidate adds
+streamed JSON frames and fixed-buffer body hashing. Each binary was run three times with
+the standard profile, one-document batch, and a one-second idle sample. Checkpoint-phase
+kernel high-water samples were 12.13, 12.17, and 12.15 MiB for baseline, versus 11.27 MiB
+in all three candidate runs. Median checkpoint high-water fell from 12.15 MiB to 11.27 MiB
+(about 0.88 MiB, or 7.2%).
 
-Whole-process peak high-water did not show a consistent reduction: median values were
-18.57 MiB for baseline and 18.47 MiB for the candidate, with overlapping run-to-run
-variation. This change therefore supports a narrower checkpoint-allocation result; it
-does not establish lower total peak memory, and the synthetic single-host comparison is
-not a Raspberry Pi qualification. The benchmark accepts `--payload-bytes` so this
-checkpoint case can be reproduced without modifying the harness.
+Median checkpoint duration was 22.7 ms for baseline and 22.7 ms for the candidate; sampled
+whole-run process CPU was 0.04 s in both medians. Whole-process high-water was essentially
+unchanged (18.42 MiB baseline, 18.45 MiB candidate), because later phases dominate the
+peak. This establishes a narrow checkpoint-allocation reduction on one synthetic host,
+not lower total peak memory or Raspberry Pi qualification. The benchmark accepts
+`--payload-bytes` so the case can be reproduced without modifying the harness.
+At the parser's 1 MiB per-string limit, a separate single paired run measured 13.25 MiB
+versus 12.25 MiB checkpoint-phase high-water, with checkpoint times of 22.7 ms and
+22.8 ms. This boundary run is a smoke measurement, not an additional repeated estimate.
 
 The bounded Tiny harness was also run against the release binary from `f0eb9c3` with a
 900-byte payload, seed `20261108`, one secondary index, and a 3-second idle observation.

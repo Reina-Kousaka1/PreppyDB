@@ -511,6 +511,40 @@ impl Json {
         }
     }
 
+    /// Serialize compact JSON directly to an I/O sink without materializing the
+    /// complete encoded value in an intermediate `String`.
+    pub fn write_compact_to<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
+        match self {
+            Json::Null => out.write_all(b"null"),
+            Json::Bool(true) => out.write_all(b"true"),
+            Json::Bool(false) => out.write_all(b"false"),
+            Json::Number(number) => out.write_all(number.to_string().as_bytes()),
+            Json::String(value) => write_escaped_to(value, out),
+            Json::Array(items) => {
+                out.write_all(b"[")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.write_all(b",")?;
+                    }
+                    item.write_compact_to(out)?;
+                }
+                out.write_all(b"]")
+            }
+            Json::Object(map) => {
+                out.write_all(b"{")?;
+                for (index, (key, value)) in map.iter().enumerate() {
+                    if index > 0 {
+                        out.write_all(b",")?;
+                    }
+                    write_escaped_to(key, out)?;
+                    out.write_all(b":")?;
+                    value.write_compact_to(out)?;
+                }
+                out.write_all(b"}")
+            }
+        }
+    }
+
     pub fn write_pretty(&self, out: &mut String, indent: usize) {
         match self {
             Json::Array(items) if !items.is_empty() => {
@@ -572,6 +606,43 @@ fn write_escaped(text: &str, out: &mut String) {
         }
     }
     out.push('"');
+}
+
+fn write_escaped_to<W: std::io::Write>(text: &str, out: &mut W) -> std::io::Result<()> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.write_all(b"\"")?;
+    let bytes = text.as_bytes();
+    let mut run_start = 0;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let escaped: Option<&[u8]> = match byte {
+            b'"' => Some(b"\\\""),
+            b'\\' => Some(b"\\\\"),
+            b'\n' => Some(b"\\n"),
+            b'\r' => Some(b"\\r"),
+            b'\t' => Some(b"\\t"),
+            0x08 => Some(b"\\b"),
+            0x0c => Some(b"\\f"),
+            _ => None,
+        };
+        if let Some(escaped) = escaped {
+            out.write_all(&bytes[run_start..index])?;
+            out.write_all(escaped)?;
+            run_start = index + 1;
+        } else if byte < 0x20 {
+            out.write_all(&bytes[run_start..index])?;
+            out.write_all(&[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX[(byte >> 4) as usize],
+                HEX[(byte & 0x0f) as usize],
+            ])?;
+            run_start = index + 1;
+        }
+    }
+    out.write_all(&bytes[run_start..])?;
+    out.write_all(b"\"")
 }
 
 impl fmt::Display for Json {
@@ -653,6 +724,25 @@ impl From<Vec<Json>> for Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn io_compact_serialization_matches_string_serializer() {
+        let value = Json::obj()
+            .with(
+                "escaped\"field",
+                Json::str("quote\" slash\\ line\n tab\t\u{0001} 🌊"),
+            )
+            .with(
+                "nested",
+                Json::array(vec![Json::Null, Json::Bool(true), Json::int(-12)]),
+            );
+        let expected = value.to_string();
+        let mut output = Vec::new();
+
+        value.write_compact_to(&mut output).unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
 
     #[test]
     fn path_parsing() {
