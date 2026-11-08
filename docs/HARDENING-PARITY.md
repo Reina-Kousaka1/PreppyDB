@@ -1,7 +1,7 @@
 # PreppyDB / SeaWorld hardening parity
 
 This comparison uses SeaWorld DB main at `d6589e61564c91e2e013df69a98d0544e3026032`
-and PreppyDB PR #1 at `0901f5692ef29e98172516ad2e0cc5de77661940`, inspected on
+and PreppyDB PR #1 at `aaeeeaf288a03cd12909341633cfc92d1c79cba9`, inspected on
 2026-11-08. SeaWorld is a read-only reference; no SeaWorld files were changed.
 
 This is an engineering comparison, not a production-readiness declaration. CI proves
@@ -25,20 +25,17 @@ process.
 
 ## Current qualification snapshot
 
-- Refreshed on 2026-11-08 for code revision `0901f5692ef29e98172516ad2e0cc5de77661940`.
+- Refreshed on 2026-11-08 for code revision `aaeeeaf288a03cd12909341633cfc92d1c79cba9`.
   The comparison table reflects the current PreppyDB PR head and the SeaWorld main
   revision stated at the top.
 - PR #1 remains open and not draft. GitHub reports `mergeable=true`; that is merge
   mechanics, not a finding-closure or independent-review decision.
-- CI run [#119, attempt 2](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42434067554)
-  completed successfully for Linux x86-64, Windows x86-64, ARM64/QEMU, Lua/Luvit, Docker
-  image builds, Docker persistence, and the aggregate status. Vercel also reports
-  success. Attempt 1 had a Windows PowerShell smoke-test connection reset
-  (SocketException 10053) during collection creation. Attempt 2 reran the failed Windows
-  job; its tests, Ruby bridge, release build and smoke test all passed. Linux x86-64,
-  ARM64/QEMU, Lua/Luvit, Docker image, Docker persistence, and aggregate jobs also passed.
-  This qualifies the checked-in code at `0901f56` for those CI environments; it does not
-  prove physical Raspberry Pi or universal power-loss behavior.
+- CI run [#134](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42502774832)
+  completed successfully for this exact head: Linux x86-64, Windows x86-64, ARM64/QEMU,
+  Lua/Luvit, Docker image builds, Docker persistence, and aggregate status. This qualifies
+  the tested jobs for `aaeeeaf`; it does not prove physical Raspberry Pi behavior or
+  universal power-loss durability. The current ARM64 CI artifact is commit-named and
+  expires on 2026-12-08; it is not a stable release channel.
 - The execution plan classifies WAL atomicity, WAL recovery, Windows manifest behavior,
   backup/restore, HTTP, authentication, pricing audit, clients, Ruby/Lua runtime paths,
   platform qualification, and performance qualification as `PARTIAL`.
@@ -57,6 +54,27 @@ process.
 - SeaWorld main remains at `d6589e61564c91e2e013df69a98d0544e3026032`; that commit only
   changes Dependabot configuration, so it does not alter the compared engine behavior.
   The SeaWorld engine CI evidence remains from the preceding engine change.
+
+## Merge-readiness decisions
+
+### A. Experimental merge to `main`
+
+**Recommendation: keep PR #1 blocked for now.** The tested CI matrix is green, but the
+original review inventory is incomplete (15 findings were reported and only 14 can be
+traced), no independent final review exists, and several durability/fault-injection
+boundaries remain open. “Experimental” labeling would not resolve those evidence gaps.
+Do not merge until the missing finding is recovered or explicitly resolved by its source,
+and an independent reviewer has checked the remaining high-risk storage and auth paths.
+
+### B. Production readiness
+
+**Recommendation: not production-ready.** No physical Pi 4B qualification or 100,000-row
+resource run has been recorded; the ARM64 results are QEMU-only and the artifact is
+temporary. Windows directory-entry/power-loss behavior is not universally guaranteed,
+restore can require manual fail-closed recovery after interruption, the pricing audit
+and database are not one atomic transaction, and a valid audit-log suffix removal has no
+external trusted anchor. These are explicit qualification limits, not failures hidden by
+the green CI result.
 
 ## Decisions for this parity effort
 

@@ -2,6 +2,32 @@
 
 This is a living plan, not a claim that the database is ready. Work only on `arena/146caad2-preppydb`; preserve all existing work. Never merge, force-push, release, or deploy as part of this mission.
 
+## Latest qualification snapshot (2026-11-08)
+
+- PR #1 is still open, not draft, and GitHub reports it mergeable. Its current head is
+  `aaeeeaf288a03cd12909341633cfc92d1c79cba9`; no local code changes were present in the
+  fresh checkout before this documentation update. There are no submitted PR reviews or
+  inline review threads.
+- GitHub Actions run [#134](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42502774832)
+  passed on that exact head: Linux x86-64, Windows x86-64, ARM64/QEMU, Lua/Luvit, Docker
+  image builds, Docker persistence, and aggregate status. This is CI evidence only; QEMU
+  does not qualify Raspberry Pi hardware or power-loss behavior.
+- Local `cargo fmt --all -- --check` passed. Local Clippy/test compilation is blocked
+  because this Windows host lacks MSVC `link.exe`; the Python launcher is unavailable.
+- The existing resource evidence reaches 10,000 synthetic documents on WSL2 x86-64. A
+  three-run 900 KiB single-document experiment measured a 7.2% lower checkpoint-phase
+  high-water mark for the streamed snapshot writer in `aaeeeaf`; whole-process peak did
+  not show a consistent reduction. A separate 1 MiB boundary smoke run also showed a
+  lower checkpoint-phase peak. No 100,000-document result or
+  physical Pi 4B test exists, and the proposed 768 MiB target remains unproven.
+- Experimental `main` merge: **blocked** pending recovery or source-backed resolution of
+  the missing 15th review finding and an independent review of the remaining high-risk
+  storage/auth paths. Production readiness: **not ready**, with physical Pi, Windows
+  directory/power-loss, restore interruption, audit atomicity/anchor, and broader fault
+  matrix gates still open.
+- The sections below record earlier checks and decisions chronologically; their old
+  commit SHAs and CI run numbers are not the current qualification state.
+
 ## Baseline and evidence
 
 - PR #1 is open. Head `5687a49b759d06ad1ec31a66374448ef2fdcc8a0`; base `20e3b591acca52ae20ffefe3cc1075ec15034ad1` (verified at plan creation).

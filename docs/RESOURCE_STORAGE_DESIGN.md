@@ -1,5 +1,16 @@
 # Bounded-Memory Storage Design (Proposal)
 
+## Current evidence (2026-11-08)
+
+The current PR head is `aaeeeaf288a03cd12909341633cfc92d1c79cba9`; its full GitHub CI
+run [#134](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42502774832) passed
+Linux x86-64, Windows x86-64, ARM64/QEMU, Lua/Luvit, and Docker jobs. The current branch
+has no measured 100,000-document run. Existing resource measurements below are synthetic
+WSL2 x86-64 results through 10,000 documents, plus narrowly scoped checkpoint serializer
+comparisons on single 900 KiB and 1 MiB documents. The exact-head ARM64 archive is
+available as a CI artifact until 2026-12-08; it is not a release. These measurements do
+not establish a 768 MiB ceiling, Raspberry Pi capacity, or physical hardware qualification.
+
 This document records the storage boundary observed in the current implementation and
 defines a migration path to a bounded-memory backend. It is a design proposal only: it
 does not change the current backend, on-disk format, public API, or durability contract.

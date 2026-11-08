@@ -4,7 +4,7 @@ This page states exactly what is tested, what was executed while building versio
 and what remains unverified. If something below is not backed by an executed command, it
 is marked as such.
 
-## Environment used for the checks in this document
+## Historical baseline environment (2026-11-04)
 
 | Item | Value |
 | --- | --- |
@@ -90,22 +90,47 @@ preppydb-cli:      0 tests (verified manually, see below)
   served sampled documents intact, then shut down cleanly via SIGTERM and SIGINT and
   passed `preppydb verify`.
 
-## What was NOT executed
+## Current PR-head qualification (2026-11-08)
+
+PR #1 remains open on `arena/146caad2-preppydb` at `aaeeeaf288a03cd12909341633cfc92d1c79cba9`.
+GitHub Actions run [#134](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42502774832)
+completed successfully for Linux x86-64 (format, Clippy, tests), Windows x86-64 (build,
+tests and PowerShell smoke), ARM64/QEMU (build and emulated tests), Lua/Luvit, Docker
+multi-architecture build, Docker persistence, and aggregate status. This run covers the
+exact PR head; it is not evidence for real Pi hardware, 100,000-document resource use, or
+power-loss durability.
+
+The isolated local checkout is on Windows. `cargo fmt --all -- --check` passed, but local
+Clippy/test compilation stops because MSVC `link.exe` is unavailable. The Python launcher
+in this environment is a nonfunctional WindowsApps alias, so the Linux-only resource
+benchmark was not run locally. No Pi is attached to this workspace.
+
+| Item | State | Boundary |
+| --- | --- | --- |
+| Linux x86-64 format, Clippy, tests | **green on exact PR head** | CI run #134 |
+| Windows x86-64 build, full tests, smoke | **green on exact PR head** | CI run #134; does not prove power-loss behavior |
+| Linux ARM64 build and tests | **green under QEMU** | CI run #134; emulation, not physical Raspberry Pi |
+| Lua/Luvit tests | **green on exact PR head** | CI run #134 |
+| Docker multi-architecture build and persistence | **green on exact PR head** | CI run #134; images were built, not pushed |
+| 100,000-document resource benchmark | **not run** | Requires dedicated Linux host and saved JSON output |
+| Raspberry Pi 4B hardware smoke | **not run** | No physical device attached |
+| 24-hour resource soak | **not run** | No result recorded |
+
+## Historical checks not rerun on the current PR head
 
 The original 2026-11-04 build sandbox had no Docker daemon, Windows host, or ARM64 hardware.
-The following GitHub Actions statuses refer to the previously committed PR head, not the
-current uncommitted worktree. This workspace has no attached Raspberry Pi; ARM64 CI is
-emulated.
+The table below records those historical observations only; current branch-level evidence
+is in the section above.
 
 | Item | State | How it is covered |
 | --- | --- | --- |
-| Linux x86-64 fmt/clippy/tests, crash recovery, release build | **green on previous PR head** | `linux-x86_64` job; current worktree has separate local results below |
-| Windows x86-64 build + full test suite + PowerShell smoke | **green on previous PR head** | `windows-x86_64` job; current worktree still needs GitHub qualification |
-| Docker image build (amd64 + arm64) | **green on previous PR head** | `docker-images` job, build only — never pushed |
-| `scripts/docker-persistence-test.sh` (restart + recreation) | **green on previous PR head** | `docker-persistence` job; current worktree has separate local results below |
-| Linux ARM64 build and emulated tests | CI only | `linux-arm64` job under `qemu-user`; this is emulation, **not** real ARM64 hardware. |
+| Linux x86-64 fmt/clippy/tests, crash recovery, release build | historical green | Earlier `linux-x86_64` job |
+| Windows x86-64 build + full test suite + PowerShell smoke | historical green | Earlier `windows-x86_64` job |
+| Docker image build (amd64 + arm64) | historical green | Earlier `docker-images` job, build only — never pushed |
+| `scripts/docker-persistence-test.sh` (restart + recreation) | historical green | Earlier `docker-persistence` job |
+| Linux ARM64 build and emulated tests | historical green under QEMU | Emulation; **not** real ARM64 hardware |
 | `docker-compose.yml` | not started | the persistence test drives `docker run` directly |
-| `luvit` runtime | not run in the baseline checks | The baseline suite used embedded Lua with substituted transport; current worktree results are listed below. |
+| `luvit` runtime | not run in the baseline checks | The baseline used embedded Lua with substituted transport; separate historical Luvit results are listed below. |
 | Long-running soak / memory profiling | not run | out of scope for this phase |
 | Replication | not implemented | later module |
 
@@ -116,11 +141,10 @@ timeout (`with_timeout`) instead of the 10 s default.
 
 Workflow: <https://github.com/Reina-Kousaka1/PreppyDB/actions/workflows/ci.yml>.
 
-## Additional local qualification of the uncommitted hardening work
+## Historical local qualification of hardening changes (2026-11-05)
 
-The checks below were run against the current local worktree on 2026-11-05. They do
-not describe the older committed PR head and do not substitute for GitHub Actions on the
-eventual pushed commit.
+The checks below were run against a local worktree on 2026-11-05. They are historical
+and do not substitute for the current-head GitHub Actions run above.
 
 | Check | Local result | Boundary |
 | --- | --- | --- |
@@ -356,19 +380,22 @@ a Raspberry Pi.
 
 ## Gaps worth closing next
 
-1. Qualify the current local diff on GitHub Actions, obtain Windows MSVC/runtime evidence, and run on a real Raspberry Pi before declaring those platforms qualified.
-2. Keep the real Luvit transport job pinned and required; it passed on PR head
-   `0e63e168bc6c2b3560f9447a1c1057c91c5974fb`. The embedded-Lua fallback alone does not
-   substitute for that real transport check.
-3. Property-based tests for the JSON parser and the schema validator (fuzzing a parser by
-   hand is not enough).
-4. A soak test: 24 h of mixed reads/writes with periodic checkpoints, watching RSS and
-   segment growth.
-5. Cross-version upgrade test (0.1.0 → next) with a real data directory.
+1. Run the guarded 100,000-document synthetic benchmark on a dedicated Linux host with
+   the documented workload and save its JSON result. No result exists yet, and the
+   provisional 768 MiB target is not demonstrated.
+2. Run the bounded Pi 4B smoke test on real hardware before claiming Raspberry Pi
+   qualification. Current ARM64 CI is QEMU emulation; the current commit artifact is
+   temporary and expires 30 days after its workflow run.
+3. Complete property-based tests for the JSON parser and schema validator.
+4. Run a 24-hour mixed read/write soak with periodic checkpoints while recording RSS and
+   WAL segment growth; no such soak is recorded.
+5. Test a cross-version upgrade with a real 0.1.0 data directory.
+6. Recover or explicitly resolve the unavailable 15th original audit finding and obtain
+   an independent final code review before considering PR #1 for merge.
 
 ## Raspberry Pi 4 hardware validation
 
-**Real hardware has not yet been tested.** CI #107 and #109 build and test ARM64 under QEMU; that is emulation, not a Raspberry Pi. CI #109 also cross-builds the `preppydb-server` and `preppydb` release binaries from the exact PR-head commit, verifies their AArch64 ELF metadata, smoke-invokes both under QEMU, and publishes a commit-named artifact for 30 days. The artifact manifest identifies the source commit, target, compiler and required glibc baseline (2.35). It is suitable for 64-bit Raspberry Pi OS Bookworm or newer; older glibc systems must not run it. [CI #109](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42411562670) passed for commit `fa6126d8c49ec80fa8aba92e4faa26355c97825f`.
+**Real hardware has not yet been tested.** CI run [#134](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42502774832) builds and tests ARM64 under QEMU; that is emulation, not a Raspberry Pi. It also cross-builds the `preppydb-server` and `preppydb` binaries from exact PR head `aaeeeaf288a03cd12909341633cfc92d1c79cba9`, verifies their AArch64 ELF metadata, smoke-invokes both under QEMU, and publishes a commit-named artifact through 2026-12-08. The artifact manifest identifies the source commit, target, compiler and required glibc baseline (2.35). It is suitable for 64-bit Raspberry Pi OS Bookworm or newer; older glibc systems must not run it. This CI artifact is not a published release or stable download channel.
 
 ### Run the bounded hardware smoke test
 
