@@ -41,6 +41,29 @@ run #140 result. The workload still needs about 222 MiB at peak for 100,000 docu
 far above the provisional small-load target if applied at this scale. This synthetic
 hosted x86-64 result is not a Raspberry Pi measurement or a capacity guarantee.
 
+### Current small-load Tiny-profile WSL measurements
+
+The release server binary for PR source `b2c4f563ab40e74351666895f02ebeb881679adb` was
+also measured locally in Ubuntu WSL2 x86-64 using the repository's
+`scripts/benchmark-resources.py`. Runs used Tiny, a 900-byte deterministic payload (about
+926 encoded bytes per document), one scalar index, seed `20261108`, 10 seconds idle,
+50-write batches for 100 documents and 500-write batches otherwise. The benchmark limited
+the temporary server to 1.5 GiB address space, 900 CPU seconds, 2 GiB per file, and 128
+open files. Data directories were temporary and removed. Each cell is a single run.
+
+| Documents | Idle RSS | Idle CPU (10 s) | Threads | Process peak RSS (VmHWM) | RSS after checkpoint | RSS after index build | Checkpoint time | Recovery start after SIGKILL |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 3.86 MiB | 0.10% | 3 | 4.96 MiB | 4.80 MiB | 4.75 MiB | 19.1 ms | 111 ms |
+| 1,000 | 3.90 MiB | 0.10% | 3 | 12.98 MiB | 9.89 MiB | 11.55 MiB | 26.3 ms | 121 ms |
+| 10,000 | 3.88 MiB | 0.00% | 3 | 28.96 MiB | 26.15 MiB | 27.54 MiB | 91.2 ms | 120 ms |
+
+Whole-run CPU was 0.24%, 0.72%, and 1.73% of one core respectively; these percentages
+include writes, reads, recovery, verification, and shutdown, so they are not idle CPU.
+The 10,000-document peak was below the provisional 40 MiB small-load target in this
+specific workload. It does not imply a 40 MiB cap: resident document and index state grows
+with document size, index count, and data count. These are WSL2 observations, not physical
+Raspberry Pi measurements.
+
 ### Historical bounded 100,000-document CI measurement (run #140)
 
 Run #140 used the release server, `tiny` profile, 100,000 deterministic synthetic documents
