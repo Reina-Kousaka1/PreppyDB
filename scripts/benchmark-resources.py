@@ -47,7 +47,7 @@ def extract_bootstrap_token(output: str) -> str | None:
     return tokens[0] if len(tokens) == 1 else None
 
 
-def proc_status(pid: int) -> tuple[int | None, int | None, int | None]:
+def proc_status(pid: int) -> tuple[int | None, int | None, int | None, int | None]:
     try:
         values = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
         rss_fields = {
@@ -57,13 +57,17 @@ def proc_status(pid: int) -> tuple[int | None, int | None, int | None]:
         }
         rss = rss_fields.get("VmRSS")
         peak_rss = rss_fields.get("VmHWM")
+        thread_count = next(
+            (int(line.split(":", 1)[1].strip()) for line in values.splitlines() if line.startswith("Threads:")),
+            None,
+        )
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
         fields = stat[stat.rfind(")") + 2 :].split()
         clock_ticks = os.sysconf("SC_CLK_TCK")
         cpu_seconds = (int(fields[11]) + int(fields[12])) / clock_ticks
-        return rss, peak_rss, int(cpu_seconds * 1_000_000)
+        return rss, peak_rss, int(cpu_seconds * 1_000_000), thread_count
     except (FileNotFoundError, IndexError, OSError, ValueError):
-        return None, None, None
+        return None, None, None, None
 
 
 def system_memory_available() -> int | None:
@@ -91,6 +95,7 @@ class ResourceSampler:
         self.pid = pid
         self.phase = "startup"
         self.kernel_peak_rss = 0
+        self.process_peak_threads = 0
         self.phase_peak: dict[str, int] = {}
         self.initial_available = system_memory_available()
         self.minimum_available = self.initial_available
@@ -109,18 +114,33 @@ class ResourceSampler:
         with self._lock:
             self.phase = phase
 
+    def observe_process_sample(
+        self,
+        sample: tuple[int | None, int | None, int | None, int | None],
+    ) -> None:
+        rss, peak_rss, cpu_us, thread_count = sample
+        with self._lock:
+            if rss is not None:
+                self.phase_peak[self.phase] = max(self.phase_peak.get(self.phase, 0), rss)
+                self.kernel_peak_rss = max(self.kernel_peak_rss, rss)
+            if peak_rss is not None:
+                self.kernel_peak_rss = max(self.kernel_peak_rss, peak_rss)
+            if thread_count is not None:
+                self.process_peak_threads = max(self.process_peak_threads, thread_count)
+            if cpu_us is not None:
+                self.process_cpu_us = cpu_us
+
+    def sample_process(self) -> tuple[int | None, int | None, int | None, int | None]:
+        sample = proc_status(self.pid)
+        self.observe_process_sample(sample)
+        return sample
+
     def _sample(self) -> None:
         while not self._stop.is_set():
-            rss, peak_rss, cpu_us = proc_status(self.pid)
+            self.sample_process()
             available = system_memory_available()
             ticks = system_cpu_ticks()
             with self._lock:
-                if rss is not None:
-                    self.phase_peak[self.phase] = max(self.phase_peak.get(self.phase, 0), rss)
-                if peak_rss is not None:
-                    self.kernel_peak_rss = max(self.kernel_peak_rss, peak_rss)
-                if cpu_us is not None:
-                    self.process_cpu_us = cpu_us
                 if available is not None:
                     self.minimum_available = (
                         available
@@ -142,6 +162,7 @@ class ResourceSampler:
         return {
             "sample_interval_ms": int(SAMPLE_INTERVAL_SECONDS * 1000),
             "peak_rss_bytes_kernel_high_watermark": self.kernel_peak_rss,
+            "peak_process_threads_sampled": self.process_peak_threads,
             "phase_peak_rss_bytes_sampled": self.phase_peak,
             "available_memory_start_bytes": self.initial_available,
             "available_memory_min_bytes": self.minimum_available,
@@ -258,7 +279,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", required=True, type=Path, help="Path to the built preppydb-server binary")
     parser.add_argument("--documents", type=int, default=DEFAULT_SAFE_DOCUMENTS)
-    parser.add_argument("--batch-size", type=int, default=MAX_BATCH)
+    parser.add_argument("--profile", choices=("standard", "tiny"), default="standard")
+    parser.add_argument(
+        "--idle-seconds",
+        type=float,
+        default=10.0,
+        help="duration of the no-request CPU observation window (default: 10 seconds)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help="write batch size (default: 500 in tiny profile, otherwise 1,000)",
+    )
     parser.add_argument("--seed", type=int, default=20261108)
     parser.add_argument("--source-commit", default=os.environ.get("PREPPYDB_SOURCE_COMMIT"))
     parser.add_argument("--manifest", type=Path, help="optional key=value build manifest to include")
@@ -269,6 +301,8 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path, default=Path("-"), help="JSON output path, or - for stdout")
     args = parser.parse_args()
+    if args.batch_size is None:
+        args.batch_size = 500 if args.profile == "tiny" else MAX_BATCH
 
     if not sys.platform.startswith("linux"):
         parser.error("this resource sampler currently requires Linux /proc")
@@ -276,6 +310,8 @@ def main() -> int:
         parser.error("--server must point to an existing PreppyDB server binary")
     if not 1 <= args.documents <= MAX_DOCUMENTS:
         parser.error(f"--documents must be between 1 and {MAX_DOCUMENTS}")
+    if not 0.1 <= args.idle_seconds <= 300:
+        parser.error("--idle-seconds must be between 0.1 and 300")
     if args.documents > DEFAULT_SAFE_DOCUMENTS and not args.allow_large_test:
         parser.error("more than 1,000 documents requires --allow-large-test")
     if not 1 <= args.batch_size <= MAX_BATCH:
@@ -317,8 +353,11 @@ def main() -> int:
 
         def start_server(phase: str) -> float:
             nonlocal process, sampler
+            command = [str(binary), "--data-dir", str(data_dir), "--listen", f"127.0.0.1:{port}"]
+            if args.profile != "standard":
+                command.extend(["--profile", args.profile])
             process = subprocess.Popen(
-                [str(binary), "--data-dir", str(data_dir), "--listen", f"127.0.0.1:{port}"],
+                command,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 preexec_fn=apply_process_limits,
@@ -332,8 +371,20 @@ def main() -> int:
 
         try:
             start_server("load")
-            time.sleep(1.0)
-            idle_rss, _, _ = proc_status(process.pid)
+            sampler.set_phase("idle")
+            idle_before = sampler.sample_process()
+            idle_started = time.perf_counter()
+            time.sleep(args.idle_seconds)
+            idle_elapsed = time.perf_counter() - idle_started
+            idle_after = sampler.sample_process()
+            idle_rss = idle_after[0]
+            idle_cpu_percent = (
+                round(100 * (idle_after[2] - idle_before[2]) / 1_000_000 / idle_elapsed, 2)
+                if idle_before[2] is not None and idle_after[2] is not None and idle_elapsed > 0
+                else None
+            )
+            idle_thread_count = idle_after[3]
+            sampler.set_phase("load")
             request(
                 base,
                 token,
@@ -368,7 +419,7 @@ def main() -> int:
                 batch_latencies.append(time.perf_counter() - batch_started)
 
             sampler.set_phase("index_build")
-            index_rss_before, _, _ = proc_status(process.pid)
+            index_rss_before, _, _, _ = sampler.sample_process()
             index_started = time.perf_counter()
             request(
                 base,
@@ -379,8 +430,9 @@ def main() -> int:
                 deadline,
             )
             index_build_seconds = time.perf_counter() - index_started
-            index_rss_after, _, _ = proc_status(process.pid)
+            index_rss_after, _, _, _ = sampler.sample_process()
 
+            sampler.set_phase("read")
             for index in range(min(1000, args.documents)):
                 if time.perf_counter() >= deadline:
                     raise TimeoutError("resource benchmark exceeded its 30-minute wall-clock limit")
@@ -395,11 +447,11 @@ def main() -> int:
                 read_latencies.append(time.perf_counter() - read_started)
 
             sampler.set_phase("checkpoint")
-            checkpoint_rss_before, _, _ = proc_status(process.pid)
+            checkpoint_rss_before, _, _, _ = sampler.sample_process()
             checkpoint_started = time.perf_counter()
             request(base, token, "POST", "/v1/admin/checkpoint", {}, deadline)
             checkpoint_seconds = time.perf_counter() - checkpoint_started
-            checkpoint_rss_after, _, _ = proc_status(process.pid)
+            checkpoint_rss_after, _, _, _ = sampler.sample_process()
             sizes_after_checkpoint = file_sizes(data_dir)
 
             tail_count = min(args.batch_size, args.documents)
@@ -433,6 +485,10 @@ def main() -> int:
             resources["peak_rss_bytes_kernel_high_watermark"] = max(
                 resources["peak_rss_bytes_kernel_high_watermark"],
                 recovery_resources["peak_rss_bytes_kernel_high_watermark"],
+            )
+            resources["peak_process_threads_sampled"] = max(
+                resources["peak_process_threads_sampled"],
+                recovery_resources["peak_process_threads_sampled"],
             )
             resources["available_memory_min_bytes"] = min(
                 item
@@ -474,6 +530,7 @@ def main() -> int:
                     json.dumps({"group": 999, "payload": payload}, separators=(",", ":")).encode()
                 ),
                 "batch_size": args.batch_size,
+                "profile": args.profile,
                 "source_commit": args.source_commit,
                 "build_manifest": (
                     dict(
@@ -494,6 +551,8 @@ def main() -> int:
                 "checkpoint_rss_before_bytes": checkpoint_rss_before,
                 "checkpoint_rss_after_bytes": checkpoint_rss_after,
                 "idle_rss_after_health_bytes": idle_rss,
+                "idle_cpu_percent_of_one_core": idle_cpu_percent,
+                "process_threads_at_idle": idle_thread_count,
                 "timing": {
                     "startup_seconds": start_times[0],
                     "checkpoint_seconds": round(checkpoint_seconds, 6),
@@ -513,8 +572,8 @@ def main() -> int:
                     "host_architecture": os.uname().machine,
                     "wall_seconds": round(time.perf_counter() - started_at, 3),
                     "wall_clock_limit_seconds": MAX_WALL_SECONDS,
-                    "idle_observation_seconds": 1,
-                    "rss_peak_source": "Linux /proc/<pid>/status VmHWM, polled per child process",
+                    "idle_observation_seconds": round(idle_elapsed, 3),
+                    "rss_peak_source": "maximum of Linux /proc/<pid>/status VmHWM and sampled/direct VmRSS observations",
                     "recovery_method": "SIGKILL of this isolated benchmark child after a checkpoint and WAL tail write",
                     "data_directory": "temporary and removed after result is written",
                     "child_process_limits": {

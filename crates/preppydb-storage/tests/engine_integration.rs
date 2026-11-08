@@ -974,6 +974,45 @@ fn ttl_expires_and_sweep_is_logged() {
 }
 
 #[test]
+fn ttl_sweep_processes_expired_documents_in_bounded_batches() {
+    let dir = tempdir("ttl-bounded-sweep");
+    let mut config = EngineConfig::new(&dir);
+    config.limits.max_batch_ops = 3;
+    config.checkpoint_every_mutations = None;
+    let engine = Engine::open(config).unwrap();
+    engine
+        .create_collection(CollectionMeta::new("cache", 0))
+        .unwrap();
+    let now = preppydb_storage::clock::now_ms();
+    for index in 0..8 {
+        engine
+            .put(
+                "cache",
+                &format!("expired-{index}"),
+                Json::int(index),
+                PutOptions {
+                    expected_version: Some(0),
+                    expires_at: Some(now - 1),
+                },
+            )
+            .unwrap();
+    }
+
+    assert!(engine.get_opt("cache", "expired-0").unwrap().is_none());
+    assert_eq!(engine.sweep_expired().unwrap(), 3);
+    assert_eq!(engine.sweep_expired().unwrap(), 3);
+    assert_eq!(engine.sweep_expired().unwrap(), 2);
+    assert_eq!(engine.sweep_expired().unwrap(), 0);
+    assert_eq!(engine.stats().total_documents, 0);
+    drop(engine);
+
+    let engine = open(&dir);
+    assert_eq!(engine.stats().total_documents, 0);
+    drop(engine);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn crash_recovery_keeps_committed_writes() {
     // A child process writes documents and then aborts without any clean shutdown.
     // Everything that was committed with sync=always must be present afterwards.

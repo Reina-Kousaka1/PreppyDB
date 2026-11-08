@@ -911,13 +911,19 @@ impl Store {
         }
     }
 
-    /// Keys of all expired documents (for the TTL sweeper).
-    pub fn expired_keys(&self, now_ms: i64) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        for (name, coll) in &self.collections {
+    /// Return up to `limit` expired document keys for a bounded TTL sweep.
+    pub fn expired_keys(&self, now_ms: i64, limit: usize) -> Vec<(String, String)> {
+        let mut out = Vec::with_capacity(limit.min(128));
+        if limit == 0 {
+            return out;
+        }
+        'collections: for (name, coll) in &self.collections {
             for (key, doc) in &coll.docs {
                 if doc.is_expired(now_ms) {
                     out.push((name.clone(), key.clone()));
+                    if out.len() == limit {
+                        break 'collections;
+                    }
                 }
             }
         }
@@ -1159,8 +1165,29 @@ mod tests {
         .unwrap();
         assert!(s.get("people", "tmp", 1500).unwrap().is_some());
         assert!(s.get("people", "tmp", 2500).unwrap().is_none());
-        assert_eq!(s.expired_keys(2500).len(), 1);
-        assert_eq!(s.expired_keys(1500).len(), 0);
+        assert_eq!(s.expired_keys(2500, 10).len(), 1);
+        assert_eq!(s.expired_keys(1500, 10).len(), 0);
+    }
+
+    #[test]
+    fn expired_key_collection_stops_at_requested_bound() {
+        let mut s = store();
+        for index in 0..20 {
+            s.put(
+                "people",
+                &format!("tmp-{index:02}"),
+                Json::int(index),
+                Some(2000),
+                None,
+                1000,
+                1,
+                ApplyMode::Live,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(s.expired_keys(2500, 7).len(), 7);
+        assert!(s.expired_keys(2500, 0).is_empty());
     }
 
     #[test]

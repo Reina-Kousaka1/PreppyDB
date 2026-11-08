@@ -1690,7 +1690,9 @@ impl Engine {
         self.check_healthy()?;
         let expired = {
             let state = self.read();
-            state.store.expired_keys(now_ms())
+            state
+                .store
+                .expired_keys(now_ms(), self.cfg.limits.max_batch_ops)
         };
         if expired.is_empty() {
             return Ok(0);
@@ -1701,7 +1703,6 @@ impl Engine {
                 collection: collection.clone(),
                 key: key.clone(),
             })
-            .take(self.cfg.limits.max_batch_ops)
             .collect();
         let removed = ops.len();
         self.commit_document_batch(&[], ops, "ttl_expiry", None)?;

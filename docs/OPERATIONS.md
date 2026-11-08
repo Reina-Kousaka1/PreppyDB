@@ -393,8 +393,29 @@ After a process crash such as `kill -9`, startup validates and replays the persi
 | Batch / transaction operations | 1 000 | server handler (fixed) |
 | Scan / index page | 1 000 keys | `limit` query parameter |
 | Collection size | per model (see [DATA-MODEL.md](DATA-MODEL.md)) | `max_docs` per collection |
+| Server profile | `standard` | `profile`, or `--profile` |
 | Concurrent HTTP workers | 8 by default | `workers` |
+| Accepted connection queue | 256 by default | `backlog` |
 | Rate limit | 50/s, burst 100 | `rate_limit_per_second`, `rate_limit_burst` |
+
+### Low-resource server profile
+
+For a small host, start the server with `--profile tiny`. It sets one HTTP worker, a
+four-connection queue, a 512 KiB request-body limit, and disables the periodic TTL
+sweeper. The standard profile and default settings are unchanged. The profile never
+changes `sync_mode` (still `always` by default), checkpoint frequency, WAL, or file
+format. Explicit JSON settings can override profile values; a command-line `--profile`
+is applied after the JSON file and therefore takes precedence for these four settings.
+
+With the periodic sweeper disabled, expired documents remain invisible to reads but
+stay physically stored until an administrator calls `POST /v1/admin/sweep-expired` or
+runs `preppydb compact --data-dir <PATH>`. Each explicit sweep removes at most one
+bounded batch (1,000 operations with current defaults); repeat it until the endpoint
+reports zero removals when a collection has more expired documents. This trades
+background CPU/thread activity for delayed space reclamation; it does not make the
+in-memory working set bounded.
+Documents and indexes are still held in RAM, so size the database for the full dataset.
+Use the resource benchmark on the intended host before choosing a dataset limit.
 
 The working set lives in memory: size the host so the whole dataset fits with headroom.
 Measure with your own documents (`GET /v1/stats` reports per-collection document counts and

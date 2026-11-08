@@ -204,9 +204,16 @@ claims.
 binary supplied with `--server`. It creates a temporary data directory, binds to an
 OS-assigned loopback port, seeds deterministic ~1 KiB documents, builds one scalar
 index, checkpoints, adds a WAL tail, kills only that child process, verifies recovery,
-and emits JSON. It records sampled RSS and available RAM, CPU, WAL/snapshot bytes,
-startup/recovery/shutdown times, write/read p50 and p95, checkpoint duration, and index
-build timing. The temporary database is removed on completion.
+and emits JSON. It records the Linux process high-water RSS, sampled per-phase RSS and
+available RAM, idle CPU and thread counts, CPU, WAL/snapshot bytes, startup/recovery/
+shutdown times, write/read p50 and p95, checkpoint duration, and index-build timing. The
+idle observation defaults to 10 seconds and can be extended with `--idle-seconds`. The
+temporary database is removed on completion.
+
+Run the same workload with `--profile standard` and `--profile tiny` for comparison. Tiny
+defaults to 500-operation batches so its 512 KiB HTTP body bound is respected; the
+standard profile defaults to 1,000. To compare equivalent request shapes, set the same
+`--batch-size` for both profiles.
 
 The default is 1,000 documents. The requested 100,000-document profile requires
 `--allow-large-test`, at least 1 GiB of free temporary disk, and is limited to 1.5 GiB
@@ -221,15 +228,43 @@ Example on a dedicated Linux host after building the release server:
 cargo build --release --locked -p preppydb-server
 python3 scripts/benchmark-resources.py \
   --server target/release/preppydb-server \
+  --profile tiny --idle-seconds 30 \
   --documents 100000 --allow-large-test --seed 20261108 \
   --source-commit "$(git rev-parse HEAD)" \
   --output resource-results.json
 ```
 
 Treat the resulting JSON as a measurement of that binary and host only. Compare changes
-with the same binary flags, seed, OS, storage device, and workload. The sampler polls
-every 50 ms and can miss shorter RSS spikes; its peak value is a lower bound, not an
-exact process high-water mark.
+with the same binary flags, seed, OS, storage device, profile, and workload. Overall
+process peak RSS is the maximum of Linux `VmHWM` and directly or periodically sampled
+`VmRSS`; phase peaks are sampled every 50 ms plus explicit before/after observations at
+index and checkpoint boundaries. Phase peaks remain lower bounds for short transients.
+Per-process resource limits do not isolate the host or the filesystem page cache.
+
+### Initial WSL2 profile measurements
+
+The first local comparison used the same release build, seed `20261108`, synthetic
+~926-byte documents, 500-operation batches for both profiles, and Ubuntu under WSL2
+(Linux 6.18.33.2, x86_64, 12th Gen Intel Core i5-12450H, rustc 1.99.1). The measured
+binary came from a dirty local working tree based on `bb220510a70ed6247010510ff3016f8dcc7af13b`;
+these are exploratory measurements, not CI evidence or a Raspberry Pi qualification.
+
+| Documents | Profile | Idle RSS | Idle CPU (30 s) | Threads at idle | Process peak RSS | RSS after checkpoint |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 100 | standard | 3.93 MiB | 0.13% | 11 | 5.56 MiB | 5.56 MiB |
+| 100 | tiny | 3.81 MiB | 0.13% | 3 | 5.18 MiB | 5.18 MiB |
+| 1,000 | standard | 3.95 MiB | not sampled for 30 s | 11 | 17.20 MiB | 17.20 MiB |
+| 1,000 | tiny | 3.84 MiB | not sampled for 30 s | 3 | 11.45 MiB | 9.77 MiB |
+| 10,000 | standard | 3.93 MiB | not sampled for 30 s | 11 | 70.04 MiB | 59.60 MiB |
+| 10,000 | tiny | 3.86 MiB | not sampled for 30 s | 3 | 41.27 MiB | 25.68 MiB |
+
+Idle CPU was measured during 30-second no-request windows only for the 100-document
+comparison. The 1,000- and 10,000-document runs used a shorter idle sample, so no idle
+CPU result is claimed for them. Tiny reduced idle thread count from 11 to 3 and lowered
+the observed 10,000-document process peak, but that peak still slightly exceeds the
+provisional 40 MiB target. The working set remains fully in memory; none of these
+measurements establish a safe maximum dataset size. Re-run on a real Pi with its actual
+storage and workload before making deployment capacity decisions.
 
 Two local runs on Ubuntu under WSL2 (Linux 6.18.33.2, x86_64, 12th Gen Intel Core
 i5-12450H, rustc 1.99.1, release profile) reported median times of 2,146/2,522/2,579 ns

@@ -15,7 +15,7 @@
 
 use preppydb_server::api::ApiState;
 use preppydb_server::auth::{AuthStore, Role};
-use preppydb_server::config::ServerConfig;
+use preppydb_server::config::{ResourceProfile, ServerConfig};
 use preppydb_server::http::{self, HttpLimits, ServerCounters};
 use preppydb_storage::engine::Engine;
 use std::path::PathBuf;
@@ -32,6 +32,7 @@ fn main() {
 struct Args {
     data_dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
+    profile: Option<ResourceProfile>,
     listen: Option<String>,
     allow_public_bind: bool,
     read_only: bool,
@@ -45,6 +46,7 @@ fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         data_dir: None,
         config_path: None,
+        profile: None,
         listen: None,
         allow_public_bind: false,
         read_only: false,
@@ -71,6 +73,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--config" => {
                 args.config_path = Some(PathBuf::from(iter.next().ok_or("--config needs a value")?))
+            }
+            "--profile" => {
+                let value = iter.next().ok_or("--profile needs a value")?;
+                args.profile = Some(ResourceProfile::parse(&value)?);
             }
             "--listen" => args.listen = Some(iter.next().ok_or("--listen needs a value")?),
             "--allow-public-bind" => args.allow_public_bind = true,
@@ -99,6 +105,7 @@ USAGE:
 OPTIONS:
     --data-dir <PATH>            database directory (required unless in the config)
     --config <FILE>              JSON configuration file
+    --profile <NAME>             resource preset: standard or tiny
     --listen <ADDR>              bind address (default 127.0.0.1:7070)
     --allow-public-bind          permit binding to a non-loopback address
     --read-only                  open the database read-only
@@ -135,6 +142,9 @@ fn run() -> Result<(), String> {
     };
     if let Some(data_dir) = args.data_dir.clone() {
         config.data_path = data_dir;
+    }
+    if let Some(profile) = args.profile {
+        config.apply_profile(profile);
     }
     if let Some(listen) = args.listen.clone() {
         config.listen = listen;
@@ -232,6 +242,7 @@ fn run() -> Result<(), String> {
     let limits = HttpLimits {
         max_body_bytes: config.max_body_bytes,
         workers: config.workers,
+        backlog: config.backlog,
         ..Default::default()
     };
 

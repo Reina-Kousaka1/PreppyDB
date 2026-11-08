@@ -8,9 +8,38 @@ use preppydb_storage::engine::{EngineConfig, RepairPolicy};
 use preppydb_storage::wal::SyncMode;
 use std::path::{Path, PathBuf};
 
+/// Named resource presets. Profiles only change server resource settings; they never
+/// weaken storage durability or alter the on-disk format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceProfile {
+    Standard,
+    Tiny,
+}
+
+impl ResourceProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResourceProfile::Standard => "standard",
+            ResourceProfile::Tiny => "tiny",
+        }
+    }
+
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "standard" => Ok(ResourceProfile::Standard),
+            "tiny" => Ok(ResourceProfile::Tiny),
+            _ => Err(format!(
+                "unknown resource profile '{value}' (expected standard or tiny)"
+            )),
+        }
+    }
+}
+
 /// Runtime configuration of the HTTP server.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    /// Named preset that produced the resource settings; explicit settings may override it.
+    pub profile: ResourceProfile,
     /// `host:port` to bind. Loopback by default.
     pub listen: String,
     pub data_path: PathBuf,
@@ -40,11 +69,14 @@ pub struct ServerConfig {
     pub lua_execution_enabled: bool,
     /// Worker threads for the HTTP server.
     pub workers: usize,
+    /// Bounded accepted-connection queue for HTTP workers.
+    pub backlog: usize,
 }
 
 impl ServerConfig {
     pub fn new(data_path: impl Into<PathBuf>) -> ServerConfig {
         ServerConfig {
+            profile: ResourceProfile::Standard,
             listen: "127.0.0.1:7070".to_string(),
             data_path: data_path.into(),
             allow_public_bind: false,
@@ -63,6 +95,28 @@ impl ServerConfig {
             ruby_planner_path: None,
             lua_execution_enabled: false,
             workers: 8,
+            backlog: 256,
+        }
+    }
+
+    /// Apply a resource preset without changing durability or storage limits.
+    pub fn apply_profile(&mut self, profile: ResourceProfile) {
+        self.profile = profile;
+        match profile {
+            ResourceProfile::Standard => {
+                self.max_body_bytes = 4 * 1024 * 1024;
+                self.ttl_sweep_interval_ms = Some(30_000);
+                self.workers = 8;
+                self.backlog = 256;
+            }
+            ResourceProfile::Tiny => {
+                self.max_body_bytes = 512 * 1024;
+                // Expired documents remain invisible to reads; physical cleanup is
+                // explicit through the admin sweep endpoint/CLI.
+                self.ttl_sweep_interval_ms = None;
+                self.workers = 1;
+                self.backlog = 4;
+            }
         }
     }
 
@@ -119,6 +173,9 @@ impl ServerConfig {
         if self.workers == 0 || self.workers > 512 {
             problems.push("workers must be between 1 and 512".to_string());
         }
+        if self.backlog == 0 || self.backlog > 65_536 {
+            problems.push("backlog must be between 1 and 65536".to_string());
+        }
         if self.rate_limit_per_second > 0 && self.rate_limit_burst < self.rate_limit_per_second {
             problems.push("rate_limit_burst must be >= rate_limit_per_second".to_string());
         }
@@ -130,6 +187,7 @@ impl ServerConfig {
 
     pub fn to_json(&self) -> Json {
         Json::obj()
+            .with("profile", Json::str(self.profile.as_str()))
             .with("listen", Json::str(self.listen.clone()))
             .with("data_path", Json::str(self.data_path.display().to_string()))
             .with("allow_public_bind", Json::Bool(self.allow_public_bind))
@@ -202,6 +260,7 @@ impl ServerConfig {
                 }),
             )
             .with("workers", Json::uint(self.workers as u64))
+            .with("backlog", Json::uint(self.backlog as u64))
     }
 
     /// Apply a JSON document (from a config file) on top of the defaults.
@@ -213,7 +272,8 @@ impl ServerConfig {
                     .filter(|key| {
                         !matches!(
                             key.as_str(),
-                            "listen"
+                            "profile"
+                                | "listen"
                                 | "data_path"
                                 | "allow_public_bind"
                                 | "max_body_bytes"
@@ -231,6 +291,7 @@ impl ServerConfig {
                                 | "ruby_planner_path"
                                 | "lua_execution_enabled"
                                 | "workers"
+                                | "backlog"
                         )
                     })
                     .cloned()
@@ -242,6 +303,15 @@ impl ServerConfig {
                 "unknown configuration keys: {}",
                 unknown.join(", ")
             ));
+        }
+        match value.get("profile") {
+            None => {}
+            Some(entry) => {
+                let profile = entry
+                    .as_str()
+                    .ok_or("profile must be 'standard' or 'tiny'")?;
+                self.apply_profile(ResourceProfile::parse(profile)?);
+            }
         }
         if let Some(value) = value.get_str("listen") {
             self.listen = value.to_string();
@@ -335,6 +405,10 @@ impl ServerConfig {
             self.workers = usize::try_from(value)
                 .map_err(|_| "workers exceeds this platform's addressable range")?;
         }
+        if let Some(value) = value.get("backlog").and_then(|v| v.as_u64()) {
+            self.backlog = usize::try_from(value)
+                .map_err(|_| "backlog exceeds this platform's addressable range")?;
+        }
         Ok(())
     }
 
@@ -414,9 +488,50 @@ mod tests {
             Some(50_000)
         );
         assert_eq!(json.get("workers").and_then(Json::as_u64), Some(8));
+        assert_eq!(json.get("backlog").and_then(Json::as_u64), Some(256));
+        assert_eq!(json.get("profile").and_then(Json::as_str), Some("standard"));
         assert_eq!(json.get("sync_mode").and_then(Json::as_str), Some("always"));
         assert_eq!(json.get("auth_path"), Some(&Json::Null));
         assert_eq!(json.get("pricing_audit_path"), Some(&Json::Null));
+    }
+
+    #[test]
+    fn tiny_profile_bounds_server_resources_without_weakening_storage_durability() {
+        let mut config = ServerConfig::new("/tmp/preppydb");
+        config.apply_profile(ResourceProfile::Tiny);
+
+        assert_eq!(config.max_body_bytes, 512 * 1024);
+        assert_eq!(config.workers, 1);
+        assert_eq!(config.backlog, 4);
+        assert_eq!(config.ttl_sweep_interval_ms, None);
+        assert_eq!(config.sync_mode, SyncMode::Always);
+        assert_eq!(config.checkpoint_every_mutations, Some(50_000));
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+    }
+
+    #[test]
+    fn tiny_profile_json_settings_can_be_overridden_explicitly() {
+        let value = preppydb_json::parse(
+            r#"{"profile":"tiny","workers":2,"backlog":8,"max_body_bytes":262144,"ttl_sweep_interval_ms":60000}"#,
+        )
+        .unwrap();
+        let mut config = ServerConfig::new("/tmp/preppydb");
+        config.merge_json(&value).unwrap();
+
+        assert_eq!(config.profile, ResourceProfile::Tiny);
+        assert_eq!(config.workers, 2);
+        assert_eq!(config.backlog, 8);
+        assert_eq!(config.max_body_bytes, 256 * 1024);
+        assert_eq!(config.ttl_sweep_interval_ms, Some(60_000));
+    }
+
+    #[test]
+    fn unsupported_or_malformed_resource_profile_is_rejected() {
+        for input in [r#"{"profile":"fast"}"#, r#"{"profile":1}"#] {
+            let mut config = ServerConfig::new("/tmp/preppydb");
+            let value = preppydb_json::parse(input).unwrap();
+            assert!(config.merge_json(&value).is_err(), "accepted {input}");
+        }
     }
 
     #[test]
