@@ -103,7 +103,8 @@ AuditEntry { seq, kind, at, detail, previous_hash, hash }
 
 `hash = SHA-256(seq || kind || at || detail || previous_hash)`. `GET /v1/pricing/audit/verify`
 (or `preppydb audit verify`) recomputes the chain; editing, reordering or deleting an
-entry breaks it and is reported instead of being ignored. The log is append-only from the
+entry that has a successor breaks the chain and is reported. Removing a trailing suffix
+cannot be detected without an external trusted head anchor. The log is append-only from the
 server's point of view — there is no rotate/truncate endpoint.
 
 If the process stops after a start record but before its terminal record, the server
