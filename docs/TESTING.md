@@ -308,11 +308,38 @@ times were 2,339/3,624/2,764 ns and 2,282/2,805/2,876 ns. This is a smoke check 
 ordinary single-document commit cost does not grow with a full-store copy; use repeated
 runs on the target host for any deployment-specific capacity decision.
 
+### Corrected phase-separated Tiny run (PR head `0e63e168`)
+
+On 2026-11-08, the release server built from `0e63e168bc6c2b3560f9447a1c1057c91c5974fb`
+was measured in Ubuntu WSL2 on x86-64 with the same 900-byte deterministic payload,
+seed `20261108`, 500-operation batches, and a 10-second idle window. Each run used only
+its temporary database and the harness's 1.5 GiB address-space, 2 GiB file, 15-minute
+CPU, and 128-open-file child limits. The harness was locally instrumented to record
+phase-boundary `VmHWM`; its sampler is stopped before the child exits to avoid attributing
+a post-exit `/proc` read to the server.
+
+| Documents | Idle RSS | Idle CPU | Idle threads | After load HWM | Checkpoint RSS | Recovery-start RSS | Verify HWM | Whole-process HWM | Whole-run CPU |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 3.83 MiB | 0.1% | 3 | 5.22 MiB | 5.07 MiB | 4.54 MiB | 5.23 MiB | 5.55 MiB | 0.16% |
+| 1,000 | 3.86 MiB | 0.1% | 3 | 11.73 MiB | 9.77 MiB | 7.15 MiB | 11.81 MiB | 12.97 MiB | 0.75% |
+| 10,000 | 3.83 MiB | 0.1% | 3 | 27.59 MiB | 25.64 MiB | 23.23 MiB | 43.98 MiB | 43.98 MiB | 1.86% |
+
+Index build took 15–20 ms. Its direct before/after `VmHWM` did not increase in these
+runs. At 10,000 documents, `POST /v1/admin/verify` increased RSS from about 23.2 MiB
+after recovery startup to about 43.1 MiB; the phase high-water mark reached 43.98 MiB.
+This matches the implementation: `Engine::verify` reconstructs a full replay `Store`
+while the live `Store` remains resident. The 40 MiB provisional peak target is therefore
+exceeded by the full integrity-verification request in this workload, not by idle, the
+measured index build, or checkpoint. Verification's semantic replay is retained; no
+reduced-check verification mode was used. These are host-specific synthetic figures and
+do not qualify a Raspberry Pi.
+
 ## Gaps worth closing next
 
 1. Qualify the current local diff on GitHub Actions, obtain Windows MSVC/runtime evidence, and run on a real Raspberry Pi before declaring those platforms qualified.
-2. Add a `luvit` job with the real `http` transport (the CI job tries and tolerates its
-   absence today).
+2. Keep the real Luvit transport job pinned and required; it passed on PR head
+   `0e63e168bc6c2b3560f9447a1c1057c91c5974fb`. The embedded-Lua fallback alone does not
+   substitute for that real transport check.
 3. Property-based tests for the JSON parser and the schema validator (fuzzing a parser by
    hand is not enough).
 4. A soak test: 24 h of mixed reads/writes with periodic checkpoints, watching RSS and

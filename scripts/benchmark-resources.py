@@ -97,6 +97,7 @@ class ResourceSampler:
         self.kernel_peak_rss = 0
         self.process_peak_threads = 0
         self.phase_peak: dict[str, int] = {}
+        self.phase_peak_hwm: dict[str, int] = {}
         self.initial_available = system_memory_available()
         self.minimum_available = self.initial_available
         self.process_cpu_us: int | None = None
@@ -125,6 +126,9 @@ class ResourceSampler:
                 self.kernel_peak_rss = max(self.kernel_peak_rss, rss)
             if peak_rss is not None:
                 self.kernel_peak_rss = max(self.kernel_peak_rss, peak_rss)
+                self.phase_peak_hwm[self.phase] = max(
+                    self.phase_peak_hwm.get(self.phase, 0), peak_rss
+                )
             if thread_count is not None:
                 self.process_peak_threads = max(self.process_peak_threads, thread_count)
             if cpu_us is not None:
@@ -164,6 +168,7 @@ class ResourceSampler:
             "peak_rss_bytes_kernel_high_watermark": self.kernel_peak_rss,
             "peak_process_threads_sampled": self.process_peak_threads,
             "phase_peak_rss_bytes_sampled": self.phase_peak,
+            "phase_peak_hwm_bytes_sampled": self.phase_peak_hwm,
             "available_memory_start_bytes": self.initial_available,
             "available_memory_min_bytes": self.minimum_available,
             "process_cpu_seconds_at_last_sample": (
@@ -418,8 +423,9 @@ def main() -> int:
                 )
                 batch_latencies.append(time.perf_counter() - batch_started)
 
+            loaded_sample = sampler.sample_process()
             sampler.set_phase("index_build")
-            index_rss_before, _, _, _ = sampler.sample_process()
+            index_rss_before, index_hwm_before, _, _ = sampler.sample_process()
             index_started = time.perf_counter()
             request(
                 base,
@@ -430,7 +436,7 @@ def main() -> int:
                 deadline,
             )
             index_build_seconds = time.perf_counter() - index_started
-            index_rss_after, _, _, _ = sampler.sample_process()
+            index_rss_after, index_hwm_after, _, _ = sampler.sample_process()
 
             sampler.set_phase("read")
             for index in range(min(1000, args.documents)):
@@ -446,6 +452,7 @@ def main() -> int:
                 )
                 read_latencies.append(time.perf_counter() - read_started)
 
+            read_complete_sample = sampler.sample_process()
             sampler.set_phase("checkpoint")
             checkpoint_rss_before, _, _, _ = sampler.sample_process()
             checkpoint_started = time.perf_counter()
@@ -454,6 +461,8 @@ def main() -> int:
             checkpoint_rss_after, _, _, _ = sampler.sample_process()
             sizes_after_checkpoint = file_sizes(data_dir)
 
+            tail_before_sample = sampler.sample_process()
+            sampler.set_phase("tail_writes")
             tail_count = min(args.batch_size, args.documents)
             tail_ops = [
                 {
@@ -465,23 +474,32 @@ def main() -> int:
                 for index in range(tail_count)
             ]
             request(base, token, "POST", "/v1/collections/bench/batch", {"operations": tail_ops}, deadline)
-            sampler.set_phase("shutdown")
-            crash_recovery_kill_seconds = crash_process(process)
+            tail_after_sample = sampler.sample_process()
+            before_crash_sample = sampler.sample_process()
+            sampler.set_phase("pre_crash")
+            sampler.sample_process()
             resources = sampler.finish()
+            crash_recovery_kill_seconds = crash_process(process)
 
             sampler = None
             recovery_startup = start_server("recovery")
+            after_recovery_sample = sampler.sample_process()
+            sampler.set_phase("verify")
             verification = request(base, token, "POST", "/v1/admin/verify", {}, deadline)
+            after_verify_sample = sampler.sample_process()
             if verification.get("data", {}).get("ok") is not True:
                 raise RuntimeError("database verify failed after recovery")
+            sampler.set_phase("stats")
             stats = request(base, token, "GET", "/v1/stats", deadline=deadline)
+            after_stats_sample = sampler.sample_process()
             recovered_count = stats.get("data", {}).get("total_documents")
             if recovered_count != args.documents:
                 raise RuntimeError(f"recovered {recovered_count} documents; expected {args.documents}")
             final_sizes = file_sizes(data_dir)
             sampler.set_phase("shutdown")
-            shutdown_times.append(stop_process(process))
+            sampler.sample_process()
             recovery_resources = sampler.finish()
+            shutdown_times.append(stop_process(process))
             resources["peak_rss_bytes_kernel_high_watermark"] = max(
                 resources["peak_rss_bytes_kernel_high_watermark"],
                 recovery_resources["peak_rss_bytes_kernel_high_watermark"],
@@ -519,6 +537,8 @@ def main() -> int:
             ]
             for phase, peak in recovery_resources["phase_peak_rss_bytes_sampled"].items():
                 resources["phase_peak_rss_bytes_sampled"][phase] = peak
+            for phase, peak in recovery_resources["phase_peak_hwm_bytes_sampled"].items():
+                resources["phase_peak_hwm_bytes_sampled"][phase] = peak
 
             output = {
                 "format": "preppydb-resource-benchmark-v1",
@@ -547,6 +567,51 @@ def main() -> int:
                     "build_seconds": round(index_build_seconds, 6),
                     "rss_before_bytes": index_rss_before,
                     "rss_after_bytes": index_rss_after,
+                    "high_water_before_bytes": index_hwm_before,
+                    "high_water_after_bytes": index_hwm_after,
+                    "high_water_increase_bytes": (
+                        max(0, index_hwm_after - index_hwm_before)
+                        if index_hwm_before is not None and index_hwm_after is not None
+                        else None
+                    ),
+                },
+                "stage_boundary_memory_bytes": {
+                    "after_load": {
+                        "rss": loaded_sample[0],
+                        "high_water": loaded_sample[1],
+                    },
+                    "after_index_build": {
+                        "rss": index_rss_after,
+                        "high_water": index_hwm_after,
+                    },
+                    "after_reads": {
+                        "rss": read_complete_sample[0],
+                        "high_water": read_complete_sample[1],
+                    },
+                    "before_tail_writes": {
+                        "rss": tail_before_sample[0],
+                        "high_water": tail_before_sample[1],
+                    },
+                    "after_tail_writes": {
+                        "rss": tail_after_sample[0],
+                        "high_water": tail_after_sample[1],
+                    },
+                    "before_crash": {
+                        "rss": before_crash_sample[0],
+                        "high_water": before_crash_sample[1],
+                    },
+                    "after_recovery_startup": {
+                        "rss": after_recovery_sample[0],
+                        "high_water": after_recovery_sample[1],
+                    },
+                    "after_verify": {
+                        "rss": after_verify_sample[0],
+                        "high_water": after_verify_sample[1],
+                    },
+                    "after_stats": {
+                        "rss": after_stats_sample[0],
+                        "high_water": after_stats_sample[1],
+                    },
                 },
                 "checkpoint_rss_before_bytes": checkpoint_rss_before,
                 "checkpoint_rss_after_bytes": checkpoint_rss_after,
