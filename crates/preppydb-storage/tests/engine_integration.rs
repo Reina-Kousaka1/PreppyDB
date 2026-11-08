@@ -2717,6 +2717,136 @@ fn scan_orders_and_paginates() {
 }
 
 #[test]
+fn scan_applies_prefix_direction_and_pagination_before_cloning_results() {
+    let dir = tempdir("scan-bounded-page");
+    let engine = open(&dir);
+    engine
+        .create_collection(CollectionMeta::new("c", 0))
+        .unwrap();
+    let maximum = '\u{10ffff}'.to_string();
+    let surrogate_boundary = '\u{d7ff}'.to_string();
+    let keys = [
+        "a".to_string(),
+        "aa".to_string(),
+        "ab".to_string(),
+        format!("a{maximum}"),
+        format!("a{maximum}x"),
+        "b".to_string(),
+        "β".to_string(),
+        "βx".to_string(),
+        surrogate_boundary.clone(),
+        '\u{e000}'.to_string(),
+        maximum.clone(),
+        format!("{maximum}{maximum}"),
+    ];
+    for key in keys {
+        engine
+            .put("c", &key, Json::str(key.clone()), PutOptions::default())
+            .unwrap();
+    }
+
+    let forward = engine
+        .scan(
+            "c",
+            &ScanOptions {
+                prefix: Some("a".into()),
+                limit: 2,
+                offset: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        forward
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["aa", "ab"]
+    );
+
+    let reverse = engine
+        .scan(
+            "c",
+            &ScanOptions {
+                prefix: Some("a".into()),
+                limit: 2,
+                offset: 1,
+                reverse: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        reverse
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("a{maximum}").as_str(), "ab"]
+    );
+
+    let maximum_prefix = engine
+        .scan(
+            "c",
+            &ScanOptions {
+                prefix: Some(maximum.clone()),
+                limit: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        maximum_prefix
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        vec![maximum.as_str(), format!("{maximum}{maximum}").as_str()]
+    );
+
+    let trailing_maximum = engine
+        .scan(
+            "c",
+            &ScanOptions {
+                prefix: Some(format!("a{maximum}")),
+                limit: 0,
+                reverse: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        trailing_maximum
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            format!("a{maximum}x").as_str(),
+            format!("a{maximum}").as_str()
+        ]
+    );
+
+    let surrogate_boundary_prefix = engine
+        .scan(
+            "c",
+            &ScanOptions {
+                prefix: Some(surrogate_boundary.clone()),
+                limit: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        surrogate_boundary_prefix
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        vec![surrogate_boundary.as_str()]
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn compare_and_set_and_unique_index() {
     let dir = tempdir("cas");
     let engine = open(&dir);

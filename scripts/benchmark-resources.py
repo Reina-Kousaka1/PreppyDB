@@ -495,6 +495,27 @@ def main() -> int:
                 read_latencies.append(time.perf_counter() - read_started)
 
             read_complete_sample = sampler.sample_process()
+            scan_limit = min(100, args.documents)
+            sampler.set_phase("scan")
+            scan_rss_before, scan_hwm_before, _, _ = sampler.sample_process()
+            scan_started = time.perf_counter()
+            scan_response = request(
+                base,
+                token,
+                "GET",
+                f"/v1/collections/bench/documents?limit={scan_limit}",
+                deadline=deadline,
+            )
+            scan_seconds = time.perf_counter() - scan_started
+            scan_rss_after, scan_hwm_after, _, _ = sampler.sample_process()
+            scanned_documents = scan_response.get("data", {}).get("documents")
+            if not isinstance(scanned_documents, list) or len(scanned_documents) != scan_limit:
+                raise RuntimeError(
+                    f"scan returned {len(scanned_documents) if isinstance(scanned_documents, list) else 'no'} "
+                    f"documents; expected {scan_limit}"
+                )
+            scan_complete_sample = sampler.sample_process()
+
             sampler.set_phase("checkpoint")
             checkpoint_rss_before, _, _, _ = sampler.sample_process()
             checkpoint_started = time.perf_counter()
@@ -632,6 +653,10 @@ def main() -> int:
                         "rss": read_complete_sample[0],
                         "high_water": read_complete_sample[1],
                     },
+                    "after_scan": {
+                        "rss": scan_complete_sample[0],
+                        "high_water": scan_complete_sample[1],
+                    },
                     "before_tail_writes": {
                         "rss": tail_before_sample[0],
                         "high_water": tail_before_sample[1],
@@ -659,6 +684,20 @@ def main() -> int:
                 },
                 "checkpoint_rss_before_bytes": checkpoint_rss_before,
                 "checkpoint_rss_after_bytes": checkpoint_rss_after,
+                "scan": {
+                    "limit": scan_limit,
+                    "returned_documents": len(scanned_documents),
+                    "seconds": round(scan_seconds, 6),
+                    "rss_before_bytes": scan_rss_before,
+                    "rss_after_bytes": scan_rss_after,
+                    "high_water_before_bytes": scan_hwm_before,
+                    "high_water_after_bytes": scan_hwm_after,
+                    "high_water_increase_bytes": (
+                        max(0, scan_hwm_after - scan_hwm_before)
+                        if scan_hwm_before is not None and scan_hwm_after is not None
+                        else None
+                    ),
+                },
                 "idle_rss_after_health_bytes": idle_rss,
                 "idle_cpu_percent_of_one_core": idle_cpu_percent,
                 "process_threads_at_idle": idle_thread_count,

@@ -27,6 +27,7 @@ use crate::store::{reserve_undo_bytes, ApplyMode, Collection, Doc, Limits, Store
 use crate::wal::{self, SyncMode, WalWriter};
 use preppydb_json::Json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -38,6 +39,25 @@ type IndexEntryIter<'a> =
 
 const MAX_VERIFY_INDEX_FIELDS: usize = 4096;
 const MAX_VERIFY_INDEX_FIELD_BYTES: usize = 1024 * 1024;
+
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    for (index, ch) in prefix.char_indices().rev() {
+        let codepoint = ch as u32;
+        let next = match codepoint {
+            0xD7FF => 0xE000,
+            0x10FFFF => continue,
+            value => value + 1,
+        };
+        let Some(next) = char::from_u32(next) else {
+            continue;
+        };
+        let mut upper = String::with_capacity(index + next.len_utf8());
+        upper.push_str(&prefix[..index]);
+        upper.push(next);
+        return Some(upper);
+    }
+    None
+}
 
 fn add_verify_index_field(
     fields: &mut BTreeMap<String, BTreeSet<String>>,
@@ -1698,30 +1718,40 @@ impl Engine {
         self.check_healthy()?;
         let now = now_ms();
         let coll = state.store.collection(collection)?;
-        let mut items: Vec<(String, Doc)> = match &options.prefix {
-            Some(prefix) => coll
-                .docs
-                .range(std::sync::Arc::<str>::from(prefix.as_str())..)
-                .take_while(|(key, _)| key.starts_with(prefix))
-                .filter(|(_, doc)| options.include_expired || !doc.is_expired(now))
-                .map(|(key, doc)| (key.to_string(), doc.clone()))
-                .collect(),
-            None => coll
-                .docs
-                .iter()
-                .filter(|(_, doc)| options.include_expired || !doc.is_expired(now))
-                .map(|(key, doc)| (key.to_string(), doc.clone()))
-                .collect(),
-        };
-        if options.reverse {
-            items.reverse();
-        }
+        let upper = options.prefix.as_deref().and_then(prefix_upper_bound);
+        let lower_bound = options
+            .prefix
+            .as_deref()
+            .map(Bound::Included)
+            .unwrap_or(Bound::Unbounded);
+        let upper_bound = upper
+            .as_deref()
+            .map(Bound::Excluded)
+            .unwrap_or(Bound::Unbounded);
+        let items = coll.docs.range::<str, _>((lower_bound, upper_bound));
         let limit = if options.limit == 0 {
             usize::MAX
         } else {
             options.limit
         };
-        Ok(items.into_iter().skip(options.offset).take(limit).collect())
+        let visible =
+            |(_, doc): &(&Arc<str>, &Doc)| options.include_expired || !doc.is_expired(now);
+        if options.reverse {
+            Ok(items
+                .rev()
+                .filter(visible)
+                .skip(options.offset)
+                .take(limit)
+                .map(|(key, doc)| (key.to_string(), doc.clone()))
+                .collect())
+        } else {
+            Ok(items
+                .filter(visible)
+                .skip(options.offset)
+                .take(limit)
+                .map(|(key, doc)| (key.to_string(), doc.clone()))
+                .collect())
+        }
     }
 
     /// Look up documents by an exact secondary index value.

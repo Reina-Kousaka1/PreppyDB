@@ -430,3 +430,15 @@ The server and CLI child processes receive per-process limits (`RLIMIT_AS` 512 M
 **These limits do not provide aggregate memory isolation.** `RLIMIT_AS` applies per process, and host resource sampling is not a reservation. Therefore this runner is deliberately only a tiny smoke test. Large write loops, long soak tests, repeated crash campaigns, and full Cargo builds/tests remain blocked on the Pi until they can be run under reliable host-level resource isolation. The one-process SIGKILL check is not a power-loss test and does not prove sudden-power-loss durability.
 
 Record the CI run URL, artifact commit, Pi model and RAM size, OS/glibc/kernel, available resources before/after, output and resource samples in the hardware test report. Until that run is completed, leave this section explicitly marked untested; passing QEMU and CI jobs do not qualify Raspberry Pi hardware or establish production readiness. Windows directory-flush guarantees, an external pricing-audit anchor, independent review, and other PR hardening gates remain separate.
+
+### Limited scan memory check (candidate based on PR head `547cdab`)
+
+A paired local WSL2 comparison used the same deterministic Tiny-profile workload (10,000 documents, 900-byte payloads, one `group` index, seed `20261108`, 10-second idle window) and requested a page of 100 documents. Three runs per variant were measured. The before build used the pre-scan implementation; the candidate used bounded BTree range traversal and paginated before cloning documents.
+
+| Metric | Before | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Scan response time | 32.7 ms | 21.6 ms | 33.7% lower |
+| Scan-phase lifetime HWM increase | 12.19 MiB | 0 MiB | no new process high-water mark |
+| Whole-process peak HWM | 38.87 MiB | 33.84 MiB | 5.02 MiB lower |
+
+The endpoint returned all 100 requested documents on every run. The HWM value is the process-lifetime peak (`VmHWM`), so a zero increase means the scan did not exceed an earlier peak; it is not an independent allocator-peak measurement. These synthetic WSL2 results are diagnostic, not Raspberry Pi qualification. Unbounded full scans still materialize their requested results, and the underlying Store and indexes remain in memory.
