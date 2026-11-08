@@ -346,12 +346,45 @@ jobs:
 
       - name: Install lupa and luvit
         run: |
-          set -o pipefail
+          set -euo pipefail
           python3 -m pip install --user lupa
           RUNTIME=$(mktemp -d "$RUNNER_TEMP/preppydb-lua.XXXXXXXX")
-          curl -fLsS https://github.com/luvit/luvi/releases/download/v2.14.0/luvi-regular-Linux_x86_64 -o "$RUNTIME/luvi"
-          echo "f79614b208f7999030a13fca22ffeb91c3d880487be2b5b7e2425ab42ec7a1d0  $RUNTIME/luvi" | sha256sum -c -
+          LUVI_BIN="$RUNTIME/luvi"
+          LUVI_URL=https://github.com/luvit/luvi/releases/download/v2.14.0/luvi-regular-Linux_x86_64
+          LUVI_SHA256=f79614b208f7999030a13fca22ffeb91c3d880487be2b5b7e2425ab42ec7a1d0
+          LUVI_SOURCE_COMMIT=450ec116aef6f8cb0cba83c7e61c9bce112d6deb
+
+          if curl --fail --location --silent --show-error \
+            --connect-timeout 15 --max-time 90 \
+            --retry 4 --retry-delay 2 --retry-max-time 60 --retry-all-errors \
+            "$LUVI_URL" -o "$LUVI_BIN"; then
+            printf '%s  %s\n' "$LUVI_SHA256" "$LUVI_BIN" | sha256sum --check
+          else
+            rm -f "$LUVI_BIN"
+            echo "::notice::Official luvi release download failed; building the pinned v2.14.0 source commit."
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends build-essential cmake libssl-dev perl pkg-config
+
+            LUVI_SOURCE="$RUNTIME/luvi-src"
+            git clone --no-checkout https://github.com/luvit/luvi.git "$LUVI_SOURCE"
+            git -C "$LUVI_SOURCE" checkout --detach "$LUVI_SOURCE_COMMIT"
+            test "$(git -C "$LUVI_SOURCE" rev-parse HEAD)" = "$LUVI_SOURCE_COMMIT"
+            test "$(git -C "$LUVI_SOURCE" rev-parse 'v2.14.0^{commit}')" = "$LUVI_SOURCE_COMMIT"
+            git -C "$LUVI_SOURCE" submodule update --init --recursive
+            if git -C "$LUVI_SOURCE" submodule status --recursive | grep -E '^[-+U]'; then
+              echo "luvi source submodules do not match the pinned gitlinks" >&2
+              exit 1
+            fi
+
+            make -C "$LUVI_SOURCE" regular-shared NPROCS=2
+            make -C "$LUVI_SOURCE" NPROCS=2
+            make -C "$LUVI_SOURCE" test NPROCS=2
+            install -m 0755 "$LUVI_SOURCE/build/luvi" "$LUVI_BIN"
+          fi
           chmod +x "$RUNTIME/luvi"
+          LUVI_VERSION=$("$LUVI_BIN" --version 2>&1)
+          printf '%s\n' "$LUVI_VERSION"
+          printf '%s\n' "$LUVI_VERSION" | grep -F '2.14.0'
           git clone --no-checkout https://github.com/luvit/lit.git "$RUNTIME/lit-src"
           git -C "$RUNTIME/lit-src" checkout --detach 84fc5d729f1088b3b93bc9a55d1f7a245bca861d
           git -C "$RUNTIME/lit-src" submodule update --init --recursive
