@@ -23,6 +23,7 @@ jobs:
   linux-x86_64:
     name: Linux x86-64 (fmt, clippy, tests)
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -83,6 +84,38 @@ jobs:
 
       - name: Release build
         run: cargo build --workspace --release --locked
+
+      - name: Bounded 100,000-document resource benchmark
+        run: |
+          {
+            echo "pr_head=${{ github.event.pull_request.head.sha || github.sha }}"
+            echo "built_revision=$(git rev-parse HEAD)"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "target=x86_64-unknown-linux-gnu"
+          } > resource-build-manifest.txt
+          python3 scripts/benchmark-resources.py \
+            --server target/release/preppydb-server \
+            --profile tiny \
+            --documents 100000 \
+            --payload-bytes 1024 \
+            --batch-size 400 \
+            --index-count 1 \
+            --allow-large-test \
+            --seed 20261108 \
+            --source-commit "$(git rev-parse HEAD)" \
+            --manifest resource-build-manifest.txt \
+            --output resource-results.json
+          python3 -m json.tool resource-results.json
+
+      - name: Upload resource benchmark JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-resource-benchmark-${{ github.event.pull_request.head.sha || github.sha }}
+          path: resource-results.json
+          if-no-files-found: ignore
+          retention-days: 90
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
