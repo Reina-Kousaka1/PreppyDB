@@ -1,17 +1,47 @@
 # Bounded-Memory Storage Design (Proposal)
 
-## Current evidence (2026-11-08; PR head `f98ba65`)
+## Current evidence (2026-11-08; PR head `b2c4f56`)
 
-The current PR head is `f98ba65c3023e5641e35f0939ca03bf3831fd4ac`. GitHub Actions run
-[#140](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42512188019) passed on this
-exact commit, including Linux, Windows, emulated Linux ARM64, Lua/Luvit, Docker, the crash
+The current PR head is `b2c4f563ab40e74351666895f02ebeb881679adb`. GitHub Actions run
+[#148](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42521488292) passed on this
+commit, including Linux, Windows, emulated Linux ARM64, Lua/Luvit, Docker, the crash
 harness, and the bounded resource benchmark. The ARM64 job uses QEMU, not Raspberry Pi
-hardware. Earlier resource measurements below are synthetic WSL2 x86-64 results through
-10,000 documents, plus narrowly scoped checkpoint serializer comparisons on single 900 KiB
-and 1 MiB documents. No result here establishes Raspberry Pi capacity or real-device
-qualification. The exact-head ARM64 artifact is temporary CI output, not a release.
+hardware. No result here establishes Raspberry Pi capacity or real-device qualification.
+The exact-head ARM64 artifact is temporary CI output, not a release.
 
-### Bounded 100,000-document CI measurement
+### Current bounded 100,000-document CI measurement (run #148)
+
+Run #148 used the release server, `tiny` profile, 100,000 deterministic synthetic documents
+with 1,024 payload bytes each, one scalar index, batch size 400, a 60-second idle window,
+and seed `20261108`. It ran on GitHub Actions Ubuntu 22.04 x86-64 with a 1.5 GiB
+address-space limit, 15-minute CPU limit, 2 GiB per-file limit, and 128-file limit. The
+temporary benchmark data directory was removed. Actions tested synthetic merge revision
+`e053d423a9bfa86ee9d498f96f59d91983cc19f3`, containing PR head `b2c4f563ab40e74351666895f02ebeb881679adb`.
+The machine-readable result is in the
+[run #148 resource benchmark artifact](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42521488292/artifacts/13634200361)
+(90-day retention).
+
+| Measurement | Result |
+| --- | ---: |
+| Whole-run wall time | 90.106 s |
+| Process peak RSS (kernel high-water mark) | 232,554,496 bytes (221.71 MiB) |
+| Idle RSS / CPU after health check (60.06 s) | 3.76 MiB / 0.17% of one core |
+| Threads at idle | 3 |
+| Checkpoint RSS before → after | 207,982,592 → 208,048,128 bytes (198.35 → 198.42 MiB) |
+| Sampled checkpoint-phase peak RSS | 208,048,128 bytes (198.42 MiB) |
+| Peak phase | Verify: 232,554,496 bytes (221.71 MiB) |
+| Checkpoint duration | 1.727 s |
+| Recovery startup after isolated child SIGKILL | 1.518 s |
+| Write batch p50 / p95 | 19.775 / 20.591 ms per 400-document batch |
+| Read p50 / p95 | 20.111 / 20.234 ms |
+| Snapshot / WAL after checkpoint | 121,347,033 / 12 bytes |
+
+This confirms low observed idle use and that the verifier peak fell below the earlier
+run #140 result. The workload still needs about 222 MiB at peak for 100,000 documents,
+far above the provisional small-load target if applied at this scale. This synthetic
+hosted x86-64 result is not a Raspberry Pi measurement or a capacity guarantee.
+
+### Historical bounded 100,000-document CI measurement (run #140)
 
 Run #140 used the release server, `tiny` profile, 100,000 deterministic synthetic documents
 with 1,024 payload bytes each, one scalar index, batch size 400, a 60-second idle window,
