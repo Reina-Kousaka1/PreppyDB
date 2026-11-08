@@ -62,6 +62,7 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 fn add_verify_index_field(
     fields: &mut BTreeMap<String, BTreeSet<String>>,
     total_bytes: &mut usize,
+    total_count: &mut usize,
     collection: &str,
     field: &str,
 ) -> bool {
@@ -74,7 +75,9 @@ fn add_verify_index_field(
     let Some(next_bytes) = total_bytes.checked_add(field.len()) else {
         return false;
     };
-    let next_count: usize = fields.values().map(BTreeSet::len).sum::<usize>() + 1;
+    let Some(next_count) = total_count.checked_add(1) else {
+        return false;
+    };
     if next_count > MAX_VERIFY_INDEX_FIELDS || next_bytes > MAX_VERIFY_INDEX_FIELD_BYTES {
         return false;
     }
@@ -83,34 +86,36 @@ fn add_verify_index_field(
         .or_default()
         .insert(field.to_string());
     *total_bytes = next_bytes;
+    *total_count = next_count;
     true
 }
 
 fn add_verify_index_meta(
     fields: &mut BTreeMap<String, BTreeSet<String>>,
     total_bytes: &mut usize,
+    total_count: &mut usize,
     collection: &str,
     index: &IndexMeta,
 ) -> bool {
-    add_verify_index_field(fields, total_bytes, collection, &index.field)
+    add_verify_index_field(fields, total_bytes, total_count, collection, &index.field)
 }
 
 fn collect_verify_index_fields_from_op(
     op: &Op,
     fields: &mut BTreeMap<String, BTreeSet<String>>,
     total_bytes: &mut usize,
+    total_count: &mut usize,
 ) -> bool {
     match op {
-        Op::CreateCollection { meta } => meta
-            .indexes
-            .values()
-            .all(|index| add_verify_index_meta(fields, total_bytes, &meta.name, index)),
+        Op::CreateCollection { meta } => meta.indexes.values().all(|index| {
+            add_verify_index_meta(fields, total_bytes, total_count, &meta.name, index)
+        }),
         Op::CreateIndex { collection, index } => {
-            add_verify_index_meta(fields, total_bytes, collection, index)
+            add_verify_index_meta(fields, total_bytes, total_count, collection, index)
         }
         Op::Batch { ops, .. } => ops
             .iter()
-            .all(|op| collect_verify_index_fields_from_op(op, fields, total_bytes)),
+            .all(|op| collect_verify_index_fields_from_op(op, fields, total_bytes, total_count)),
         _ => true,
     }
 }
@@ -123,9 +128,15 @@ fn collect_verify_index_fields(
 ) -> Result<Option<BTreeMap<String, BTreeSet<String>>>> {
     let mut fields = BTreeMap::new();
     let mut total_bytes = 0usize;
+    let mut total_count = 0usize;
     for segment in segments {
         let scan = wal::scan_segment_visit(segment, |record| {
-            if !collect_verify_index_fields_from_op(&record.op, &mut fields, &mut total_bytes) {
+            if !collect_verify_index_fields_from_op(
+                &record.op,
+                &mut fields,
+                &mut total_bytes,
+                &mut total_count,
+            ) {
                 return Err(DbError::LimitExceeded {
                     limit: "verify_index_field_plan",
                     max: MAX_VERIFY_INDEX_FIELD_BYTES as u64,
@@ -2568,18 +2579,30 @@ mod document_undo_tests {
     fn verifier_index_projection_plan_is_bounded() {
         let mut fields = BTreeMap::new();
         let mut total_bytes = 0;
+        let mut total_count = 0;
         for index in 0..MAX_VERIFY_INDEX_FIELDS {
             assert!(add_verify_index_field(
                 &mut fields,
                 &mut total_bytes,
+                &mut total_count,
                 "c",
                 &format!("field_{index}")
             ));
         }
         let bounded_bytes = total_bytes;
+        assert_eq!(total_count, MAX_VERIFY_INDEX_FIELDS);
+        assert!(add_verify_index_field(
+            &mut fields,
+            &mut total_bytes,
+            &mut total_count,
+            "c",
+            "field_0"
+        ));
+        assert_eq!(total_count, MAX_VERIFY_INDEX_FIELDS);
         assert!(!add_verify_index_field(
             &mut fields,
             &mut total_bytes,
+            &mut total_count,
             "c",
             "one_more_field"
         ));
@@ -2591,15 +2614,18 @@ mod document_undo_tests {
 
         let mut byte_limited = BTreeMap::new();
         let mut byte_count = 0;
+        let mut field_count = 0;
         let too_long = "x".repeat(MAX_VERIFY_INDEX_FIELD_BYTES + 1);
         assert!(!add_verify_index_field(
             &mut byte_limited,
             &mut byte_count,
+            &mut field_count,
             "c",
             &too_long
         ));
         assert!(byte_limited.is_empty());
         assert_eq!(byte_count, 0);
+        assert_eq!(field_count, 0);
     }
 
     #[test]
