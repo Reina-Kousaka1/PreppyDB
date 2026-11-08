@@ -25,15 +25,16 @@ process.
 
 ## Current qualification snapshot
 
-- Refreshed on 2026-11-08 against PR #1 head `c16bc7ec981f8c3a03cbc0785efa563a86a9727f`.
+- Refreshed on 2026-11-08 for code revision `e69dbfde67eb78fb905c6efd4463d75356bfe8c5`.
   The comparison table above remains a point-in-time architectural comparison from the
-  date stated at its top.
+  date stated at its top. A later documentation-only update does not change that code
+  qualification.
 - PR #1 remains open and not draft. GitHub reports `mergeable=true`; that is merge
   mechanics, not a finding-closure or independent-review decision.
-- CI run [#113](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42426164871)
+- CI run [#115](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42429662702)
   completed successfully for Linux x86-64, Windows x86-64, ARM64/QEMU, Lua/Luvit, Docker
   image builds, Docker persistence, and the aggregate status. Vercel also reports
-  success. These checks qualify the checked-in head, not local uncommitted changes.
+  success. These checks qualify the checked-in code, not local uncommitted changes.
 - The execution plan classifies WAL atomicity, WAL recovery, Windows manifest behavior,
   backup/restore, HTTP, authentication, pricing audit, clients, Ruby/Lua runtime paths,
   platform qualification, and performance qualification as `PARTIAL`.
