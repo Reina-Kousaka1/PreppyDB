@@ -344,12 +344,15 @@ short-lived local Tiny process.
 Index build took 15–20 ms. Its direct before/after `VmHWM` did not increase in these
 runs. At 10,000 documents, `POST /v1/admin/verify` increased RSS from about 23.2 MiB
 after recovery startup to about 43.1 MiB; the phase high-water mark reached 43.98 MiB.
-This matches the implementation: `Engine::verify` reconstructs a full replay `Store`
-while the live `Store` remains resident. The 40 MiB provisional peak target is therefore
-exceeded by the full integrity-verification request in this workload, not by idle, the
-measured index build, or checkpoint. Verification's semantic replay is retained; no
-reduced-check verification mode was used. These are host-specific synthetic figures and
-do not qualify a Raspberry Pi.
+At the time of this `0e63e168` run, `Engine::verify` reconstructed a full replay `Store`
+while the live `Store` remained resident. The 40 MiB provisional peak target was therefore
+exceeded by the full integrity-verification request in that workload, not by idle, the
+measured index build, or checkpoint. Verification's semantic replay was retained; no
+reduced-check verification mode was used. The verifier was later changed at `f0eb9c3` to
+replay into a bounded field projection that preserves full-file decoding, checksums, and
+index semantics. Follow-up measurements and the exact fallback limits are recorded in
+[RESOURCE_STORAGE_DESIGN.md](RESOURCE_STORAGE_DESIGN.md). These WSL2 results do not qualify
+a Raspberry Pi.
 
 ## Gaps worth closing next
 

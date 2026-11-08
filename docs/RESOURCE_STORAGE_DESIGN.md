@@ -28,12 +28,15 @@ the current document is detached from its indexes. This also gives WAL append ro
 ownership of the old value without copying it. Atomic multi-operation batches retain the
 old documents needed for rollback, subject to the existing undo-byte budget.
 
-Checkpointing already serializes from the locked store without cloning the whole store.
-Snapshot recovery decodes frames directly into a private `Store`, avoiding an additional
-full-document vector. `Engine::verify` intentionally constructs a second replay `Store`
-while the live `Store` remains resident so it can check that the persisted snapshot and
-WAL are semantically replayable. This preserves a useful integrity check but makes its
-peak approach the memory cost of two stores.
+Checkpointing serializes from the locked store without cloning it. Snapshot recovery
+decodes frames directly into a private `Store`, avoiding an additional full-document
+vector. Before `f0eb9c3`, `Engine::verify` also reconstructed every full document in a
+second `Store`, making verification approach the memory cost of two stores. At `f0eb9c3`,
+the verifier was changed to retain only document keys, versions, collection metadata, and
+all fields used by snapshot or WAL index definitions. It still decodes and checksum-validates
+the complete persisted snapshot and WAL; only its private semantic replay state is
+projected. If the bounded index-field plan cannot be built safely, verification uses the
+original full-document fallback.
 
 The Tiny-profile synthetic measurements in [TESTING.md](TESTING.md#corrected-phase-separated-tiny-run-pr-head-0e63e168)
 show the current scale on one x86-64 WSL2 host: idle RSS is about 3.8 MiB; the one-run
@@ -83,16 +86,14 @@ changing only the per-value key container does not address the dominant allocati
 The working tree also moves a displaced document into the single-document rollback value
 instead of deep-cloning the old document on each update/delete. A regression test verifies
 restoration after an injected WAL append failure. This removes an extra O(document-size)
-rollback copy from that path; no update-latency claim is made. `Engine::verify` remains the
-dominant peak, so verification now builds its private replay store from only the document
-keys, versions, collection metadata, and values needed to reconstruct every persisted index.
-It first scans the retained WAL for index definitions, with limits of 4,096 distinct field
-paths and 1 MiB of field-path bytes. If the WAL is damaged or the plan exceeds those bounds,
-verification falls back to the prior full-document replay path. The snapshot reader still
-validates the complete serialized snapshot and its checksum; projection occurs only after
-each document has been decoded. WAL operations are likewise decoded and validated in full,
-then only the indexed paths are retained for semantic replay. This optimization applies only
-to the read-only verifier, never to live state or recovery.
+rollback copy from that path; no update-latency claim is made. For the verifier projection,
+the engine first scans the retained WAL for index definitions, with limits of 4,096 distinct
+field paths and 1 MiB of field-path bytes. If the WAL is damaged or the plan exceeds those
+bounds, verification falls back to the prior full-document replay path. The snapshot reader
+still validates the complete serialized snapshot and its checksum; projection occurs only
+after each document has been decoded. WAL operations are likewise decoded and validated in
+full, then only the indexed paths are retained for semantic replay. This optimization applies
+only to the read-only verifier, never to live state or recovery.
 
 A single paired resource run compared the exact `3da4a96` baseline with this projected
 verifier using the same Tiny workload, 10,000 documents, 900-byte payload, seed `20261108`,
@@ -106,6 +107,24 @@ is paid only by explicit verification. Independent repeated runs and real-hardwa
 remain necessary before making broader performance claims.
 
 All measurements are synthetic WSL2 x86-64 observations, not Raspberry Pi qualification.
+
+The bounded Tiny harness was also run against the release binary from `f0eb9c3` with a
+900-byte payload, seed `20261108`, one secondary index, and a 3-second idle observation.
+These runs are individual samples; the 100-document run used batches of 50, while the
+1,000- and 10,000-document runs used batches of 500.
+
+| Documents | Idle RSS | Idle CPU | Threads | Process peak RSS | RSS after checkpoint | Peak phase | Whole-run CPU | Wall time |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| 100 | 3.87 MiB | 0.0% | 3 | 4.98 MiB | 4.77 MiB | shutdown | 0.37% | 5.38 s |
+| 1,000 | 3.85 MiB | 0.0% | 3 | 12.92 MiB | 9.83 MiB | writes/recovery setup | 0.89% | 23.61 s |
+| 10,000 | 3.95 MiB | 0.0% | 3 | 34.55 MiB | 27.91 MiB | stats/verify | 2.39% | 24.24 s |
+
+A separate 10,000-document run with four same-field indexes peaked at 36.50 MiB and
+27.85 MiB after checkpoint. Thus the measured process peak was below the provisional
+40 MiB target in both 10,000-document cases. The CPU percentages across each complete
+benchmark include writes, reads, recovery, verification, and shutdown; they are not idle
+CPU. Idle CPU was sampled for only three seconds, so these short observations do not
+replace a longer idle test or a Raspberry Pi measurement.
 
 ## Target properties
 
