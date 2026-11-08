@@ -187,6 +187,34 @@ pub fn write_snapshot_from_store(
     )
 }
 
+/// Serialize a document frame without cloning its complete JSON value into the
+/// temporary `Doc::to_json()` object. Field order matches the ordered `Json::Object`
+/// representation, preserving the existing on-disk bytes.
+fn snapshot_doc_payload(collection: &str, key: &str, doc: &Doc) -> String {
+    let mut payload = String::new();
+    payload.push_str("{\"c\":");
+    Json::str(collection).write_compact(&mut payload);
+    payload.push_str(",\"d\":{\"created_at\":");
+    Json::int(doc.created_at).write_compact(&mut payload);
+    payload.push_str(",\"expires_at\":");
+    doc.expires_at
+        .map(Json::int)
+        .unwrap_or(Json::Null)
+        .write_compact(&mut payload);
+    payload.push_str(",\"revision\":");
+    Json::uint(doc.revision).write_compact(&mut payload);
+    payload.push_str(",\"updated_at\":");
+    Json::int(doc.updated_at).write_compact(&mut payload);
+    payload.push_str(",\"value\":");
+    doc.value.write_compact(&mut payload);
+    payload.push_str(",\"version\":");
+    Json::uint(doc.version).write_compact(&mut payload);
+    payload.push_str("},\"k\":");
+    Json::str(key).write_compact(&mut payload);
+    payload.push_str(",\"t\":\"doc\"}");
+    payload
+}
+
 fn write_snapshot_iter<'a, I>(
     path: &Path,
     generation: u64,
@@ -289,12 +317,7 @@ where
             &mut bytes,
         )?;
         for (key, doc) in docs {
-            let payload = Json::obj()
-                .with("t", Json::str("doc"))
-                .with("c", Json::str(meta.name.clone()))
-                .with("k", Json::str(key))
-                .with("d", doc.to_json())
-                .to_string();
+            let payload = snapshot_doc_payload(&meta.name, key, doc);
             write_frame(
                 &mut writer,
                 &mut body_hasher,
@@ -743,6 +766,27 @@ mod tests {
             expires_at: None,
         };
         vec![(meta, vec![("molly".to_string(), doc)])]
+    }
+
+    #[test]
+    fn snapshot_document_payload_matches_existing_json_serialization() {
+        let mut doc = sample().remove(0).1.remove(0).1;
+        doc.value = Json::obj()
+            .with("escaped\"field", Json::str("Molly\n🌊"))
+            .with(
+                "nested",
+                Json::array(vec![Json::Null, Json::Bool(true), Json::int(-12)]),
+            );
+        doc.expires_at = Some(9876);
+
+        let expected = Json::obj()
+            .with("t", Json::str("doc"))
+            .with("c", Json::str("profiles"))
+            .with("k", Json::str("key/\"🌊"))
+            .with("d", doc.to_json())
+            .to_string();
+
+        assert_eq!(snapshot_doc_payload("profiles", "key/\"🌊", &doc), expected);
     }
 
     #[test]

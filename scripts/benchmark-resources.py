@@ -32,7 +32,10 @@ MAX_WALL_SECONDS = 30 * 60
 MAX_ADDRESS_SPACE_BYTES = 1536 * 1024 * 1024
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_CPU_SECONDS = 15 * 60
-PAYLOAD_BYTES = 900
+DEFAULT_PAYLOAD_BYTES = 900
+MAX_JSON_STRING_BYTES = 1 << 20
+TINY_HTTP_BODY_BYTES = 512 * 1024
+STANDARD_HTTP_BODY_BYTES = 4 * 1024 * 1024
 SAMPLE_INTERVAL_SECONDS = 0.05
 BOOTSTRAP_TOKEN_LINE = re.compile(r"^[A-Za-z0-9_-]{40,}$")
 
@@ -284,6 +287,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", required=True, type=Path, help="Path to the built preppydb-server binary")
     parser.add_argument("--documents", type=int, default=DEFAULT_SAFE_DOCUMENTS)
+    parser.add_argument(
+        "--payload-bytes",
+        type=int,
+        default=DEFAULT_PAYLOAD_BYTES,
+        help="deterministic ASCII payload size per document (default: 900; maximum: 1 MiB)",
+    )
     parser.add_argument("--profile", choices=("standard", "tiny"), default="standard")
     parser.add_argument(
         "--idle-seconds",
@@ -321,6 +330,8 @@ def main() -> int:
         parser.error("--server must point to an existing PreppyDB server binary")
     if not 1 <= args.documents <= MAX_DOCUMENTS:
         parser.error(f"--documents must be between 1 and {MAX_DOCUMENTS}")
+    if not 1 <= args.payload_bytes <= MAX_JSON_STRING_BYTES:
+        parser.error(f"--payload-bytes must be between 1 and {MAX_JSON_STRING_BYTES}")
     if not 0.1 <= args.idle_seconds <= 300:
         parser.error("--idle-seconds must be between 0.1 and 300")
     if args.documents > DEFAULT_SAFE_DOCUMENTS and not args.allow_large_test:
@@ -329,13 +340,34 @@ def main() -> int:
         parser.error(f"--batch-size must be between 1 and {MAX_BATCH}")
     if not 1 <= args.index_count <= 16:
         parser.error("--index-count must be between 1 and 16")
+    body_limit = TINY_HTTP_BODY_BYTES if args.profile == "tiny" else STANDARD_HTTP_BODY_BYTES
+    batch_operations = min(args.batch_size, args.documents)
+    sample_operation = {
+        "op": "put",
+        "key": "doc-99999999",
+        "expected_version": 0,
+        "value": {"group": 999, "payload": "x" * args.payload_bytes},
+    }
+    operation_bytes = len(json.dumps(sample_operation, separators=(",", ":")).encode())
+    estimated_batch_bytes = (
+        len(b'{"operations":[')
+        + batch_operations * operation_bytes
+        + max(0, batch_operations - 1)
+        + len(b"]}")
+    )
+    if estimated_batch_bytes > body_limit:
+        parser.error(
+            f"estimated write batch ({estimated_batch_bytes} bytes) exceeds the "
+            f"{args.profile} HTTP body limit ({body_limit} bytes); reduce "
+            "--payload-bytes or --batch-size"
+        )
     if args.manifest and not args.manifest.is_file():
         parser.error("--manifest must point to an existing build manifest")
 
     binary = args.server.resolve()
     rng = random.Random(args.seed)
     alphabet = string.ascii_letters + string.digits
-    payload = "".join(rng.choice(alphabet) for _ in range(PAYLOAD_BYTES))
+    payload = "".join(rng.choice(alphabet) for _ in range(args.payload_bytes))
     batch_latencies: list[float] = []
     read_latencies: list[float] = []
     start_times: list[float] = []
@@ -555,7 +587,7 @@ def main() -> int:
                 "synthetic_only": True,
                 "seed": args.seed,
                 "documents": args.documents,
-                "payload_bytes_per_document": PAYLOAD_BYTES,
+                "payload_bytes_per_document": args.payload_bytes,
                 "approximate_encoded_document_bytes": len(
                     json.dumps({"group": 999, "payload": payload}, separators=(",", ":")).encode()
                 ),
