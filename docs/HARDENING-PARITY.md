@@ -1,8 +1,8 @@
 # PreppyDB / SeaWorld hardening parity
 
 This comparison uses SeaWorld DB main at `d6589e61564c91e2e013df69a98d0544e3026032`
-and PreppyDB PR #1 at `c76052945456c3391569e7230c8507ff6ea6984f`, inspected on
-2026-11-07. SeaWorld is a read-only reference; no SeaWorld files were changed.
+and PreppyDB PR #1 at `14b7df372f38a78e3ec88e66a64eaa21708b8be5`, inspected on
+2026-11-08. SeaWorld is a read-only reference; no SeaWorld files were changed.
 
 This is an engineering comparison, not a production-readiness declaration. CI proves
 only the tested jobs and failure model. Process-crash tests do not prove survival of
@@ -18,26 +18,28 @@ process.
 | Multi-segment corruption and torn tails | One append log. Incomplete final transaction/record suffix is discarded; a complete bad checksum or semantic error fails open. | Multiple WAL segments; streaming scanner; complete CRC failures are corruption; torn final tails may be truncated; sequence gaps, regressions, and torn non-final segments fail closed; explicit repair may remove later suffix segments. | Segment ordering and suffix deletion add repair crash windows absent from a single file. The plan still marks the full checkpoint/multi-segment corruption matrix incomplete. | SeaWorld's rule “never skip a complete corrupt record” is already followed. Extend failure injection around each destructive repair step and repeat open to prove idempotence. | Corrupt/truncate first, middle, and final segments around checkpoints; inject truncate, unlink, and directory-sync failures; verify strict/read-only preservation and second reopen. | High |
 | Backup and restore publication | Backup writes a compacted file to a new path, reopens/verifies it, then publishes with no-overwrite hard link. Restore requires a nonexistent target and publishes only a verified copy; no in-place replacement. | Backup archives a stable engine view and now validates archive checksums plus the extracted database before publishing. Restore validates staging and uses an intent marker; replacing an existing target moves it aside and then renames staging into place. | PreppyDB's two-rename replacement has an interruption window; intent blocks open and requires manual inspection/recovery. SeaWorld avoids that replacement problem by refusing existing targets. | Prefer create-new restore target as the safe default; if force replacement remains, preserve old data, durable intent, fail-closed open, and explicit recovery instructions. | Crash at each rename, marker creation/retirement, directory barrier and rollback; verify old/new paths and idempotent reopen on Windows/Linux. | Critical |
 | Filesystem sync and Windows | Files are synced before publication; parent directory sync is attempted where supported. Windows and device/filesystem limits are expressly documented. | POSIX directory sync is used; Windows moves use write-through APIs in selected paths, but the helper cannot flush parent directories. No power-loss guarantee is made. | Neither design proves power-loss durability on all filesystems. PreppyDB replacement operations involve more directory transitions. | Separate file-content durability from directory-entry durability in docs and errors; treat failed/unsupported barriers as explicit limits. Avoid promising universal Windows atomicity. | Native Windows tests for replacement/no-replace and process crashes; Linux fsync injection; document that power-loss remains unqualified. | High |
-| Audit and pricing mutation | SeaWorld has no pricing subsystem or pricing audit log; not directly comparable. | Pricing audit is bounded, streamed and checked on reopen, but its append and the database mutation are separate and non-atomic. Valid suffix deletion before first verification has no external anchor. | A crash or I/O error can leave a mutation without an audit entry or vice versa; local hash/checksum cannot detect a fully removed suffix without an external trusted anchor. | First define the audit contract. For atomicity, put audit intent and pricing mutation in the same PreppyDB transaction or implement a recoverable transactional outbox; do not claim atomicity from two file writes. | Crash at audit append, database commit and response; reopen and reconcile both directions; test tamper/truncation and idempotent recovery. | High |
+| Audit and pricing mutation | SeaWorld has no pricing subsystem or pricing audit log; not directly comparable. | Pricing audit is bounded, streamed and checked on reopen. A durable `started` intent precedes a DB transaction; `committed`/`aborted` follows it. Startup reconciles exact before/after images after WAL recovery, and unresolved intents block further pricing writes. Audit file and database still are not one atomic transaction. Valid suffix deletion has no external trusted anchor. | The recovery protocol handles tested process-crash windows, but cannot make two independent files atomic; an indeterminate storage outcome remains unresolved until reopen/reconciliation. A valid removed audit suffix is undetectable without an external anchor. | Keep the intent/reconciliation protocol and fail closed. If stronger atomic audit semantics are required, move the authoritative outbox/anchor into the same DB transaction before adding another independent persistence protocol. | Crash after intent, after DB commit and before terminal audit append; injected audit append/sync failures; reopen twice; verify exact before/after reconciliation and fail-closed behavior for ambiguous state; test suffix deletion limitations. | High |
 | Crash/fault injection | Dedicated child-process crash harness covers transaction, page/root publication, recovery, backup and compaction process-kill boundaries. | Rust crash harness plus injected WAL, manifest, restore and sync failures; live CI also performs kill/restart persistence tests. | Not all OS errors and multi-segment repair transitions are exercised; process termination is not power-loss testing. | Reuse explicit named failpoints at durability boundaries; assert before-or-after state and reopen twice, without sleeps as synchronization. | Full matrix across commit, repair, checkpoint, backup, restore and recovery; Linux and Windows runtime CI. | High |
 | ARM64 / Raspberry Pi | Rust 1.89 is in CI; Linux/Windows engine jobs. No ARM64 qualification is declared by the project. | ARM64 cross-build and QEMU tests plus multi-arch Docker image and persistence jobs pass on PR head. | QEMU is not physical Raspberry Pi qualification; storage media, kernel/filesystem and memory pressure differ. | Keep QEMU as build/regression coverage; add a non-production hardware qualification run before claiming Pi support. | On-device create/write/kill/reopen/verify/backup/restore on the intended Pi model, OS, filesystem and storage medium. | High |
 | CI, MSRV, Clippy | Ubuntu and Windows CI; MSRV Rust 1.89 check; format, two Clippy modes, tests, release build and crash-test feature. | Current PR head CI: Linux, Windows, ARM64/QEMU, Lua/Luvit and Docker jobs green; Rust and tests are locked in CI. | CI green does not close the missing original finding, absent independent review, or incomplete fault matrix. | Treat CI as necessary, not sufficient; link each finding to a targeted regression and platform job. | Repeat complete CI after every final fix and obtain independent review after the finding inventory is reconciled. | Medium |
 
 ## Current qualification snapshot
 
-- Refreshed on 2026-11-08 for code revision `e69dbfde67eb78fb905c6efd4463d75356bfe8c5`.
-  The comparison table above remains a point-in-time architectural comparison from the
-  date stated at its top. A later documentation-only update does not change that code
-  qualification.
+- Refreshed on 2026-11-08 for code revision `14b7df372f38a78e3ec88e66a64eaa21708b8be5`.
+  The comparison table reflects the current PreppyDB PR head and the SeaWorld main
+  revision stated at the top.
 - PR #1 remains open and not draft. GitHub reports `mergeable=true`; that is merge
   mechanics, not a finding-closure or independent-review decision.
-- CI run [#115](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42429662702)
+- CI run [#117](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42431263713)
   completed successfully for Linux x86-64, Windows x86-64, ARM64/QEMU, Lua/Luvit, Docker
   image builds, Docker persistence, and the aggregate status. Vercel also reports
-  success. These checks qualify the checked-in code, not local uncommitted changes.
+  success. These checks qualify the checked-in code at `14b7df3`.
 - The execution plan classifies WAL atomicity, WAL recovery, Windows manifest behavior,
   backup/restore, HTTP, authentication, pricing audit, clients, Ruby/Lua runtime paths,
   platform qualification, and performance qualification as `PARTIAL`.
+- Pricing audit reconciliation is recoverable for exact recorded before/after images,
+  but is not atomic across the independent audit file and database. Valid audit-suffix
+  deletion still needs an external trusted anchor to be detectable.
 - Finding inventory remains `OPEN`: the original review reports 15 findings, while only
   14 can be uniquely identified from the available report and repository records.
 - No independent final review has been recorded; there are no submitted PR reviews or
@@ -47,10 +49,9 @@ process.
   power-loss guarantee, non-atomic pricing-audit/database mutation, no external trusted
   anchor for detecting removal of a valid audit suffix, incomplete fault/performance
   matrices, and ARM64 QEMU rather than physical Raspberry Pi qualification.
-- SeaWorld's current main CI includes Rust 1.89, Ubuntu, and Windows checks. The latest
-  main commit was a Dependabot-only commit; its passing Dependabot checks are not engine
-  test evidence. The engine CI run identified in the SeaWorld repository history passed
-  on the preceding engine change.
+- SeaWorld main remains at `d6589e61564c91e2e013df69a98d0544e3026032`; that commit only
+  changes Dependabot configuration, so it does not alter the compared engine behavior.
+  The SeaWorld engine CI evidence remains from the preceding engine change.
 
 ## Decisions for this parity effort
 
