@@ -150,10 +150,11 @@ fn collect_verify_index_fields(
 fn project_verification_value(value: &mut Json, fields: &BTreeSet<String>) -> Result<()> {
     let full_value = std::mem::replace(value, Json::Null);
     let mut projected = Json::obj();
-    let mut ordered_fields: Vec<_> = fields.iter().collect();
-    ordered_fields
-        .sort_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
-    for field in ordered_fields {
+    // BTreeSet's lexical order places a path before any dotted descendant
+    // (for example, `profile` before `profile.level`). That preserves parent
+    // objects when both a parent and a nested indexed field are projected,
+    // without allocating and sorting a temporary vector for every document.
+    for field in fields {
         if let Some(index_value) = full_value.get_path(field) {
             projected
                 .set_path(field, index_value.clone())
@@ -2541,6 +2542,22 @@ pub fn collection_ref<'a>(store: &'a Store, name: &str) -> Result<&'a Collection
 #[cfg(test)]
 mod document_undo_tests {
     use super::*;
+
+    #[test]
+    fn verifier_projection_keeps_parent_and_nested_index_fields() {
+        let mut value =
+            Json::parse(r#"{"profile":{"level":17,"name":"Charlotte","unused":true}}"#).unwrap();
+        let fields = BTreeSet::from(["profile.level".to_string(), "profile".to_string()]);
+
+        project_verification_value(&mut value, &fields).unwrap();
+
+        assert_eq!(value.get_path("profile.level"), Some(&Json::uint(17)));
+        assert_eq!(
+            value.get_path("profile.name"),
+            Some(&Json::str("Charlotte"))
+        );
+        assert_eq!(value.get_path("profile.unused"), Some(&Json::Bool(true)));
+    }
 
     #[test]
     fn verifier_index_projection_plan_is_bounded() {
