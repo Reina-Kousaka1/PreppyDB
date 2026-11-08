@@ -108,6 +108,15 @@ per-segment counters. The low-level `scan_segment` convenience API retains decod
 records and therefore rejects segment files larger than 128 MiB; callers that need to
 inspect larger segments must use `scan_segment_visit` or `summarize_segment`.
 
+Snapshot recovery and verification also decode frames incrementally, directly into a
+private temporary `Store`. The store is not returned or published until frame CRCs, the
+snapshot digest, footer, trailing EOF and declared counts validate; indexes are rebuilt
+after those checks. This avoids keeping a second full document vector alongside the
+recovery store. The active document set and its indexes still reside in memory, so this
+reduces recovery-time duplication but does not make database RAM use independent of data
+size. `read_snapshot` remains available for compatibility callers that need the vector
+representation.
+
 ### Checkpointing
 
 1. Take the writer lock.

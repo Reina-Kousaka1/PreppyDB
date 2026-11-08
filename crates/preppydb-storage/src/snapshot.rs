@@ -14,7 +14,7 @@
 
 use crate::catalog::CollectionMeta;
 use crate::error::{DbError, Result};
-use crate::store::{Doc, Store};
+use crate::store::{ApplyMode, Doc, Limits, Store};
 use preppydb_crypto::crc32c;
 use preppydb_crypto::sha256::{sha256, Sha256};
 use preppydb_json::Json;
@@ -116,6 +116,16 @@ pub struct SnapshotData {
     pub header: SnapshotHeader,
     pub collections: Vec<(CollectionMeta, Vec<(String, Doc)>)>,
     pub body_sha256: String,
+}
+
+/// A fully verified snapshot loaded directly into its owned working store.
+///
+/// Unlike [`SnapshotData`], this avoids retaining a second complete vector of
+/// documents while recovery or verification builds the live `Store`.
+pub struct SnapshotStore {
+    pub header: SnapshotHeader,
+    pub body_sha256: String,
+    pub store: Store,
 }
 
 /// Write `collections` to `path` atomically (write to `.tmp`, fsync, rename).
@@ -326,8 +336,110 @@ where
     })
 }
 
-/// Read and fully verify a snapshot file.
+trait SnapshotSink {
+    fn collection(&mut self, meta: CollectionMeta) -> Result<()>;
+    fn document(&mut self, collection: &str, key: String, doc: Doc) -> Result<()>;
+}
+
+#[derive(Default)]
+struct VecSnapshotSink {
+    collections: Vec<(CollectionMeta, Vec<(String, Doc)>)>,
+    collection_indices: std::collections::BTreeMap<String, usize>,
+    document_keys: Vec<HashSet<String>>,
+}
+
+impl SnapshotSink for VecSnapshotSink {
+    fn collection(&mut self, meta: CollectionMeta) -> Result<()> {
+        let index = self.collections.len();
+        self.collection_indices.insert(meta.name.clone(), index);
+        self.collections.push((meta, Vec::new()));
+        self.document_keys.push(HashSet::new());
+        Ok(())
+    }
+
+    fn document(&mut self, collection: &str, key: String, doc: Doc) -> Result<()> {
+        let index = self
+            .collection_indices
+            .get(collection)
+            .copied()
+            .ok_or_else(|| {
+                DbError::corrupt(
+                    "snapshot",
+                    format!("document for unknown collection '{collection}'"),
+                )
+            })?;
+        if !self.document_keys[index].insert(key.clone()) {
+            return Err(DbError::corrupt(
+                "snapshot",
+                format!("duplicate document key in collection '{collection}'"),
+            ));
+        }
+        self.collections[index].1.push((key, doc));
+        Ok(())
+    }
+}
+
+struct StoreSnapshotSink {
+    store: Store,
+}
+
+impl SnapshotSink for StoreSnapshotSink {
+    fn collection(&mut self, meta: CollectionMeta) -> Result<()> {
+        self.store.create_collection(meta, ApplyMode::Replay)
+    }
+
+    fn document(&mut self, collection: &str, key: String, doc: Doc) -> Result<()> {
+        let coll = self.store.collections.get_mut(collection).ok_or_else(|| {
+            DbError::corrupt(
+                "snapshot",
+                format!("document for unknown collection '{collection}'"),
+            )
+        })?;
+        if coll.docs.insert(key, doc).is_some() {
+            return Err(DbError::corrupt(
+                "snapshot",
+                format!("duplicate document key in collection '{collection}'"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Read and fully verify a snapshot file into its compatibility representation.
 pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
+    let mut sink = VecSnapshotSink::default();
+    let (header, body_sha256) = read_snapshot_into(path, &mut sink)?;
+    Ok(SnapshotData {
+        header,
+        collections: sink.collections,
+        body_sha256,
+    })
+}
+
+/// Read and fully verify a snapshot directly into a temporary store.
+///
+/// The store is not returned until every frame CRC, the body digest, the footer,
+/// trailing EOF and declared object counts have been checked. Indexes are then
+/// rebuilt from that private store before it can be published to the engine.
+pub fn read_snapshot_store(path: &Path, limits: Limits) -> Result<SnapshotStore> {
+    let mut sink = StoreSnapshotSink {
+        store: Store::new(limits),
+    };
+    let (header, body_sha256) = read_snapshot_into(path, &mut sink)?;
+    for collection in sink.store.collections.values_mut() {
+        collection.rebuild_indexes()?;
+    }
+    Ok(SnapshotStore {
+        header,
+        body_sha256,
+        store: sink.store,
+    })
+}
+
+fn read_snapshot_into(
+    path: &Path,
+    sink: &mut impl SnapshotSink,
+) -> Result<(SnapshotHeader, String)> {
     let file =
         File::open(path).map_err(|err| DbError::io(format!("opening {}", path.display()), err))?;
     let mut reader = BufReader::new(file);
@@ -367,9 +479,9 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
     }
 
     let mut hasher = Sha256::new();
-    let mut collections: Vec<(CollectionMeta, Vec<(String, Doc)>)> = Vec::new();
     let mut collection_names = HashSet::new();
-    let mut document_keys: Vec<HashSet<String>> = Vec::new();
+    let mut document_count = 0u64;
+    let mut collection_count = 0u64;
     loop {
         let mut len_buf = [0u8; 4];
         read_snapshot_exact(&mut reader, &mut len_buf, path, "frame length or footer")?;
@@ -395,33 +507,25 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
                     "unexpected bytes after snapshot footer",
                 ));
             }
-            if collections.iter().map(|(_, d)| d.len() as u64).sum::<u64>() != header.doc_count {
+            if document_count != header.doc_count {
                 return Err(DbError::corrupt(
                     path.display().to_string(),
                     format!(
                         "header announces {} documents but the body contains {}",
-                        header.doc_count,
-                        collections.iter().map(|(_, d)| d.len()).sum::<usize>()
+                        header.doc_count, document_count
                     ),
                 ));
             }
-            let actual_collections = u64::try_from(collections.len()).map_err(|_| {
-                DbError::corrupt(path.display().to_string(), "collection count overflow")
-            })?;
-            if actual_collections != header.collections {
+            if collection_count != header.collections {
                 return Err(DbError::corrupt(
                     path.display().to_string(),
                     format!(
-                        "header announces {} collections but the body contains {actual_collections}",
-                        header.collections
+                        "header announces {} collections but the body contains {collection_count}",
+                        header.collections,
                     ),
                 ));
             }
-            return Ok(SnapshotData {
-                header,
-                collections,
-                body_sha256: preppydb_crypto::hex_encode(&digest),
-            });
+            return Ok((header, preppydb_crypto::hex_encode(&digest)));
         }
         if len > MAX_FRAME_LEN {
             return Err(DbError::corrupt(
@@ -460,8 +564,10 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
                         format!("duplicate collection '{}' in snapshot", meta.name),
                     ));
                 }
-                collections.push((meta, Vec::new()));
-                document_keys.push(HashSet::new());
+                sink.collection(meta)?;
+                collection_count = collection_count.checked_add(1).ok_or_else(|| {
+                    DbError::corrupt(path.display().to_string(), "collection count overflow")
+                })?;
             }
             Some("doc") => {
                 let collection = value
@@ -474,22 +580,10 @@ pub fn read_snapshot(path: &Path) -> Result<SnapshotData> {
                     .get("d")
                     .ok_or_else(|| DbError::corrupt("snapshot", "doc frame without document"))?;
                 let doc = Doc::from_json(doc_json)?;
-                let collection_index = collections
-                    .iter()
-                    .position(|(meta, _)| meta.name == collection)
-                    .ok_or_else(|| {
-                        DbError::corrupt(
-                            path.display().to_string(),
-                            format!("document for unknown collection '{collection}'"),
-                        )
-                    })?;
-                if !document_keys[collection_index].insert(key.to_string()) {
-                    return Err(DbError::corrupt(
-                        path.display().to_string(),
-                        format!("duplicate document key in collection '{collection}'"),
-                    ));
-                }
-                collections[collection_index].1.push((key.to_string(), doc));
+                sink.document(collection, key.to_string(), doc)?;
+                document_count = document_count.checked_add(1).ok_or_else(|| {
+                    DbError::corrupt(path.display().to_string(), "document count overflow")
+                })?;
             }
             other => {
                 return Err(DbError::corrupt(
@@ -609,6 +703,52 @@ mod tests {
         assert_eq!(loaded.collections[0].1[0].0, "molly");
         assert_eq!(loaded.collections[0].1[0].1.version, 3);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn store_reader_builds_indexed_state_without_snapshot_document_vector() {
+        let dir = tempdir("store-reader");
+        let path = dir.join("snap-1.pdb");
+        let mut collections = sample();
+        collections[0].0.indexes.insert(
+            "by_name".into(),
+            crate::catalog::IndexMeta {
+                name: "by_name".into(),
+                field: "name".into(),
+                unique: true,
+                sparse: true,
+                created_at: 1234,
+            },
+        );
+        let written = write_snapshot(&path, 1, 42, 1234, &collections).unwrap();
+
+        let loaded = read_snapshot_store(&path, Limits::default()).unwrap();
+
+        assert_eq!(loaded.header, written.header);
+        assert_eq!(loaded.body_sha256, written.body_sha256);
+        let collection = loaded.store.collection("profiles").unwrap();
+        assert_eq!(collection.docs.len(), 1);
+        assert_eq!(collection.docs["molly"].version, 3);
+        let key = Json::str("Molly").canonical_bytes();
+        assert!(collection.indexes["by_name"].entries.contains_key(&key));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn store_reader_does_not_return_state_from_a_corrupt_snapshot() {
+        let dir = tempdir("store-reader-corrupt");
+        let path = dir.join("snap-1.pdb");
+        write_snapshot(&path, 1, 42, 1234, &sample()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x80;
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(matches!(
+            read_snapshot_store(&path, Limits::default()),
+            Err(DbError::Corrupt { .. })
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

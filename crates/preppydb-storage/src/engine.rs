@@ -455,12 +455,12 @@ fn validate_snapshot_reference(manifest: &Manifest, reference: &SnapshotRef) -> 
 
 fn validate_snapshot_contents(
     reference: &SnapshotRef,
-    data: &snapshot::SnapshotData,
+    header: &snapshot::SnapshotHeader,
     path: &Path,
 ) -> Result<()> {
-    if data.header.generation != reference.generation
-        || data.header.seq != reference.seq
-        || data.header.doc_count != reference.doc_count
+    if header.generation != reference.generation
+        || header.seq != reference.seq
+        || header.doc_count != reference.doc_count
     {
         return Err(DbError::corrupt(
             path.display().to_string(),
@@ -587,24 +587,15 @@ impl Engine {
             match std::fs::symlink_metadata(&path) {
                 Ok(_) => {
                     ensure_regular_snapshot_file(&path)?;
-                    let data = snapshot::read_snapshot(&path)?;
-                    validate_snapshot_contents(&snap_ref, &data, &path)?;
+                    let data = snapshot::read_snapshot_store(&path, cfg.limits.clone())?;
+                    validate_snapshot_contents(&snap_ref, &data.header, &path)?;
                     if !snap_ref.sha256.is_empty() && data.body_sha256 != snap_ref.sha256 {
                         return Err(DbError::corrupt(
                             path.display().to_string(),
                             "snapshot SHA-256 does not match the manifest",
                         ));
                     }
-                    for (meta, docs) in data.collections {
-                        let name = meta.name.clone();
-                        store.create_collection(meta, ApplyMode::Replay)?;
-                        if let Some(coll) = store.collections.get_mut(&name) {
-                            for (key, doc) in docs {
-                                coll.docs.insert(key, doc);
-                            }
-                            coll.rebuild_indexes()?;
-                        }
-                    }
+                    store = data.store;
                     seq = data.header.seq;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1987,10 +1978,12 @@ impl Engine {
                             .with("error", Json::str(err.to_string())),
                     );
                 } else {
-                    match snapshot::read_snapshot(&path) {
+                    match snapshot::read_snapshot_store(&path, self.cfg.limits.clone()) {
                         Ok(data) => {
                             let mut ok = true;
-                            if let Err(err) = validate_snapshot_contents(snap_ref, &data, &path) {
+                            if let Err(err) =
+                                validate_snapshot_contents(snap_ref, &data.header, &path)
+                            {
                                 ok = false;
                                 issues.push(err.to_string());
                             }
@@ -2009,49 +2002,7 @@ impl Engine {
                                 ));
                             }
                             if ok {
-                                for (meta, docs) in data.collections {
-                                    let name = meta.name.clone();
-                                    if let Err(err) =
-                                        replay_store.create_collection(meta, ApplyMode::Replay)
-                                    {
-                                        ok = false;
-                                        issues.push(format!(
-                                            "snapshot {} cannot be loaded for verification: {err}",
-                                            snap_ref.file
-                                        ));
-                                        break;
-                                    }
-                                    let Some(collection) = replay_store.collections.get_mut(&name)
-                                    else {
-                                        ok = false;
-                                        issues.push(format!(
-                                            "snapshot {} omitted collection {name} during verification",
-                                            snap_ref.file
-                                        ));
-                                        break;
-                                    };
-                                    for (key, doc) in docs {
-                                        if collection.docs.insert(key.clone(), doc).is_some() {
-                                            ok = false;
-                                            issues.push(format!(
-                                                "snapshot {} contains duplicate document key {key} in collection {name}",
-                                                snap_ref.file
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                    if !ok {
-                                        break;
-                                    }
-                                    if let Err(err) = collection.rebuild_indexes() {
-                                        ok = false;
-                                        issues.push(format!(
-                                            "snapshot {} indexes cannot be rebuilt: {err}",
-                                            snap_ref.file
-                                        ));
-                                        break;
-                                    }
-                                }
+                                replay_store = data.store;
                             }
                             replay_state_valid = ok;
                             snapshot_json = Some(
@@ -2361,19 +2312,7 @@ impl std::fmt::Debug for Engine {
 
 /// Convenience: build a `Store` view from a snapshot file (used by `restore --verify`).
 pub fn load_snapshot_store(path: &Path, limits: Limits) -> Result<Store> {
-    let data = snapshot::read_snapshot(path)?;
-    let mut store = Store::new(limits);
-    for (meta, docs) in data.collections {
-        let name = meta.name.clone();
-        store.create_collection(meta, ApplyMode::Replay)?;
-        if let Some(coll) = store.collections.get_mut(&name) {
-            for (key, doc) in docs {
-                coll.docs.insert(key, doc);
-            }
-            coll.rebuild_indexes()?;
-        }
-    }
-    Ok(store)
+    Ok(snapshot::read_snapshot_store(path, limits)?.store)
 }
 
 /// Helper for tests and tooling: the collection view without cloning the whole store.

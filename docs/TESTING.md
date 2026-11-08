@@ -266,6 +266,30 @@ provisional 40 MiB target. The working set remains fully in memory; none of thes
 measurements establish a safe maximum dataset size. Re-run on a real Pi with its actual
 storage and workload before making deployment capacity decisions.
 
+### Snapshot recovery loader comparison (exploratory)
+
+Two matched 10,000-document runs compared release binaries from baseline commit
+`6a3beef` with the local change that decodes verified snapshot frames directly into a
+private `Store`. Both used `tiny`, 500-operation batches, seed `20261108`, a 10-second
+idle window and the same Ubuntu WSL2 host. This is a local synthetic comparison, not Pi
+or CI qualification.
+
+| Metric | Baseline runs | Direct-to-Store runs |
+| --- | ---: | ---: |
+| Idle RSS | 3.85–3.86 MiB | 3.75–3.82 MiB |
+| Idle CPU | 0.0–0.1% of one core | 0.1% of one core |
+| Threads at idle | 3 | 3 |
+| Process RSS high-water mark | 41.22–45.61 MiB | 38.85–43.86 MiB |
+| RSS after checkpoint | 25.67–25.68 MiB | 25.55–25.63 MiB |
+| Recovery startup | 0.125–0.204 s | 0.119–0.207 s |
+
+The median process high-water mark decreased from 43.42 MiB to 41.36 MiB across these
+two runs. Recovery-phase samples varied between runs, so they do not establish a
+recovery-only peak reduction. The structural change removes the temporary full
+`SnapshotData` document vector from engine open/verify; the active documents and indexes
+remain resident, and no bounded-cache or disk-backed document store has been added.
+The sample is small and does not demonstrate the ≤40 MiB target at 10,000 documents.
+
 Two local runs on Ubuntu under WSL2 (Linux 6.18.33.2, x86_64, 12th Gen Intel Core
 i5-12450H, rustc 1.99.1, release profile) reported median times of 2,146/2,522/2,579 ns
 and 2,141/2,566/2,615 ns respectively for the three store sizes. The corresponding p95
