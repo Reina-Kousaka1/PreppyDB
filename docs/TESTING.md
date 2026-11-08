@@ -290,6 +290,17 @@ recovery-only peak reduction. The structural change removes the temporary full
 remain resident, and no bounded-cache or disk-backed document store has been added.
 The sample is small and does not demonstrate the ≤40 MiB target at 10,000 documents.
 
+The committed direct-to-Store build (`26b8f359e409da87faa90bb19af2a8385458eecc`) was
+also measured once at each documented scale on the same host with a 10-second idle
+window. These figures are an additional current-build observation, not a Pi capacity
+claim:
+
+| Documents | Idle RSS | Idle CPU (10 s) | Threads | Process peak RSS | Checkpoint RSS | Recovery phase RSS | Recovery startup | Process CPU (whole run) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 3.87 MiB | 0.1% | 3 | 5.27 MiB | 5.09 MiB | 5.23 MiB | 0.111 s | 0.16% |
+| 1,000 | 3.86 MiB | 0.0% | 3 | 11.74 MiB | 9.78 MiB | 7.11 MiB | 0.103 s | 0.65% |
+| 10,000 | 3.81 MiB | 0.1% | 3 | 44.07 MiB | 25.64 MiB | 35.90 MiB | 0.121 s | 1.80% |
+
 Two local runs on Ubuntu under WSL2 (Linux 6.18.33.2, x86_64, 12th Gen Intel Core
 i5-12450H, rustc 1.99.1, release profile) reported median times of 2,146/2,522/2,579 ns
 and 2,141/2,566/2,615 ns respectively for the three store sizes. The corresponding p95
