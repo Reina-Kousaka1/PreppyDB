@@ -70,6 +70,16 @@ repeated sampling; four identical-field indexes are a key-sharing stress case, n
 representative production workload. The working-tree 10,000-document peak with four
 indexes was 45.32 MiB and still misses the 40 MiB objective.
 
+A follow-up experiment compared the exact `3da4a96` baseline with a temporary hybrid
+index bucket (up to 16 sorted keys in a vector, then a `BTreeSet`). Both release builds
+used the same 10,000-document Tiny workload, 900-byte payload, seed `20261108`, and
+3-second idle sample. The single-index peak was 43.50 MiB for both builds. With four
+indexes, the baseline peak was 45.16 MiB and the hybrid-bucket peak was 46.21 MiB. The
+index-build RSS and checkpoint RSS were effectively unchanged. The experiment therefore
+did not reduce peak memory and was discarded; the current implementation retains
+`BTreeSet` buckets. The peak still occurs during full-store semantic verification, so
+changing only the per-value key container does not address the dominant allocation.
+
 The working tree also moves a displaced document into the single-document rollback value
 instead of deep-cloning the old document on each update/delete. A regression test verifies
 restoration after an injected WAL append failure. This removes an extra O(document-size)
