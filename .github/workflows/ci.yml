@@ -38,6 +38,8 @@ jobs:
       - name: Raspberry Pi smoke script syntax and resource limits
         run: |
           bash -n scripts/rpi4-hardware-smoke.sh
+          python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("scripts/benchmark-resources.py").read_text())'
+          python3 scripts/benchmark-resources.py --help >/dev/null
           prlimit --as=536870912 --cpu=30 --fsize=33554432 --core=0 --nofile=128 -- true
 
       - name: Formatting
@@ -266,22 +268,40 @@ jobs:
         run: |
           set -euo pipefail
           TARGET=aarch64-unknown-linux-gnu
+          VERSION=$(awk '/^\[workspace.package\]/{in_workspace=1;next} /^\[/{in_workspace=0} in_workspace && /^version = / {gsub(/"/, "", $3); print $3; exit}' Cargo.toml)
           DIST="$GITHUB_WORKSPACE/dist/preppydb-arm64"
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-arm64-artifact"
           mkdir -p "$DIST"
           test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -n "$VERSION"
           CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo build --locked --release --target "$TARGET" \
             --bin preppydb-server --bin preppydb
           install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/preppydb-server" "$DIST/preppydb-server"
           install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/preppydb" "$DIST/preppydb"
+          MAX_GLIBC_REQUIRED=""
           for binary in "$DIST/preppydb-server" "$DIST/preppydb"; do
             readelf -h "$binary" | grep 'Machine:.*AArch64' >/dev/null
             readelf -l "$binary" | grep '/lib/ld-linux-aarch64.so.1' >/dev/null
+            required_glibc=$(readelf --version-info --wide "$binary" \
+              | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -V | tail -n 1 || true)
+            if [ -n "$required_glibc" ]; then
+              newest=$(printf '%s\n' GLIBC_2.35 "$required_glibc" | sort -V | tail -n 1)
+              if [ "$newest" != GLIBC_2.35 ]; then
+                echo "$binary requires $required_glibc, newer than the declared glibc 2.35 baseline" >&2
+                exit 1
+              fi
+              if [ -z "$MAX_GLIBC_REQUIRED" ] || \
+                [ "$(printf '%s\n' "$MAX_GLIBC_REQUIRED" "$required_glibc" | sort -V | tail -n 1)" = "$required_glibc" ]; then
+                MAX_GLIBC_REQUIRED="$required_glibc"
+              fi
+            fi
           done
           {
+            echo "version=$VERSION"
             echo "commit=$SOURCE_COMMIT"
             echo "target=$TARGET"
             echo "glibc_minimum=2.35"
+            echo "glibc_symbol_max_required=$MAX_GLIBC_REQUIRED"
             echo "rustc=$(rustc --version)"
             echo "cross_compiler=$(aarch64-linux-gnu-gcc --version | sed -n '1p')"
           } > "$DIST/manifest.txt"
