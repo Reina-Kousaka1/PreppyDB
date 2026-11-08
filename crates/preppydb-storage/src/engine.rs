@@ -2545,8 +2545,13 @@ mod document_undo_tests {
 
     #[test]
     fn verifier_projection_keeps_parent_and_nested_index_fields() {
-        let mut value =
-            Json::parse(r#"{"profile":{"level":17,"name":"Charlotte","unused":true}}"#).unwrap();
+        let mut value = Json::obj().with(
+            "profile",
+            Json::obj()
+                .with("level", Json::uint(17))
+                .with("name", Json::str("Charlotte"))
+                .with("unused", Json::Bool(true)),
+        );
         let fields = BTreeSet::from(["profile.level".to_string(), "profile".to_string()]);
 
         project_verification_value(&mut value, &fields).unwrap();
