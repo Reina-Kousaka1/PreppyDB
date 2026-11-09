@@ -66,8 +66,34 @@ This is evidence for the combined changes present on `471ef53`, including bounde
 materialization and compact verification replay; it does not isolate the effect of either
 change. In this single pair, whole-process peak was 43.3% lower and sampled Verify-phase
 RSS was 26.3% lower. It is a matched synthetic run on hosted x86-64, not a Raspberry Pi
-result or a repeated-run estimate. The separate uncommitted verifier representation change
-in the current local worktree is not included in this measurement.
+result or a repeated-run estimate. The verifier representation added later is measured in
+run #159 below.
+
+### Current PR-head qualification for `f2de769` (run #159)
+
+GitHub Actions [run #159](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42572148462)
+measured merge checkout `52b92b58e5bb654e9d005d0aac20f43c71ce2cf6` (PR head
+`f2de769a37844219efe9fba219eb4b3b770accfb` merged into base
+`20e3b591acca52ae20ffefe3cc1075ec15034ad1`) and the same pre-optimization baseline
+`f0eb9c3678a8309308a1b6c184a92b815f566a1b` in one Ubuntu x86-64 job. Both runs used Tiny,
+100,000 deterministic documents with 1,024-byte payloads, one `group` index, batch size
+400, seed `20261108`, and a 60-second idle interval. Each configuration was measured once.
+
+| Measurement | Merge checkout `52b92b5` (PR head `f2de769`) | Baseline `f0eb9c3` |
+| --- | ---: | ---: |
+| Idle RSS / CPU / threads | 3.89 MiB / 0.15% / 3 | 3.73 MiB / 0.18% / 3 |
+| Whole-process peak RSS (`VmHWM`) | 212.02 MiB | 376.60 MiB |
+| Sampled Verify-phase RSS peak | 211.34 MiB | 288.65 MiB |
+| Checkpoint RSS before → after | 198.44 → 198.45 MiB | 201.70 → 201.70 MiB |
+| Checkpoint duration | 2.120 s | 1.901 s |
+| Recovery startup after SIGKILL | 1.321 s | 1.321 s |
+
+The current merge checkout used 43.7% less whole-process peak RSS and 26.8% less sampled
+Verify-phase RSS than the matched pre-optimization baseline in this single pair. This is a
+branch-level comparison, not an isolated measurement of the `f2de769` verifier change. The
+workload uses one ordinary `group` index and does not stress sparse documents with many
+unique indexes, which is the new verifier representation's targeted case. It is a hosted
+x86-64 measurement, not a Raspberry Pi result or a repeated-run estimate.
 
 ### Current small-load Tiny-profile WSL measurements
 
