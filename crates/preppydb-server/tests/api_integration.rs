@@ -182,9 +182,35 @@ fn health_and_version_are_public() {
     assert_eq!(health.get_str("status"), Some("ok"));
     let version = client.version().unwrap();
     assert_eq!(version.get_str("engine"), Some("preppydb"));
+    // Durability is advertised on a public endpoint so a caller can refuse to run an
+    // economy on a server that acknowledges writes before they are synced. The test
+    // servers all use SyncMode::Always.
+    assert_eq!(version.get_str("sync_mode"), Some("always"));
+    assert_eq!(
+        version.get("durable_writes").and_then(|value| value.as_bool()),
+        Some(true)
+    );
     let (status, _, body) = raw(&server.base_url, "GET", "/readyz", None, None);
     assert_eq!(status, 200);
     assert_eq!(body.get("ready").and_then(|v| v.as_bool()), Some(true));
+}
+
+#[test]
+fn version_reports_a_non_durable_configuration_honestly() {
+    // The field must describe the running configuration, not a hoped-for one. With an
+    // interval sync the server still acknowledges before `fsync`, so `durable_writes`
+    // has to be false and a client can refuse to run a ledger on it.
+    let server = start("version-interval", |config| {
+        config.sync_mode = SyncMode::Interval(50);
+    });
+    let version = Client::anonymous(&server.base_url).unwrap().version().unwrap();
+    assert_eq!(version.get_str("sync_mode"), Some("interval"));
+    assert_eq!(
+        version
+            .get("durable_writes")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
 }
 
 #[test]

@@ -433,7 +433,12 @@ impl ApiState {
                     .with("api_version", Json::str(API_VERSION))
                     .with("storage_version", Json::str(preppydb_storage::VERSION))
                     .with("model_version", Json::str(preppydb_model::MODEL_VERSION))
-                    .with("engine", Json::str("preppydb")),
+                    .with("engine", Json::str("preppydb"))
+                    // Durability is a property of the running server, not of the client's
+                    // assumptions: a caller that needs "successful write == durable write"
+                    // (an economy, for example) can only decide that here.
+                    .with("sync_mode", Json::str(self.engine.sync_mode().as_str()))
+                    .with("durable_writes", Json::Bool(self.engine.sync_mode().is_always())),
             ),
             ("POST", ["v1", "auth", "login"]) => self.handle_login(request),
             ("GET", ["v1", "auth", "whoami"]) => {

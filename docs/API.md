@@ -119,8 +119,21 @@ Unknown user and wrong password return the identical `401 invalid_credentials` b
 | --- | --- |
 | `GET /healthz` | process alive: `{"status":"ok","checks":{}}` |
 | `GET /readyz` | ready to serve reads/writes: `{"ready":true,"read_only":false,"checks":{"storage":"ok"}}` — `503` when storage is unavailable |
-| `GET /v1/version` | `{"engine":"preppydb","version":"0.1.0","api":"v1"}` |
+| `GET /v1/version` | `{"engine":"preppydb","version":"0.1.0","api_version":"v1","storage_version":"…","model_version":"…","sync_mode":"always","durable_writes":true}` |
 | `GET /` | web admin UI (static) |
+
+### Durability fields in `GET /v1/version`
+
+`sync_mode` and `durable_writes` describe the running server, not a default:
+
+* `sync_mode` is the effective policy — `always`, `interval` or `never`.
+* `durable_writes` is `true` only for `always`, i.e. only when a successful write has been
+  handed to the device with `fsync` before the response is sent. Under `interval` and
+  `never` the server may acknowledge a write that a power loss can still lose.
+
+A client that cannot tolerate that — an economy, a ledger — should refuse to run when
+`durable_writes` is `false`. The same values are part of the authenticated
+`GET /v1/stats` response (`sync_mode`, and `read_only`), which is unchanged.
 
 ## Collections
 
