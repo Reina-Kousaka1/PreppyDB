@@ -189,7 +189,12 @@ fn health_and_version_are_public() {
     // economy on a server that acknowledges writes before they are synced. The test
     // servers all use SyncMode::Always.
     assert_eq!(version.get_str("sync_mode"), Some("always"));
-    assert_eq!(version.get("durable_writes").and_then(|value| value.as_bool()), Some(true));
+    assert_eq!(
+        version
+            .get("durable_writes")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
     let (status, _, body) = raw(&server.base_url, "GET", "/readyz", None, None);
     assert_eq!(status, 200);
     assert_eq!(body.get("ready").and_then(|v| v.as_bool()), Some(true));
@@ -203,9 +208,17 @@ fn version_reports_a_non_durable_configuration_honestly() {
     let server = start("version-interval", |config| {
         config.sync_mode = SyncMode::Interval(50);
     });
-    let version = Client::anonymous(&server.base_url).unwrap().version().unwrap();
+    let version = Client::anonymous(&server.base_url)
+        .unwrap()
+        .version()
+        .unwrap();
     assert_eq!(version.get_str("sync_mode"), Some("interval"));
-    assert_eq!(version.get("durable_writes").and_then(|value| value.as_bool()), Some(false));
+    assert_eq!(
+        version
+            .get("durable_writes")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
 }
 
 #[test]

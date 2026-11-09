@@ -438,7 +438,10 @@ impl ApiState {
                     // assumptions: a caller that needs "successful write == durable write"
                     // (an economy, for example) can only decide that here.
                     .with("sync_mode", Json::str(self.engine.sync_mode().as_str()))
-                    .with("durable_writes", Json::Bool(self.engine.sync_mode().is_always())),
+                    .with(
+                        "durable_writes",
+                        Json::Bool(self.engine.sync_mode().is_always()),
+                    ),
             ),
             ("POST", ["v1", "auth", "login"]) => self.handle_login(request),
             ("GET", ["v1", "auth", "whoami"]) => {
