@@ -90,30 +90,37 @@ preppydb-cli:      0 tests (verified manually, see below)
   served sampled documents intact, then shut down cleanly via SIGTERM and SIGINT and
   passed `preppydb verify`.
 
-## Current PR-head qualification (2026-11-08)
+## Current PR-head qualification (2026-11-09)
 
-PR #1 remains open on `arena/146caad2-preppydb` at
-`f98ba65c3023e5641e35f0939ca03bf3831fd4ac`. GitHub Actions run [#140](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42512188019)
-is the exact-head qualification run. Linux x86-64 (format, Clippy, tests, crash recovery,
-release build, bounded resource benchmark), Windows x86-64 (build, tests, PowerShell smoke),
-ARM64/QEMU, Lua/Luvit, Docker build/persistence, the CI aggregator, and Vercel all passed.
-The resource benchmark measures idle CPU for 60.06 seconds. QEMU is not real Pi hardware
+PR #1 remains open and unmerged on `arena/146caad2-preppydb` at
+`aa7dafab1cf5c8a31c7cf4b0e5341133be0dbc8c`. GitHub Actions run [#161](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42574240210)
+completed successfully for that exact head. Linux x86-64 (format, Clippy, tests, crash
+recovery, release build, bounded resource benchmark), Windows x86-64, ARM64/QEMU,
+Lua/Luvit, and Docker build/persistence all passed. The optional controlled stress ladder
+and stress-isolation jobs were skipped behind their manual approval gates; this run did not
+stress a Raspberry Pi or another user-operated system. QEMU is not physical Pi hardware,
 and process-kill/reopen is not power-loss durability.
 
-Local Rust validation ran in the existing Ubuntu WSL environment. Format, workspace check,
-Clippy, full workspace tests, release build, and the crash-recovery shell harness passed.
-The local Windows host still lacks MSVC `link.exe`; Windows qualification therefore comes
-from GitHub Actions, not a native local build. No Pi is attached to this workspace.
+The paired resource measurement is from [run #160](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42573094086),
+on the immediately preceding documentation-only head `cb84912d52397a2b0b804aeade3e8d6484cb989b`.
+The measured engine source was unchanged from run #159. On hosted Ubuntu x86-64, the Tiny
+profile ran 100,000 deterministic 1,024-byte documents with one `group` index. The branch
+measured 3.79 MiB idle RSS, 0.13% of one core over 60 seconds, 3 total idle threads, and
+212.07 MiB process peak RSS. The matched pre-optimization baseline measured 3.68 MiB,
+0.15%, 3 threads, and 376.53 MiB peak RSS. This single-run pair showed 43.7% lower peak
+RSS for the optimized branch; it is not a Raspberry Pi measurement, a repeated-run estimate,
+or a capacity guarantee. See [RESOURCE_STORAGE_DESIGN.md](RESOURCE_STORAGE_DESIGN.md) for
+the workload parameters and the full comparison.
 
 | Item | State | Boundary |
 | --- | --- | --- |
-| Linux x86-64 format, Clippy, tests, crash harness, release build | **green on exact PR head** | CI run #140 |
-| Windows x86-64 build, full tests, smoke | **green on exact PR head** | CI run #140; does not prove power-loss behavior |
-| Linux ARM64 build and tests | **green under QEMU** | CI run #140; emulation, not physical Raspberry Pi |
-| Lua/Luvit tests | **green on exact PR head** | CI run #140 |
-| Docker multi-architecture build and persistence | **green on exact PR head** | CI run #140; images were built, not pushed |
-| 100,000-document resource benchmark | **passed on hosted Ubuntu x86-64** | Tiny profile; 60.06 s idle sample: 3.74 MiB RSS, 0.1% CPU, 3 threads. Whole-process peak 289.93 MiB; Verify/Stats/Shutdown remain the peak phases. Paired scan data: [run #139](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42510131204/artifacts/13629147215); current 60-second run: [run #140 artifact](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42512188019/artifacts/13629009734). Not a Pi measurement or capacity guarantee. |
-| Raspberry Pi 4B hardware smoke | **not run** | No physical device attached |
+| Linux x86-64 format, Clippy, tests, crash harness, release build | **green on exact PR head** | CI run #161 |
+| Windows x86-64 build and tests | **green on exact PR head** | CI run #161; not a power-loss qualification |
+| Linux ARM64 build and tests | **green under QEMU** | CI run #161; emulation, not physical Raspberry Pi |
+| Lua/Luvit tests | **green on exact PR head** | CI run #161 |
+| Docker multi-architecture build and persistence | **green on exact PR head** | CI run #161; images were built, not pushed |
+| 100,000-document resource comparison | **passed on hosted Ubuntu x86-64** | Run #160; branch peak 212.07 MiB versus baseline 376.53 MiB. Not a Pi measurement or capacity guarantee. |
+| Raspberry Pi 4B hardware qualification | **not recorded** | No physical-device result is part of these CI runs |
 | 24-hour resource soak | **not run** | No result recorded |
 
 ## Historical checks not rerun on the current PR head
