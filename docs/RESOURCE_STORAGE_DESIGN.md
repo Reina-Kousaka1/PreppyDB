@@ -198,6 +198,17 @@ persistence and recovery inputs; they are not a page cache or lazy document sour
 reconstructs this complete state. Secondary indexes are rebuilt from snapshot documents
 and then updated by WAL replay.
 
+The `tiny` server profile is a request/concurrency preset, not an aggregate database RAM
+quota: it configures one HTTP worker, a backlog of four accepted connections, a 512 KiB
+HTTP body limit, and disables periodic TTL cleanup. The default storage limits allow up to
+5,000,000 documents per collection, 4 MiB per document, and 1,000 operations per batch;
+collection metadata can override the document count and size defaults. Transactions
+separately cap staged writes at 32 MiB. These guardrails bound request and transaction
+sizes and default collection cardinality, but they do not cap total resident state. There
+is no bounded page cache in the current backend, so `tiny` memory use continues to grow
+with the stored dataset. The 4 GiB Pi target therefore still depends on measured workload
+size until a bounded-memory storage backend exists.
+
 Two RAM costs are consequently proportional to database size:
 
 1. the live documents and their JSON values;
