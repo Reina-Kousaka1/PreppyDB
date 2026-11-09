@@ -93,33 +93,32 @@ preppydb-cli:      0 tests (verified manually, see below)
 ## Current PR-head qualification (2026-11-09)
 
 PR #1 remains open and unmerged on `arena/146caad2-preppydb` at
-`aa7dafab1cf5c8a31c7cf4b0e5341133be0dbc8c`. GitHub Actions run [#161](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42574240210)
+`09f134161a2979ef9d0ee0ff8b05ec130c7ac961`. GitHub Actions run [#164](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42577597162)
 completed successfully for that exact head. Linux x86-64 (format, Clippy, tests, crash
-recovery, release build, bounded resource benchmark), Windows x86-64, ARM64/QEMU,
+recovery, release build, bounded resource benchmarks), Windows x86-64, ARM64/QEMU,
 Lua/Luvit, and Docker build/persistence all passed. The optional controlled stress ladder
 and stress-isolation jobs were skipped behind their manual approval gates; this run did not
 stress a Raspberry Pi or another user-operated system. QEMU is not physical Pi hardware,
 and process-kill/reopen is not power-loss durability.
 
-The paired resource measurement is from [run #160](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42573094086),
-on the immediately preceding documentation-only head `cb84912d52397a2b0b804aeade3e8d6484cb989b`.
-The measured engine source was unchanged from run #159. On hosted Ubuntu x86-64, the Tiny
-profile ran 100,000 deterministic 1,024-byte documents with one `group` index. The branch
-measured 3.79 MiB idle RSS, 0.13% of one core over 60 seconds, 3 total idle threads, and
-212.07 MiB process peak RSS. The matched pre-optimization baseline measured 3.68 MiB,
-0.15%, 3 threads, and 376.53 MiB peak RSS. This single-run pair showed 43.7% lower peak
-RSS for the optimized branch; it is not a Raspberry Pi measurement, a repeated-run estimate,
-or a capacity guarantee. See [RESOURCE_STORAGE_DESIGN.md](RESOURCE_STORAGE_DESIGN.md) for
-the workload parameters and the full comparison.
+Run #164's 100,000-document matched pair used Tiny on hosted Ubuntu x86-64 with deterministic
+1,024-byte documents, one `group` index, and a 60-second idle window. The current merge
+checkout measured 212.08 MiB process peak RSS; baseline `f0eb9c3` measured 376.39 MiB.
+Run #164 also added a 100/1,000/10,000-document paired ladder: at 10,000 documents, peak
+RSS was 28.95 MiB current versus 38.55 MiB baseline; the 100- and 1,000-document peaks
+were effectively alike. These are single-run synthetic comparisons, not Raspberry Pi
+measurements, repeated-run estimates, or capacity guarantees. Full values and workload
+parameters are in [RESOURCE_STORAGE_DESIGN.md](RESOURCE_STORAGE_DESIGN.md).
 
 | Item | State | Boundary |
 | --- | --- | --- |
-| Linux x86-64 format, Clippy, tests, crash harness, release build | **green on exact PR head** | CI run #161 |
-| Windows x86-64 build and tests | **green on exact PR head** | CI run #161; not a power-loss qualification |
-| Linux ARM64 build and tests | **green under QEMU** | CI run #161; emulation, not physical Raspberry Pi |
-| Lua/Luvit tests | **green on exact PR head** | CI run #161 |
-| Docker multi-architecture build and persistence | **green on exact PR head** | CI run #161; images were built, not pushed |
-| 100,000-document resource comparison | **passed on hosted Ubuntu x86-64** | Run #160; branch peak 212.07 MiB versus baseline 376.53 MiB. Not a Pi measurement or capacity guarantee. |
+| Linux x86-64 format, Clippy, tests, crash harness, release build | **green on exact PR head** | CI run #164 |
+| Windows x86-64 build and tests | **green on exact PR head** | CI run #164; not a power-loss qualification |
+| Linux ARM64 build and tests | **green under QEMU** | CI run #164; emulation, not physical Raspberry Pi |
+| Lua/Luvit tests | **green on exact PR head** | CI run #164 |
+| Docker multi-architecture build and persistence | **green on exact PR head** | CI run #164; images were built, not pushed |
+| 100/1,000/10,000-document paired Tiny ladder | **passed on hosted Ubuntu x86-64** | Run #164; one run per variant/count. Not a Pi measurement or capacity guarantee. |
+| 100,000-document resource comparison | **passed on hosted Ubuntu x86-64** | Run #164; branch peak 212.08 MiB versus baseline 376.39 MiB. Not a Pi measurement or capacity guarantee. |
 | Raspberry Pi 4B hardware qualification | **not recorded** | No physical-device result is part of these CI runs |
 | 24-hour resource soak | **not run** | No result recorded |
 

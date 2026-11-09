@@ -120,6 +120,31 @@ not establish performance or memory use on a physical Raspberry Pi. The 3 idle t
 include the main server thread, the configured single Tiny HTTP worker, and the signal
 handler thread; Tiny configures one HTTP worker, not a total process-thread count of one.
 
+### Paired hosted small-load Tiny ladder (run #164)
+
+GitHub Actions [run #164](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42577597162)
+measured the current PR merge checkout (`d66aa15`) and pre-optimization source
+`f0eb9c3678a8309308a1b6c184a92b815f566a1b` in the same Ubuntu x86-64 job. Each was run
+once at 100, 1,000, and 10,000 deterministic documents using Tiny, a 900-byte payload
+(about 926 encoded bytes), one `group` index, seed `20261108`, a 10-second idle sample,
+and the benchmark's 500-write batch setting. The runner applied its per-process limits and
+removed the temporary data directories. The uploaded JSON artifacts contain each result.
+
+| Documents | Current peak RSS | Baseline peak RSS | Current checkpoint RSS | Baseline checkpoint RSS | Current idle RSS / CPU | Baseline idle RSS / CPU |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 5.49 MiB | 5.37 MiB | 4.99 MiB | 4.87 MiB | 3.83 MiB / 0.20% | 3.75 MiB / 0.20% |
+| 1,000 | 12.79 MiB | 12.78 MiB | 9.68 MiB | 9.66 MiB | 3.82 MiB / 0.20% | 3.83 MiB / 0.10% |
+| 10,000 | 28.95 MiB | 38.55 MiB | 26.15 MiB | 26.02 MiB | 3.83 MiB / 0.10% | 3.72 MiB / 0.10% |
+
+At 10,000 documents, the current run's process high-water mark was 24.9% lower than this
+matched baseline run; at 100 and 1,000 documents the observed peaks were effectively alike.
+Checkpoint durations were 22.4 ms, 37.3 ms, and 184.3 ms for the current run, and 22.3 ms,
+34.8 ms, and 159.5 ms for the baseline, respectively. These are single-run observations;
+the small differences at lower counts and in checkpoint times are not reliable estimates
+of a speedup or regression. The comparison is hosted x86-64 CI, not Raspberry Pi hardware,
+and does not establish a RAM cap or capacity guarantee. The separate 100,000-document
+paired comparison is recorded in the current PR-head qualification below.
+
 ### Current small-load Tiny-profile WSL measurements
 
 The release server binary for PR source `b2c4f563ab40e74351666895f02ebeb881679adb` was
