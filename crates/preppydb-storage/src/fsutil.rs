@@ -11,7 +11,7 @@ use std::path::Path;
 pub fn move_path(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        return preppydb_winfs::move_path(from, to);
+        preppydb_winfs::move_path(from, to)
     }
     #[cfg(not(windows))]
     {
@@ -23,7 +23,7 @@ pub fn move_path(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        return preppydb_winfs::replace_file(from, to);
+        preppydb_winfs::replace_file(from, to)
     }
     #[cfg(not(windows))]
     {

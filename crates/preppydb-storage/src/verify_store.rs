@@ -12,31 +12,48 @@ use crate::error::{DbError, Result};
 use crate::record::Op;
 use crate::store::{validate_key, Limits};
 use preppydb_json::Json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+
+type CanonicalValue = Arc<[u8]>;
+// Keep only fields actually present in a document. A dense Vec<Option<_>> would
+// allocate one empty slot per field in the bounded plan for every document, which
+// can amplify memory use for sparse collections with many indexed fields.
+type ProjectedValues = Vec<(usize, CanonicalValue)>;
 
 struct UniqueIndex {
     meta: IndexMeta,
-    entries: BTreeMap<Vec<u8>, Arc<str>>,
+    field_slot: usize,
+    entries: BTreeMap<CanonicalValue, Arc<str>>,
 }
 
 struct VerifyCollection {
     meta: CollectionMeta,
-    // Projection only: one compact JSON object per key, containing the bounded set
-    // of field paths that may participate in a unique index during this replay.
-    docs: BTreeMap<Arc<str>, Json>,
+    // The reverse entries share canonical bytes with the unique-index trees.
+    docs: BTreeMap<Arc<str>, ProjectedValues>,
+    field_slots: BTreeMap<String, usize>,
     unique_indexes: BTreeMap<String, UniqueIndex>,
 }
 
 pub(crate) struct VerifyStore {
     collections: BTreeMap<String, VerifyCollection>,
+    field_plan: BTreeMap<String, BTreeSet<String>>,
     limits: Limits,
 }
 
 impl VerifyStore {
+    #[cfg(test)]
     pub(crate) fn new(limits: Limits) -> Self {
+        Self::with_field_plan(limits, BTreeMap::new())
+    }
+
+    pub(crate) fn with_field_plan(
+        limits: Limits,
+        field_plan: BTreeMap<String, BTreeSet<String>>,
+    ) -> Self {
         Self {
             collections: BTreeMap::new(),
+            field_plan,
             limits,
         }
     }
@@ -45,24 +62,37 @@ impl VerifyStore {
         if self.collections.contains_key(&meta.name) {
             return Ok(()); // Match idempotent replay semantics.
         }
-        let unique_indexes = meta
-            .indexes
-            .values()
-            .filter(|index| index.unique)
-            .map(|index| {
-                (
-                    index.name.clone(),
-                    UniqueIndex {
-                        meta: index.clone(),
-                        entries: BTreeMap::new(),
-                    },
-                )
-            })
+        let mut fields = self.field_plan.get(&meta.name).cloned().unwrap_or_default();
+        fields.extend(
+            meta.indexes
+                .values()
+                .filter(|index| index.unique)
+                .map(|index| index.field.clone()),
+        );
+        let field_slots: BTreeMap<String, usize> = fields
+            .into_iter()
+            .enumerate()
+            .map(|(slot, field)| (field, slot))
             .collect();
+        let mut unique_indexes = BTreeMap::new();
+        for index in meta.indexes.values().filter(|index| index.unique) {
+            let field_slot = *field_slots.get(&index.field).ok_or_else(|| {
+                DbError::corrupt("WAL verification", "unique index field is absent from plan")
+            })?;
+            unique_indexes.insert(
+                index.name.clone(),
+                UniqueIndex {
+                    meta: index.clone(),
+                    field_slot,
+                    entries: BTreeMap::new(),
+                },
+            );
+        }
         self.collections.insert(
             meta.name.clone(),
             VerifyCollection {
                 meta,
+                field_slots,
                 docs: BTreeMap::new(),
                 unique_indexes,
             },
@@ -74,7 +104,7 @@ impl VerifyStore {
         &mut self,
         collection: &str,
         key: String,
-        projected_value: Json,
+        value: &Json,
     ) -> Result<()> {
         let coll = self.collections.get_mut(collection).ok_or_else(|| {
             DbError::corrupt(
@@ -89,9 +119,10 @@ impl VerifyStore {
                 format!("duplicate document key in collection '{collection}'"),
             ));
         }
-        Self::validate_indexes(coll, &key, &projected_value)?;
-        Self::index_document(coll, &key, &projected_value);
-        coll.docs.insert(key, projected_value);
+        let values = Self::project_values(coll, value);
+        Self::validate_indexes(coll, &key, &values)?;
+        Self::index_document(coll, &key, &values);
+        coll.docs.insert(key, values);
         Ok(())
     }
 
@@ -102,7 +133,7 @@ impl VerifyStore {
                 key,
                 value,
                 ..
-            } => self.put(collection, key, value.clone()),
+            } => self.put(collection, key, value),
             Op::Delete { collection, key } => self.delete(collection, key),
             Op::CreateCollection { meta } => self.create_collection(meta.clone()),
             Op::DropCollection { collection } => {
@@ -126,7 +157,7 @@ impl VerifyStore {
         }
     }
 
-    fn put(&mut self, collection: &str, key: &str, value: Json) -> Result<()> {
+    fn put(&mut self, collection: &str, key: &str, value: &Json) -> Result<()> {
         validate_key(key, self.limits.max_key_len)?;
         let Some(coll) = self.collections.get_mut(collection) else {
             return Ok(()); // Match replay behavior for operations before collection creation.
@@ -136,12 +167,13 @@ impl VerifyStore {
             .get_key_value(key)
             .map(|(key, _)| Arc::clone(key))
             .unwrap_or_else(|| Arc::<str>::from(key));
-        Self::validate_indexes(coll, &stored_key, &value)?;
+        let values = Self::project_values(coll, value);
+        Self::validate_indexes(coll, &stored_key, &values)?;
         if let Some(previous) = coll.docs.remove(key) {
             Self::unindex_document(coll, &stored_key, &previous);
         }
-        Self::index_document(coll, &stored_key, &value);
-        coll.docs.insert(stored_key, value);
+        Self::index_document(coll, &stored_key, &values);
+        coll.docs.insert(stored_key, values);
         Ok(())
     }
 
@@ -161,48 +193,75 @@ impl VerifyStore {
         if coll.meta.indexes.contains_key(&index.name) {
             return Ok(());
         }
-        coll.meta.indexes.insert(index.name.clone(), index.clone());
         if !index.unique {
+            coll.meta.indexes.insert(index.name.clone(), index);
             return Ok(());
         }
+        let field_slot = *coll.field_slots.get(&index.field).ok_or_else(|| {
+            DbError::corrupt(
+                "WAL verification",
+                "unique index field is absent from bounded replay plan",
+            )
+        })?;
         let mut state = UniqueIndex {
             meta: index.clone(),
+            field_slot,
             entries: BTreeMap::new(),
         };
-        for (key, value) in &coll.docs {
-            if let Some(encoded) = Self::index_value(&index, value) {
-                if let Some(other) = state.entries.get(&encoded) {
+        for (key, values) in &coll.docs {
+            if let Some(encoded) = Self::index_value(&state, values) {
+                if let Some(other) = state.entries.get(encoded.as_ref()) {
                     if other.as_ref() != key.as_ref() {
-                        return Err(Self::unique_conflict(&index, &encoded, other));
+                        return Err(Self::unique_conflict(&index, encoded.as_ref(), other));
                     }
                 }
                 state.entries.insert(encoded, Arc::clone(key));
             }
         }
+        coll.meta.indexes.insert(index.name.clone(), index.clone());
         coll.unique_indexes.insert(index.name.clone(), state);
         Ok(())
     }
 
-    fn validate_indexes(coll: &VerifyCollection, key: &str, value: &Json) -> Result<()> {
+    fn project_values(coll: &VerifyCollection, value: &Json) -> ProjectedValues {
+        let mut projected = Vec::new();
+        // `field_slots` is keyed by the same lexical order used to assign slots,
+        // so this compact list stays sorted for `index_value`'s binary search.
+        for (field, slot) in &coll.field_slots {
+            if let Some(value) = value.get_path(field) {
+                projected.push((*slot, Arc::<[u8]>::from(value.canonical_bytes())));
+            }
+        }
+        projected
+    }
+
+    fn validate_indexes(
+        coll: &VerifyCollection,
+        key: &str,
+        values: &[(usize, CanonicalValue)],
+    ) -> Result<()> {
         for index in coll.unique_indexes.values() {
-            if let Some(encoded) = Self::index_value(&index.meta, value) {
+            if let Some(encoded) = Self::index_value(index, values) {
                 if let Some(other) = index
                     .entries
-                    .get(&encoded)
+                    .get(encoded.as_ref())
                     .filter(|other| other.as_ref() != key)
                 {
-                    return Err(Self::unique_conflict(&index.meta, &encoded, other));
+                    return Err(Self::unique_conflict(&index.meta, encoded.as_ref(), other));
                 }
             }
         }
         Ok(())
     }
 
-    fn index_value(index: &IndexMeta, value: &Json) -> Option<Vec<u8>> {
-        match value.get_path(&index.field) {
-            Some(value) => Some(value.canonical_bytes()),
-            None if index.sparse => None,
-            None => Some(Json::Null.canonical_bytes()),
+    fn index_value(
+        index: &UniqueIndex,
+        values: &[(usize, CanonicalValue)],
+    ) -> Option<CanonicalValue> {
+        match values.binary_search_by_key(&index.field_slot, |(slot, _)| *slot) {
+            Ok(position) => Some(Arc::clone(&values[position].1)),
+            Err(_) if index.meta.sparse => None,
+            Err(_) => Some(null_index_key()),
         }
     }
 
@@ -214,27 +273,40 @@ impl VerifyStore {
         ))
     }
 
-    fn index_document(coll: &mut VerifyCollection, key: &Arc<str>, value: &Json) {
+    fn index_document(
+        coll: &mut VerifyCollection,
+        key: &Arc<str>,
+        values: &[(usize, CanonicalValue)],
+    ) {
         for index in coll.unique_indexes.values_mut() {
-            if let Some(encoded) = Self::index_value(&index.meta, value) {
+            if let Some(encoded) = Self::index_value(index, values) {
                 index.entries.insert(encoded, Arc::clone(key));
             }
         }
     }
 
-    fn unindex_document(coll: &mut VerifyCollection, key: &str, value: &Json) {
+    fn unindex_document(
+        coll: &mut VerifyCollection,
+        key: &str,
+        values: &[(usize, CanonicalValue)],
+    ) {
         for index in coll.unique_indexes.values_mut() {
-            if let Some(encoded) = Self::index_value(&index.meta, value) {
+            if let Some(encoded) = Self::index_value(index, values) {
                 if index
                     .entries
-                    .get(&encoded)
+                    .get(encoded.as_ref())
                     .is_some_and(|stored| stored.as_ref() == key)
                 {
-                    index.entries.remove(&encoded);
+                    index.entries.remove(encoded.as_ref());
                 }
             }
         }
     }
+}
+
+fn null_index_key() -> Arc<[u8]> {
+    static NULL_KEY: std::sync::OnceLock<Arc<[u8]>> = std::sync::OnceLock::new();
+    Arc::clone(NULL_KEY.get_or_init(|| Arc::from(Json::Null.canonical_bytes())))
 }
 
 #[cfg(test)]
@@ -319,7 +391,9 @@ mod tests {
 
     #[test]
     fn compact_replay_can_build_unique_index_after_snapshot_documents() {
-        let mut verify = VerifyStore::new(Limits::default());
+        let field_plan =
+            BTreeMap::from([("users".to_string(), BTreeSet::from(["email".to_string()]))]);
+        let mut verify = VerifyStore::with_field_plan(Limits::default(), field_plan);
         verify
             .create_collection(CollectionMeta::new("users", 1))
             .unwrap();
@@ -327,14 +401,14 @@ mod tests {
             .insert_snapshot_document(
                 "users",
                 "a".to_string(),
-                Json::obj().with("email", Json::str("a@example.test")),
+                &Json::obj().with("email", Json::str("a@example.test")),
             )
             .unwrap();
         verify
             .insert_snapshot_document(
                 "users",
                 "b".to_string(),
-                Json::obj().with("email", Json::str("b@example.test")),
+                &Json::obj().with("email", Json::str("b@example.test")),
             )
             .unwrap();
         verify
@@ -361,5 +435,45 @@ mod tests {
                 Json::obj().with("email", Json::str("a@example.test")),
             ))
             .unwrap();
+    }
+
+    #[test]
+    fn projected_values_store_only_present_fields_and_keep_sparse_index_semantics() {
+        let fields = (0..1_000).map(|n| format!("f{n:04}")).collect();
+        let plan = BTreeMap::from([("users".to_string(), fields)]);
+        let mut verify = VerifyStore::with_field_plan(Limits::default(), plan);
+        verify
+            .create_collection(CollectionMeta::new("users", 1))
+            .unwrap();
+        verify
+            .apply(&put(
+                "a",
+                Json::obj()
+                    .with("f0002", Json::str("other"))
+                    .with("f0999", Json::str("present")),
+            ))
+            .unwrap();
+
+        let values = verify.collections["users"].docs.get("a").unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].0, 2);
+        assert_eq!(values[1].0, 999);
+
+        verify
+            .apply(&Op::CreateIndex {
+                collection: "users".to_string(),
+                index: index("sparse_f0998", "f0998", true, true),
+            })
+            .unwrap();
+        verify
+            .apply(&Op::CreateIndex {
+                collection: "users".to_string(),
+                index: index("f0999", "f0999", true, false),
+            })
+            .unwrap();
+        verify.apply(&put("b", Json::obj())).unwrap();
+        assert!(verify
+            .apply(&put("c", Json::obj().with("f0999", Json::str("present")),))
+            .is_err());
     }
 }

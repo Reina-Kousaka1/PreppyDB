@@ -43,6 +43,32 @@ run #140 result. The workload still needs about 222 MiB at peak for 100,000 docu
 far above the provisional small-load target if applied at this scale. This synthetic
 hosted x86-64 result is not a Raspberry Pi measurement or a capacity guarantee.
 
+### Matched CI comparison for PR head `471ef53` (run #154)
+
+GitHub Actions [run #154](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42527969164)
+measured merge checkout `52c933dead764e4894fad890d5be114346444a35` (PR head
+`471ef53d7a055617493e725dbe2f62dc705ad724` merged into base `20e3b591acca52ae20ffefe3cc1075ec15034ad1`)
+and a pre-optimization baseline at `f0eb9c3678a8309308a1b6c184a92b815f566a1b` in the same
+Ubuntu x86-64 job. Both used Tiny, 100,000 deterministic 1,024-byte documents, one `group`
+index, batch size 400, seed `20261108`, and a 60-second idle interval. Each configuration
+was measured once.
+
+| Measurement | Merge checkout `52c933d` (PR head `471ef53`) | Baseline `f0eb9c3` |
+| --- | ---: | ---: |
+| Idle RSS / CPU / threads | 3.81 MiB / 0.13% / 3 | 3.74 MiB / 0.13% / 3 |
+| Whole-process peak RSS (`VmHWM`) | 213.40 MiB | 376.61 MiB |
+| Sampled Verify-phase RSS peak | 212.84 MiB | 288.62 MiB |
+| Checkpoint RSS before → after | 198.41 → 198.43 MiB | 201.71 → 201.71 MiB |
+| Bounded scan (`limit=100`) duration | 21.3 ms | 305.7 ms |
+| Scan-phase sampled RSS peak | 198.41 MiB | 376.61 MiB |
+
+This is evidence for the combined changes present on `471ef53`, including bounded scan
+materialization and compact verification replay; it does not isolate the effect of either
+change. In this single pair, whole-process peak was 43.3% lower and sampled Verify-phase
+RSS was 26.3% lower. It is a matched synthetic run on hosted x86-64, not a Raspberry Pi
+result or a repeated-run estimate. The separate uncommitted verifier representation change
+in the current local worktree is not included in this measurement.
+
 ### Current small-load Tiny-profile WSL measurements
 
 The release server binary for PR source `b2c4f563ab40e74351666895f02ebeb881679adb` was

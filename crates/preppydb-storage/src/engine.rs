@@ -185,50 +185,6 @@ fn collect_verify_index_fields(
     Ok(Some(fields))
 }
 
-fn project_verification_value(value: &mut Json, fields: &BTreeSet<String>) -> Result<()> {
-    let full_value = std::mem::replace(value, Json::Null);
-    let mut projected = Json::obj();
-    // BTreeSet's lexical order places a path before any dotted descendant
-    // (for example, `profile` before `profile.level`). That preserves parent
-    // objects when both a parent and a nested indexed field are projected,
-    // without allocating and sorting a temporary vector for every document.
-    for field in fields {
-        if let Some(index_value) = full_value.get_path(field) {
-            projected
-                .set_path(field, index_value.clone())
-                .map_err(|error| {
-                    DbError::corrupt(
-                        "WAL verification",
-                        format!("cannot project indexed field '{field}': {error}"),
-                    )
-                })?;
-        }
-    }
-    *value = projected;
-    Ok(())
-}
-
-fn project_verification_op(op: &mut Op, fields: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
-    match op {
-        Op::Put {
-            collection, value, ..
-        } => {
-            if let Some(fields) = fields.get(collection) {
-                project_verification_value(value, fields)?;
-            } else {
-                *value = Json::obj();
-            }
-        }
-        Op::Batch { ops, .. } => {
-            for op in ops {
-                project_verification_op(op, fields)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 /// What to do when recovery finds corruption that is not a torn tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepairPolicy {
@@ -2171,7 +2127,7 @@ impl Engine {
             ensure_regular_snapshot_file(&path).ok()?;
             Some(path)
         });
-        let mut verify_index_fields = if manifest.snapshot.is_none() || snapshot_path.is_some() {
+        let verify_index_fields = if manifest.snapshot.is_none() || snapshot_path.is_some() {
             collect_verify_index_fields(&wal_segments)?
         } else {
             None
@@ -2180,10 +2136,12 @@ impl Engine {
         // can still be impossible to apply (for example, a unique index that conflicts
         // with existing documents). Reconstruct the snapshot baseline and replay the
         // retained suffix just as open() does, so a clean report predicts reopenability.
-        let mut replay_store = if verify_index_fields.is_some() {
-            VerifyReplayStore::Compact(VerifyStore::new(self.cfg.limits.clone()))
-        } else {
-            VerifyReplayStore::Full(Store::new(self.cfg.limits.clone()))
+        let mut replay_store = match &verify_index_fields {
+            Some(fields) => VerifyReplayStore::Compact(VerifyStore::with_field_plan(
+                self.cfg.limits.clone(),
+                fields.clone(),
+            )),
+            None => VerifyReplayStore::Full(Store::new(self.cfg.limits.clone())),
         };
         let mut replay_state_valid = manifest.snapshot.is_none();
         let mut snapshot_json = None;
@@ -2212,20 +2170,17 @@ impl Engine {
                     );
                 } else {
                     let snapshot_result =
-                        match verify_index_fields.take() {
+                        match verify_index_fields.as_ref() {
                             Some(fields) => match snapshot::read_snapshot_verification_projected(
                                 &path,
                                 self.cfg.limits.clone(),
-                                &fields,
+                                fields,
                             ) {
-                                Ok(data) => {
-                                    verify_index_fields = Some(data.index_fields);
-                                    Ok(VerifySnapshotData {
-                                        header: data.header,
-                                        body_sha256: data.body_sha256,
-                                        store: VerifyReplayStore::Compact(data.store),
-                                    })
-                                }
+                                Ok(data) => Ok(VerifySnapshotData {
+                                    header: data.header,
+                                    body_sha256: data.body_sha256,
+                                    store: VerifyReplayStore::Compact(data.store),
+                                }),
                                 Err(DbError::LimitExceeded {
                                     limit: "verify_index_field_plan",
                                     ..
@@ -2233,7 +2188,6 @@ impl Engine {
                                     // Snapshot and WAL metadata together exceeded the
                                     // bounded projection plan. Fall back to the established
                                     // full-document replay instead of omitting index fields.
-                                    verify_index_fields = None;
                                     snapshot::read_snapshot_store(&path, self.cfg.limits.clone())
                                         .map(|data| VerifySnapshotData {
                                             header: data.header,
@@ -2342,14 +2296,7 @@ impl Engine {
                 }
                 previous_seq = record.seq;
                 if replay_state_valid {
-                    let mut op = record.op;
-                    let projected = match verify_index_fields.as_ref() {
-                        Some(fields) => project_verification_op(&mut op, fields),
-                        None => Ok(()),
-                    };
-                    if let Err(err) =
-                        projected.and_then(|()| replay_store.apply(&op, record.ts, record.seq))
-                    {
+                    if let Err(err) = replay_store.apply(&record.op, record.ts, record.seq) {
                         issues.push(format!(
                             "{name}: record sequence {} cannot be replayed: {err}",
                             record.seq
@@ -2601,24 +2548,48 @@ mod document_undo_tests {
     use super::*;
 
     #[test]
-    fn verifier_projection_keeps_parent_and_nested_index_fields() {
-        let mut value = Json::obj().with(
-            "profile",
-            Json::obj()
-                .with("level", Json::uint(17))
-                .with("name", Json::str("Charlotte"))
-                .with("unused", Json::Bool(true)),
-        );
-        let fields = BTreeSet::from(["profile.level".to_string(), "profile".to_string()]);
-
-        project_verification_value(&mut value, &fields).unwrap();
-
-        assert_eq!(value.get_path("profile.level"), Some(&Json::uint(17)));
-        assert_eq!(
-            value.get_path("profile.name"),
-            Some(&Json::str("Charlotte"))
-        );
-        assert_eq!(value.get_path("profile.unused"), Some(&Json::Bool(true)));
+    fn verifier_field_plan_retains_nested_values_for_future_unique_indexes() {
+        let fields = BTreeMap::from([(
+            "users".to_string(),
+            BTreeSet::from(["profile.level".to_string()]),
+        )]);
+        let mut verify = VerifyStore::with_field_plan(Limits::default(), fields);
+        verify
+            .create_collection(CollectionMeta::new("users", 1))
+            .unwrap();
+        verify
+            .insert_snapshot_document(
+                "users",
+                "a".to_string(),
+                &Json::obj().with(
+                    "profile",
+                    Json::obj()
+                        .with("level", Json::uint(17))
+                        .with("name", Json::str("Charlotte"))
+                        .with("unused", Json::Bool(true)),
+                ),
+            )
+            .unwrap();
+        verify
+            .apply(&Op::CreateIndex {
+                collection: "users".to_string(),
+                index: IndexMeta {
+                    name: "level".to_string(),
+                    field: "profile.level".to_string(),
+                    unique: true,
+                    sparse: false,
+                    created_at: 2,
+                },
+            })
+            .unwrap();
+        assert!(verify
+            .apply(&Op::Put {
+                collection: "users".to_string(),
+                key: "b".to_string(),
+                value: Json::obj().with("profile", Json::obj().with("level", Json::uint(17))),
+                expires_at: None,
+            })
+            .is_err());
     }
 
     #[test]

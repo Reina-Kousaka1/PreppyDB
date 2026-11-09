@@ -136,7 +136,6 @@ pub(crate) struct VerificationSnapshot {
     pub header: SnapshotHeader,
     pub body_sha256: String,
     pub store: VerifyStore,
-    pub index_fields: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Write `collections` to `path` atomically (write to `.tmp`, fsync, rename).
@@ -657,25 +656,14 @@ impl SnapshotSink for VerifySnapshotSink {
     }
 
     fn document(&mut self, collection: &str, key: String, doc: Doc) -> Result<()> {
-        let fields = self.collection_fields.get(collection).ok_or_else(|| {
+        self.collection_fields.get(collection).ok_or_else(|| {
             DbError::corrupt(
                 "snapshot",
                 format!("document for unknown collection '{collection}'"),
             )
         })?;
-        let mut projected = Json::obj();
-        for field in fields {
-            if let Some(value) = doc.value.get_path(field) {
-                projected.set_path(field, value.clone()).map_err(|error| {
-                    DbError::corrupt(
-                        "snapshot",
-                        format!("cannot project indexed field '{field}': {error}"),
-                    )
-                })?;
-            }
-        }
         self.store
-            .insert_snapshot_document(collection, key, projected)
+            .insert_snapshot_document(collection, key, &doc.value)
     }
 }
 
@@ -686,12 +674,13 @@ pub(crate) fn read_snapshot_verification_projected(
     limits: Limits,
     additional_index_fields: &BTreeMap<String, BTreeSet<String>>,
 ) -> Result<VerificationSnapshot> {
-    let projection = additional_index_fields
+    let field_plan = additional_index_fields.clone();
+    let projection: BTreeMap<String, Vec<String>> = additional_index_fields
         .iter()
         .map(|(collection, fields)| (collection.clone(), fields.iter().cloned().collect()))
         .collect();
     let mut sink = VerifySnapshotSink {
-        store: VerifyStore::new(limits),
+        store: VerifyStore::with_field_plan(limits, field_plan),
         projection,
         collection_fields: BTreeMap::new(),
         field_count: 0,
@@ -702,7 +691,6 @@ pub(crate) fn read_snapshot_verification_projected(
         header,
         body_sha256,
         store: sink.store,
-        index_fields: sink.collection_fields,
     })
 }
 
