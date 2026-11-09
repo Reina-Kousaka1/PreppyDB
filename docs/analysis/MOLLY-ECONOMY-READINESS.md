@@ -1,5 +1,10 @@
 # PreppyDB ↔ Molly economy: independent readiness review
 
+**Follow-up (2026-11-04):** two findings here have since been addressed in code — H5 (no
+`EINTR` handling on the WAL `fsync`) and H6 (durability not visible on `GET /v1/version`).
+See `CHANGELOG.md` and [`docs/MOLLY-STORAGE-CONTRACT.md`](../MOLLY-STORAGE-CONTRACT.md).
+The rest of the document is unchanged and still describes `932f4c9`.
+
 **Status of this document: analysis only.** No production data was touched, no repository
 other than this one was modified, and **no test in this document was executed**. Every
 code claim below is a *reading* of the named file and line range, not a measurement. Where
