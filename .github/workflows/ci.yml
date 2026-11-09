@@ -1,0 +1,787 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Choose full CI, isolation-only, or the separately approved bounded stress workflow"
+        required: true
+        type: choice
+        options:
+          - isolation-only
+          - full-ci
+          - bounded-stress
+        default: isolation-only
+      stress_approval:
+        description: "Explicitly authorize the bounded 1/10/25/50/100-client synthetic test (leave unchecked for isolation-only)"
+        required: false
+        type: boolean
+        default: false
+      isolation_run_id:
+        description: "Successful isolation-only Actions run ID for this exact commit (required only for a later bounded-stress dispatch)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Treat compiler warnings as errors so the tree stays clean.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ------------------------------------------------------------------ Linux x86-64
+  linux-x86_64:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
+    name: Linux x86-64 (fmt, clippy, tests)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-x86_64
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Raspberry Pi smoke script syntax and resource limits
+        run: |
+          bash -n scripts/rpi4-hardware-smoke.sh
+          python3 -c 'import ast, pathlib; ast.parse(pathlib.Path("scripts/benchmark-resources.py").read_text())'
+          python3 scripts/benchmark-resources.py --help >/dev/null
+          prlimit --as=536870912 --cpu=30 --fsize=33554432 --core=0 --nofile=128 -- true
+
+      - name: Formatting
+        run: |
+          set -o pipefail
+          cargo fmt --all --check 2>&1 | tee fmt.log || {
+            awk '/^Diff in / {print; n=4; next} n>0 {print; n--}' fmt.log | head -12 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          }
+
+      - name: Clippy
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee clippy.log || {
+            awk '/^error(\[|:)|^warning: / {print; n=4; next} n>0 {print; n--}' clippy.log | head -12 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          }
+
+      - name: Unit and integration tests
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked 2>&1 | tee tests.log || {
+            awk '/^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^---- / {print; n=2; next} n>0 {print; n--}' tests.log | head -12 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          }
+
+      - name: Ruby planner and Rust bridge
+        run: |
+          ruby engines/ruby/test_planner.rb
+          cargo test -p preppydb-server --features ruby-integration-tests --test ruby_planner_integration --locked
+          cargo test -p preppydb-server --features ruby-integration-tests --test api_integration ruby_query_endpoint --locked
+
+      - name: Build the binaries used by the end-to-end scripts
+        run: cargo build --locked --bin preppydb-server --bin preppydb
+
+      - name: Crash recovery (kill -9 a live server, restart, verify)
+        run: bash scripts/crash-recovery-test.sh
+
+      - name: Release build
+        run: cargo build --workspace --release --locked
+
+      - name: Bounded 100,000-document resource benchmark
+        run: |
+          {
+            echo "pr_head=${{ github.event.pull_request.head.sha || github.sha }}"
+            echo "built_revision=$(git rev-parse HEAD)"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "target=x86_64-unknown-linux-gnu"
+          } > resource-build-manifest.txt
+          python3 scripts/benchmark-resources.py \
+            --server target/release/preppydb-server \
+            --profile tiny \
+            --documents 100000 \
+            --payload-bytes 1024 \
+            --idle-seconds 60 \
+            --batch-size 400 \
+            --index-count 1 \
+            --allow-large-test \
+            --seed 20261108 \
+            --source-commit "$(git rev-parse HEAD)" \
+            --manifest resource-build-manifest.txt \
+            --output resource-results.json
+          python3 -m json.tool resource-results.json
+
+      - name: Build pre-optimization resource baseline
+        uses: actions/checkout@v4
+        with:
+          ref: f0eb9c3678a8309308a1b6c184a92b815f566a1b
+          path: benchmark-baseline
+          persist-credentials: false
+
+      - name: Run matching benchmark on pre-optimization baseline
+        run: |
+          cargo build --manifest-path benchmark-baseline/Cargo.toml \
+            --workspace --release --locked --target-dir target/baseline
+          {
+            echo "pr_head=${{ github.event.pull_request.head.sha || github.sha }}"
+            echo "built_revision=f0eb9c3678a8309308a1b6c184a92b815f566a1b"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "target=x86_64-unknown-linux-gnu"
+          } > resource-baseline-manifest.txt
+          python3 scripts/benchmark-resources.py \
+            --server target/baseline/release/preppydb-server \
+            --profile tiny \
+            --documents 100000 \
+            --payload-bytes 1024 \
+            --idle-seconds 60 \
+            --batch-size 400 \
+            --index-count 1 \
+            --allow-large-test \
+            --seed 20261108 \
+            --source-commit f0eb9c3678a8309308a1b6c184a92b815f566a1b \
+            --manifest resource-baseline-manifest.txt \
+            --output resource-baseline-results.json
+          python3 -m json.tool resource-baseline-results.json
+
+      - name: Paired Tiny small-load resource ladder (100/1k/10k)
+        run: |
+          run_small_ladder() {
+            label="$1"
+            server="$2"
+            source_commit="$3"
+            manifest="$4"
+            for documents in 100 1000 10000; do
+              output="resource-${label}-${documents}.json"
+              python3 scripts/benchmark-resources.py \
+                --server "$server" \
+                --profile tiny \
+                --documents "$documents" \
+                --payload-bytes 900 \
+                --idle-seconds 10 \
+                --batch-size 500 \
+                --index-count 1 \
+                --allow-large-test \
+                --seed 20261108 \
+                --source-commit "$source_commit" \
+                --manifest "$manifest" \
+                --output "$output"
+              python3 -m json.tool "$output"
+            done
+          }
+          run_small_ladder current target/release/preppydb-server \
+            "$(git rev-parse HEAD)" resource-build-manifest.txt
+          run_small_ladder baseline target/baseline/release/preppydb-server \
+            f0eb9c3678a8309308a1b6c184a92b815f566a1b resource-baseline-manifest.txt
+
+      - name: Upload resource benchmark JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-resource-benchmark-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            resource-results.json
+            resource-baseline-results.json
+            resource-current-100.json
+            resource-current-1000.json
+            resource-current-10000.json
+            resource-baseline-100.json
+            resource-baseline-1000.json
+            resource-baseline-10000.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-linux-x86_64
+          path: |
+            target/release/preppydb-server
+            target/release/preppydb
+          if-no-files-found: error
+          retention-days: 14
+
+  # ----------------------------------------------------------------- Windows x86-64
+  windows-x86_64:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
+    name: Windows x86-64 (build + tests)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x86_64
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Tests
+        shell: pwsh
+        run: |
+          cargo test --workspace --locked 2>&1 | Tee-Object -FilePath tests.log
+          if ($LASTEXITCODE -ne 0) {
+            $lines = Get-Content tests.log
+            $hits = @()
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^---- ') {
+                $hits += $lines[$i]
+                for ($j = 1; $j -le 2 -and ($i + $j) -lt $lines.Count; $j++) { $hits += $lines[$i + $j] }
+              }
+            }
+            $hits | Select-Object -First 12 | ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
+
+      - name: Ruby planner and Rust bridge
+        shell: pwsh
+        run: |
+          ruby engines/ruby/test_planner.rb
+          cargo test -p preppydb-server --features ruby-integration-tests --test ruby_planner_integration --locked
+          cargo test -p preppydb-server --features ruby-integration-tests --test api_integration ruby_query_endpoint --locked
+
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-log
+          path: |
+            tests.log
+            ${{ runner.temp }}/smoke-server.out
+            ${{ runner.temp }}/smoke-server.err
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Release build
+        run: cargo build --workspace --release --locked
+
+      # A short smoke test proves the server actually starts on Windows and serves HTTP.
+      - name: Smoke test (PowerShell)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $data = Join-Path $env:RUNNER_TEMP "preppydb-smoke"
+          $out = Join-Path $env:RUNNER_TEMP "smoke-server.out"
+          $err = Join-Path $env:RUNNER_TEMP "smoke-server.err"
+          $server = $null
+          $stage = "initialization"
+          try {
+            $init = & .\target\release\preppydb-server.exe --data-dir $data --bootstrap-token ci --init-only 2>&1
+            # Pick the token by shape (32 random bytes, base64url) rather than by line number.
+            $token = ($init | Where-Object { $_ -match '^[A-Za-z0-9_-]{40,}$' } | Select-Object -First 1)
+            if (-not $token) { throw "no bootstrap token was printed" }
+            # Mask before writing any initialization output: init includes the one-time secret.
+            Write-Host "::add-mask::$token"
+            $init | Where-Object { $_ -notmatch '^[A-Za-z0-9_-]{40,}$' } | ForEach-Object { Write-Host "init: $_" }
+            $server = Start-Process -FilePath .\target\release\preppydb-server.exe `
+                -ArgumentList "--data-dir", $data, "--listen", "127.0.0.1:7070" `
+                -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+            $healthy = $false
+            $closeHeaders = @{ Connection = "close" }
+            $stage = "health check"
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Milliseconds 500
+              if ($server.HasExited) {
+                throw "server exited with code $($server.ExitCode) before becoming healthy"
+              }
+              try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:7070/healthz" -Headers $closeHeaders -TimeoutSec 2
+                if ($health.status -eq "ok") { $healthy = $true; break }
+              } catch { }
+            }
+            if (-not $healthy) { throw "server did not become healthy" }
+            $headers = @{ Authorization = "Bearer $token"; Connection = "close" }
+            $stage = "create collection"
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections" `
+                -Headers $headers -ContentType "application/json" -Body '{"name":"windows_smoke"}' | Out-Null
+            $stage = "insert document"
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents" `
+                -Headers $headers -ContentType "application/json" -Body '{"key":"k","value":{"ok":true}}' | Out-Null
+            $stage = "read document"
+            $doc = Invoke-RestMethod -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents/k" -Headers $headers
+            if ($doc.data.value.ok -ne $true) { throw "document did not round-trip" }
+            Write-Host "smoke test passed"
+          } catch {
+            Write-Host "::error::Smoke test failed during $stage`: $($_.Exception.ToString())"
+            if ($server -and $server.HasExited) { Write-Host "server-exit-code: $($server.ExitCode)" }
+            if (Test-Path $out) { Get-Content $out -Tail 30 | ForEach-Object { Write-Host "server-out: $_" } }
+            if (Test-Path $err) { Get-Content $err -Tail 30 | ForEach-Object { Write-Host "server-err: $_" } }
+            exit 1
+          } finally {
+            if ($server -and -not $server.HasExited) {
+              Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+  # -------------------------------------------------- Linux ARM64 (build + emulated tests)
+  linux-arm64:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
+    name: Linux ARM64 (build, emulated tests)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-arm64
+
+      - name: Cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user-static
+
+      - name: Build for aarch64
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: cargo build --workspace --locked --target aarch64-unknown-linux-gnu
+
+      # These tests run under qemu-user, i.e. emulated ARM64 — not on a Raspberry Pi.
+      # Real-hardware validation is listed as an open item in docs/TESTING.md.
+      - name: Tests under qemu
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
+          # The crash test re-executes the test binary; qemu-user cannot do that without
+          # binfmt_misc. It runs on the native x86-64 and Windows jobs instead.
+          PREPPYDB_SKIP_CHILD_CRASH: "1"
+        run: |
+          set -o pipefail
+          if ! cargo test --workspace --locked --target aarch64-unknown-linux-gnu 2>&1 | tee qemu-test.log; then
+            # GitHub keeps only a handful of annotations per step, so print the failing
+            # test names, compiler errors and panic messages (plus two lines of context).
+            awk '/^test .* FAILED$|^error(\[|:)|^failures:$|panicked at|^---- |Exec format/ {print; n=2; next} n>0 {print; n--}' \
+              qemu-test.log | head -12 | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
+
+      - name: Checkout exact source commit for the Pi artifact
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifact-source
+
+      # These exact binaries can be downloaded on a Raspberry Pi for a bounded,
+      # synthetic-data smoke test. The source SHA is the branch head, not the
+      # synthetic merge commit used by pull_request workflow jobs.
+      - name: Build Linux ARM64 Raspberry Pi smoke-test artifact
+        working-directory: artifact-source
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          TARGET=aarch64-unknown-linux-gnu
+          VERSION=$(awk '/^\[workspace.package\]/{in_workspace=1;next} /^\[/{in_workspace=0} in_workspace && /^version = / {gsub(/"/, "", $3); print $3; exit}' Cargo.toml)
+          DIST="$GITHUB_WORKSPACE/dist/preppydb-arm64"
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-arm64-artifact"
+          mkdir -p "$DIST"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -n "$VERSION"
+          CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo build --locked --release --target "$TARGET" \
+            --bin preppydb-server --bin preppydb
+          install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/preppydb-server" "$DIST/preppydb-server"
+          install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release/preppydb" "$DIST/preppydb"
+          MAX_GLIBC_REQUIRED=""
+          for binary in "$DIST/preppydb-server" "$DIST/preppydb"; do
+            readelf -h "$binary" | grep 'Machine:.*AArch64' >/dev/null
+            readelf -l "$binary" | grep '/lib/ld-linux-aarch64.so.1' >/dev/null
+            required_glibc=$(readelf --version-info --wide "$binary" \
+              | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -V | tail -n 1 || true)
+            if [ -n "$required_glibc" ]; then
+              newest=$(printf '%s\n' GLIBC_2.35 "$required_glibc" | sort -V | tail -n 1)
+              if [ "$newest" != GLIBC_2.35 ]; then
+                echo "$binary requires $required_glibc, newer than the declared glibc 2.35 baseline" >&2
+                exit 1
+              fi
+              if [ -z "$MAX_GLIBC_REQUIRED" ] || \
+                [ "$(printf '%s\n' "$MAX_GLIBC_REQUIRED" "$required_glibc" | sort -V | tail -n 1)" = "$required_glibc" ]; then
+                MAX_GLIBC_REQUIRED="$required_glibc"
+              fi
+            fi
+          done
+          {
+            echo "version=$VERSION"
+            echo "commit=$SOURCE_COMMIT"
+            echo "target=$TARGET"
+            echo "glibc_minimum=2.35"
+            echo "glibc_symbol_max_required=$MAX_GLIBC_REQUIRED"
+            echo "rustc=$(rustc --version)"
+            echo "cross_compiler=$(aarch64-linux-gnu-gcc --version | sed -n '1p')"
+          } > "$DIST/manifest.txt"
+          (cd "$DIST" && sha256sum preppydb-server preppydb > SHA256SUMS)
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu "$DIST/preppydb-server" --help >/dev/null
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu "$DIST/preppydb" --help >/dev/null
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          tar -czf "$GITHUB_WORKSPACE/dist/preppydb-linux-arm64-gnu.tar.gz" \
+            -C "$DIST" .
+          (cd "$GITHUB_WORKSPACE/dist" && \
+            sha256sum preppydb-linux-arm64-gnu.tar.gz > preppydb-linux-arm64-gnu.tar.gz.sha256)
+
+      - name: Upload Linux ARM64 Raspberry Pi smoke-test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-linux-arm64-gnu-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            dist/preppydb-linux-arm64-gnu.tar.gz
+            dist/preppydb-linux-arm64-gnu.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload qemu test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-test-log
+          path: qemu-test.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ------------------------------------------------------------------- Lua client
+  lua-client:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
+    name: Lua/Luvit client (offline + live)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lua-client
+
+      - name: Install lupa and luvit
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user lupa
+          RUNTIME=$(mktemp -d "$RUNNER_TEMP/preppydb-lua.XXXXXXXX")
+          LUVI_BIN="$RUNTIME/luvi"
+          LUVI_URL=https://github.com/luvit/luvi/releases/download/v2.14.0/luvi-regular-Linux_x86_64
+          LUVI_SHA256=f79614b208f7999030a13fca22ffeb91c3d880487be2b5b7e2425ab42ec7a1d0
+          LUVI_SOURCE_COMMIT=450ec116aef6f8cb0cba83c7e61c9bce112d6deb
+
+          if curl --fail --location --silent --show-error \
+            --connect-timeout 15 --max-time 90 \
+            --retry 4 --retry-delay 2 --retry-max-time 60 --retry-all-errors \
+            "$LUVI_URL" -o "$LUVI_BIN"; then
+            printf '%s  %s\n' "$LUVI_SHA256" "$LUVI_BIN" | sha256sum --check
+          else
+            rm -f "$LUVI_BIN"
+            echo "::notice::Official luvi release download failed; building the pinned v2.14.0 source commit."
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends build-essential cmake libssl-dev perl pkg-config
+
+            LUVI_SOURCE="$RUNTIME/luvi-src"
+            git clone --no-checkout https://github.com/luvit/luvi.git "$LUVI_SOURCE"
+            git -C "$LUVI_SOURCE" checkout --detach "$LUVI_SOURCE_COMMIT"
+            test "$(git -C "$LUVI_SOURCE" rev-parse HEAD)" = "$LUVI_SOURCE_COMMIT"
+            test "$(git -C "$LUVI_SOURCE" rev-parse 'v2.14.0^{commit}')" = "$LUVI_SOURCE_COMMIT"
+            git -C "$LUVI_SOURCE" submodule update --init --recursive
+            if git -C "$LUVI_SOURCE" submodule status --recursive | grep -E '^[-+U]'; then
+              echo "luvi source submodules do not match the pinned gitlinks" >&2
+              exit 1
+            fi
+
+            make -C "$LUVI_SOURCE" regular-shared NPROCS=2
+            make -C "$LUVI_SOURCE" NPROCS=2
+            make -C "$LUVI_SOURCE" test NPROCS=2
+            install -m 0755 "$LUVI_SOURCE/build/luvi" "$LUVI_BIN"
+          fi
+          chmod +x "$RUNTIME/luvi"
+          LUVI_VERSION=$("$LUVI_BIN" --version 2>&1)
+          printf '%s\n' "$LUVI_VERSION"
+          printf '%s\n' "$LUVI_VERSION" | grep -F '2.14.0'
+          git clone --no-checkout https://github.com/luvit/lit.git "$RUNTIME/lit-src"
+          git -C "$RUNTIME/lit-src" checkout --detach 84fc5d729f1088b3b93bc9a55d1f7a245bca861d
+          git -C "$RUNTIME/lit-src" submodule update --init --recursive
+          test "$(git -C "$RUNTIME/lit-src" rev-parse HEAD)" = 84fc5d729f1088b3b93bc9a55d1f7a245bca861d
+          (cd "$RUNTIME/lit-src" && "$RUNTIME/luvi" . -- make . "$RUNTIME/lit" "$RUNTIME/luvi")
+          git clone --no-checkout https://github.com/luvit/luvit.git "$RUNTIME/luvit-src"
+          git -C "$RUNTIME/luvit-src" checkout --detach 8e5a6aca15b1e5bec2398a4dadc622aea4ead7ec
+          git -C "$RUNTIME/luvit-src" submodule update --init --recursive
+          test "$(git -C "$RUNTIME/luvit-src" rev-parse HEAD)" = 8e5a6aca15b1e5bec2398a4dadc622aea4ead7ec
+          (cd "$RUNTIME/luvit-src" && "$RUNTIME/lit" make . "$RUNTIME/luvit" "$RUNTIME/luvi")
+          "$RUNTIME/luvit" --version
+          echo "$RUNTIME" >> "$GITHUB_PATH"
+
+      - name: Real Luvit transport against local test server
+        run: luvit clients/luvit/tests/test_transport_live.lua
+
+      - name: Build server
+        run: cargo build --locked -p preppydb-server
+
+      - name: Start server and run the Lua suites
+        run: |
+          DATA=$(mktemp -d)
+          ./target/debug/preppydb-server --data-dir "$DATA" --bootstrap-token ci --init-only > /tmp/init.txt
+          TOKEN=$(sed -n '2p' /tmp/init.txt)
+          ./target/debug/preppydb-server --data-dir "$DATA" --listen 127.0.0.1:7077 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:7077/healthz > /dev/null; then break; fi
+            sleep 0.5
+          done
+          PREPPYDB_URL=http://127.0.0.1:7077 PREPPYDB_TOKEN="$TOKEN" \
+            python3 clients/luvit/tests/run_with_lupa.py --live
+
+      - name: Luvit transport against PreppyDB
+        run: bash clients/luvit/tests/run_live_server.sh
+
+  # --------------------------------------------------------------------- Docker
+  docker-images:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
+    name: Docker images (amd64 + arm64, never pushed)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      # push: false is deliberate. Publishing images needs an explicit maintainer
+      # decision; this workflow only proves that both architectures build.
+      - name: Build multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  docker-persistence:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_mode == 'full-ci'
+    name: Docker persistence (restart + recreate)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build amd64 image
+        run: docker build -f docker/Dockerfile -t preppydb:ci .
+      - name: Persistence test
+        env:
+          IMAGE: preppydb:ci
+        run: |
+          set -o pipefail
+          if ! bash -x scripts/docker-persistence-test.sh 2>&1 | tee persistence.log; then
+            grep -nE 'FAIL:|exit=|writable|refusing|preppydb:|Error|error' persistence.log \
+              | head -10 | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
+
+      - name: Upload persistence log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-persistence-log
+          path: persistence.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # This qualification is opt-in on manual dispatch only. It intentionally does
+  # not invoke the prepared load generator.
+  stress-isolation:
+    name: Stress test isolation qualification (no load)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_mode == 'isolation-only' && github.ref == 'refs/heads/arena/146caad2-preppydb'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check isolated hosted runner capacity
+        run: |
+          set -euo pipefail
+          echo "runner=${RUNNER_NAME}"
+          echo "image=${ImageOS:-unknown}/${ImageVersion:-unknown}"
+          uname -a
+          docker info --format 'docker={{.ServerVersion}} storage={{.Driver}} cgroup={{.CgroupVersion}}'
+          echo "PREPPYDB_DOCKER_CGROUP=$(docker info --format '{{.CgroupVersion}}')" >> "$GITHUB_ENV"
+          available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+          free_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+          test "$available_kib" -ge 4194304
+          test "$free_kib" -ge 5242880
+
+          echo "host_available_memory_kib=$available_kib"
+          echo "runner_temp_free_kib=$free_kib"
+
+      - name: Build release server binary
+        run: |
+          rustc --version
+          cargo --version
+          echo "PREPPYDB_RUSTC=$(rustc --version)" >> "$GITHUB_ENV"
+          echo "PREPPYDB_CARGO=$(cargo --version)" >> "$GITHUB_ENV"
+          cargo build --locked --release -p preppydb-server
+
+      - name: Parse test scripts without running a workload
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          for name in ("stress-isolation-check.py", "stress-load.py", "stress-sequence.py", "test_stress_sequence.py"):
+              ast.parse(Path("scripts", name).read_text(encoding="utf-8"), filename=name)
+              print(f"syntax ok: {name}")
+          PY
+          python3 -m unittest scripts/test_stress_sequence.py
+
+      - name: Qualify the capped isolation self-test without load
+        timeout-minutes: 5
+        env:
+          PREPPYDB_COMMIT: ${{ github.sha }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          docker_cgroup=$(docker info --format '{{.CgroupVersion}}')
+          PREPPYDB_DOCKER_CGROUP="$docker_cgroup" PREPPYDB_COMMIT="$GITHUB_SHA" \
+            python3 scripts/stress-sequence.py --isolation-only
+
+      - name: Upload isolation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-stress-isolation-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/preppydb-isolation-report.json
+            ${{ runner.temp }}/preppydb-docker-config.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # This mode requires both a manual dispatch and an unchecked-by-default
+  # approval input. It repeats isolation qualification for the same commit
+  # before any synthetic load and never runs on push or pull_request events.
+  bounded-stress:
+    name: First controlled stress ladder (manual approval only)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_mode == 'bounded-stress' && inputs.stress_approval == true && github.ref == 'refs/heads/arena/146caad2-preppydb'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check isolated hosted runner capacity
+        run: |
+          set -euo pipefail
+          uname -a
+          docker info --format 'docker={{.ServerVersion}} storage={{.Driver}} cgroup={{.CgroupVersion}}'
+          available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+          free_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+          test "$available_kib" -ge 4194304
+          test "$free_kib" -ge 5242880
+
+      - name: Verify a prior successful isolation-only run for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALIFICATION_RUN_ID: ${{ inputs.isolation_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$QUALIFICATION_RUN_ID" =~ ^[0-9]+$ ]] || {
+            echo "A successful isolation-only Actions run ID is required." >&2
+            exit 1
+          }
+          RUN_JSON=$(gh run view "$QUALIFICATION_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json event,conclusion,headSha,headBranch,jobs)
+          printf '%s' "$RUN_JSON" | jq -e --arg sha "$GITHUB_SHA" \
+            --arg branch "$GITHUB_REF_NAME" '
+              .event == "workflow_dispatch" and
+              .conclusion == "success" and
+              .headSha == $sha and
+              .headBranch == $branch and
+              any(.jobs[]; .name == "Stress test isolation qualification (no load)" and .conclusion == "success")
+            ' >/dev/null
+          ARTIFACT_NAME="preppydb-stress-isolation-${GITHUB_SHA}-${QUALIFICATION_RUN_ID}"
+          ARTIFACT_DIR="$RUNNER_TEMP/prior-isolation"
+          mkdir -p "$ARTIFACT_DIR"
+          gh run download "$QUALIFICATION_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" --dir "$ARTIFACT_DIR"
+          python3 - "$ARTIFACT_DIR/preppydb-isolation-report.json" "$GITHUB_SHA" <<'PY'
+          import json, pathlib, sys
+          report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert report["status"] == "passed", report
+          assert report["test"] == "isolation-only", report
+          assert report["commit"] == sys.argv[2], report
+          assert report["load_test_started"] is False, report
+          assert report["checks"]["cgroup"]["memory_max_bytes"] == 2 * 1024**3, report
+          assert report["checks"]["cgroup"]["swap_max_bytes"] == 0, report
+          assert report["checks"]["cgroup"]["pids_max"] == 512, report
+          assert report["checks"]["cgroup"]["cpu_max"]["cores"] == 2, report
+          print("Prior same-commit isolation report verified.")
+          PY
+
+      - name: Build release server binary
+        run: cargo build --locked --release -p preppydb-server
+
+      - name: Verify scripts parse without running a workload
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          for name in ("stress-isolation-check.py", "stress-load.py", "stress-sequence.py", "test_stress_sequence.py"):
+              ast.parse(Path("scripts", name).read_text(encoding="utf-8"), filename=name)
+              print(f"syntax ok: {name}")
+          PY
+          python3 -m unittest scripts/test_stress_sequence.py
+
+      - name: Qualify isolation, then run the bounded synthetic ladder
+        timeout-minutes: 5
+        env:
+          PREPPYDB_COMMIT: ${{ github.sha }}
+          PREPPYDB_ENABLE_STRESS: I_APPROVE_BOUNDED_PREPPYDB_STRESS
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          echo "rustc=$(rustc --version)"
+          echo "cargo=$(cargo --version)"
+          PREPPYDB_COMMIT="$GITHUB_SHA" python3 scripts/stress-sequence.py
+
+      - name: Upload bounded stress report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preppydb-first-stress-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/preppydb-first-stress-report.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # --------------------------------------------------------------------- summary
+  ci-status:
+    name: CI status
+    runs-on: ubuntu-22.04
+    needs: [linux-x86_64, windows-x86_64, linux-arm64, lua-client, docker-images, docker-persistence, stress-isolation, bounded-stress]
+    if: always()
+    steps:
+      - name: Reject an unknown manual mode
+        if: github.event_name == 'workflow_dispatch' && inputs.run_mode != 'isolation-only' && inputs.run_mode != 'full-ci' && inputs.run_mode != 'bounded-stress'
+        run: |
+          echo "::error::Select isolation-only, full-ci, or bounded-stress."
+          exit 1
+
+      - name: Fail if any job failed
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "one or more jobs failed"
+            exit 1
+          fi
+          echo "all jobs passed"

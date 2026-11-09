@@ -1,0 +1,12 @@
+# Builds happen inside the image; ship only sources.
+target/
+.git/
+.github/
+.claude/
+clients/luvit/tests/__pycache__/
+docs/
+*.md
+!crates/**/*.md
+.env
+.env.*
+data/

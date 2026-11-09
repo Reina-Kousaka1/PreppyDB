@@ -1,0 +1,27 @@
+# Rust build output
+/target/
+**/target/
+
+# Local database directories and backups
+/data/
+*.pdb
+*.wal
+*.bak
+*.replaced-*
+
+# Credentials and environment files — never commit these
+.env
+.env.*
+!.env.example
+auth.json
+*.token
+
+# Python bytecode (Lua test runner)
+__pycache__/
+*.pyc
+
+# Editors / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
