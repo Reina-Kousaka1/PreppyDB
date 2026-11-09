@@ -95,6 +95,31 @@ workload uses one ordinary `group` index and does not stress sparse documents wi
 unique indexes, which is the new verifier representation's targeted case. It is a hosted
 x86-64 measurement, not a Raspberry Pi result or a repeated-run estimate.
 
+### Repeat of the current resource qualification (run #160)
+
+Run #160 repeated the same paired benchmark on documentation-only head
+`cb84912d52397a2b0b804aeade3e8d6484cb989b`; the measured engine source was unchanged from
+run #159. It again used Tiny, 100,000 deterministic 1,024-byte documents, one `group`
+index, batches of 400, seed `20261108`, and a 60-second idle interval. Each configuration
+was measured once in the same Ubuntu x86-64 job. See [run #160](https://github.com/Reina-Kousaka1/PreppyDB/actions/runs/42573094086).
+
+| Measurement | Current branch | Pre-optimization baseline |
+| --- | ---: | ---: |
+| Idle RSS / CPU / threads | 3.79 MiB / 0.13% / 3 | 3.68 MiB / 0.15% / 3 |
+| Whole-process peak RSS (`VmHWM`) | 212.07 MiB | 376.53 MiB |
+| Checkpoint RSS before → after | 197.86 → 198.35 MiB | 201.70 → 201.70 MiB |
+| Checkpoint duration | 1.933 s | 2.075 s |
+| Recovery startup after SIGKILL | 1.426 s | 1.413 s |
+| Write batch p50 / p95 | 19.751 / 20.820 ms | 19.755 / 20.829 ms |
+
+The repeated pair shows 43.7% less whole-process peak RSS on this workload, consistent with
+run #159. The tiny differences in idle readings, checkpoint time, and write latency are
+single-run observations and should not be interpreted as a measured regression or speedup.
+This second run is still hosted x86-64 evidence, uses the same synthetic workload, and does
+not establish performance or memory use on a physical Raspberry Pi. The 3 idle threads
+include the main server thread, the configured single Tiny HTTP worker, and the signal
+handler thread; Tiny configures one HTTP worker, not a total process-thread count of one.
+
 ### Current small-load Tiny-profile WSL measurements
 
 The release server binary for PR source `b2c4f563ab40e74351666895f02ebeb881679adb` was
