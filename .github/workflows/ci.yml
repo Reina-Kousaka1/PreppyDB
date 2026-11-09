@@ -164,6 +164,36 @@ jobs:
             --output resource-baseline-results.json
           python3 -m json.tool resource-baseline-results.json
 
+      - name: Paired Tiny small-load resource ladder (100/1k/10k)
+        run: |
+          run_small_ladder() {
+            label="$1"
+            server="$2"
+            source_commit="$3"
+            manifest="$4"
+            for documents in 100 1000 10000; do
+              output="resource-${label}-${documents}.json"
+              python3 scripts/benchmark-resources.py \
+                --server "$server" \
+                --profile tiny \
+                --documents "$documents" \
+                --payload-bytes 900 \
+                --idle-seconds 10 \
+                --batch-size 500 \
+                --index-count 1 \
+                --allow-large-test \
+                --seed 20261108 \
+                --source-commit "$source_commit" \
+                --manifest "$manifest" \
+                --output "$output"
+              python3 -m json.tool "$output"
+            done
+          }
+          run_small_ladder current target/release/preppydb-server \
+            "$(git rev-parse HEAD)" resource-build-manifest.txt
+          run_small_ladder baseline target/baseline/release/preppydb-server \
+            f0eb9c3678a8309308a1b6c184a92b815f566a1b resource-baseline-manifest.txt
+
       - name: Upload resource benchmark JSON
         if: always()
         uses: actions/upload-artifact@v4
@@ -172,6 +202,12 @@ jobs:
           path: |
             resource-results.json
             resource-baseline-results.json
+            resource-current-100.json
+            resource-current-1000.json
+            resource-current-10000.json
+            resource-baseline-100.json
+            resource-baseline-1000.json
+            resource-baseline-10000.json
           if-no-files-found: ignore
           retention-days: 90
 
