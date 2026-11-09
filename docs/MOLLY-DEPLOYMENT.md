@@ -21,7 +21,13 @@ validated on the device, not as a report of a working deployment.
 | Clean shutdown | `tini` as PID 1, `stop_grace_period: 35s` so an in-flight `fsync` finishes |
 
 `PREPPYDB_SYNC_MODE` accepts `always`, `interval`, `interval:<ms>` or `never`;
-any other value makes the container exit 64 with a message. Do not use anything
+any other value makes the container exit 64 with a message.
+
+If the container is started with its own `--config <file>` (profiles, query
+planning, limits), the entrypoint does **not** add a second one — the operator's
+file wins and `sync_mode` has to be in it. Setting the environment variable in
+that case prints a warning and changes nothing, because silently overriding a
+config file would drop the rest of its settings. Do not use anything
 but `always` for a database an adapter writes to: with `interval` and `never`
 the server may acknowledge a write that a power loss still loses.
 
