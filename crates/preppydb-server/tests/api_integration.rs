@@ -102,7 +102,10 @@ where
         .create_token("writer", vec![Role::Write], None)
         .unwrap();
     let (reader, _) = auth.create_token("reader", vec![Role::Read], None).unwrap();
-    let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+    // Build the engine from the same configuration the server was given, not from the
+    // defaults: otherwise a test that tweaks `config.sync_mode` (or the repair policy)
+    // would exercise a server that reports the tweak and runs with the default.
+    let engine = Engine::open(config.engine_config()).unwrap();
     let counters = Arc::new(ServerCounters::default());
     let state = Arc::new(ApiState::new(engine, config.clone(), auth, counters));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -520,17 +520,13 @@ impl WalWriter {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                     interrupted += 1;
                     if interrupted > MAX_INTERRUPTED_RETRIES {
-                        return Err(DbError::io(
-                            format!(
-                                "syncing {} (interrupted {interrupted} times)",
-                                self.current.display()
-                            ),
-                            err,
-                        ));
+                        let context = format!("syncing {}", self.current.display());
+                        return Err(DbError::io(context, err));
                     }
                 }
                 Err(err) => {
-                    return Err(DbError::io(format!("syncing {}", self.current.display()), err))
+                    let context = format!("syncing {}", self.current.display());
+                    return Err(DbError::io(context, err));
                 }
             }
         }
