@@ -66,6 +66,32 @@ MESSAGE
     fi
 fi
 
+# Durability policy. `always` is the only mode in which an acknowledged write has been
+# handed to the device with fsync; a second database that an economy adapter writes to
+# must run in it, so it is the default here. The server has no CLI flag for sync mode, so
+# it is handed over in a generated config file; --data-dir and --listen below still take
+# precedence over anything in that file.
+SYNC_MODE="${PREPPYDB_SYNC_MODE:-always}"
+case "$SYNC_MODE" in
+    always|never|interval) ;;
+    interval:*)
+        INTERVAL_VALUE="${SYNC_MODE#interval:}"
+        case "$INTERVAL_VALUE" in
+            ""|*[!0-9]*)
+                echo "preppydb: PREPPYDB_SYNC_MODE '$SYNC_MODE' needs a millisecond value" >&2
+                exit 64
+                ;;
+        esac
+        ;;
+    *)
+        echo "preppydb: PREPPYDB_SYNC_MODE must be always, never, interval or interval:<ms>" >&2
+        exit 64
+        ;;
+esac
+RUNTIME_CONFIG="${TMPDIR:-/tmp}/preppydb-runtime-config.json"
+printf '{"sync_mode":"%s"}\n' "$SYNC_MODE" > "$RUNTIME_CONFIG"
+set -- "$@" --config "$RUNTIME_CONFIG"
+
 # Bind address 0.0.0.0 inside a container is fine (the container network is the trust
 # boundary), but the server only allows a non-loopback bind with an explicit flag.
 case "$LISTEN" in
