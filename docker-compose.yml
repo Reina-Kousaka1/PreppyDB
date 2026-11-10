@@ -17,7 +17,7 @@ services:
         CARGO_PROFILE: release
     image: preppydb:local
     container_name: preppydb
-    restart: unless-stopped
+    restart: "on-failure:5"
     environment:
       PREPPYDB_ADMIN_USER: ${PREPPYDB_ADMIN_USER:-admin}
       PREPPYDB_ADMIN_PASSWORD: ${PREPPYDB_ADMIN_PASSWORD:?set PREPPYDB_ADMIN_PASSWORD (min. 12 characters) before starting}

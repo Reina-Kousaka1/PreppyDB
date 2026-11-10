@@ -14,6 +14,7 @@ FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS build
 
 ARG TARGETARCH
 ARG CARGO_PROFILE=release
+ARG CARGO_BUILD_JOBS=1
 
 # Cross toolchain for arm64. The amd64 build uses the image's own gcc.
 RUN apt-get update \
@@ -40,7 +41,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
              export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc ;; \
       *) echo "unsupported TARGETARCH '$TARGETARCH' (want amd64 or arm64)" >&2; exit 1 ;; \
     esac; \
-    cargo build --locked --profile "$CARGO_PROFILE" --target "$RUST_TARGET" \
+    case "$CARGO_BUILD_JOBS" in ''|*[!0-9]*|0) echo "CARGO_BUILD_JOBS must be a positive integer" >&2; exit 64 ;; esac; \
+    cargo build --locked --jobs "$CARGO_BUILD_JOBS" --profile "$CARGO_PROFILE" --target "$RUST_TARGET" \
         --bin preppydb-server --bin preppydb; \
     mkdir -p /out; \
     cp "target/$RUST_TARGET/$CARGO_PROFILE/preppydb-server" /out/; \
