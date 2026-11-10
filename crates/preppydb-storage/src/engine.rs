@@ -1011,6 +1011,15 @@ impl Engine {
         })
     }
 
+    /// The durability policy this engine was opened with.
+    ///
+    /// Only [`SyncMode::Always`] means "a write that returned success has been handed to
+    /// the device with `fsync`". `Interval` and `Never` acknowledge before that, so a
+    /// caller that needs durability (a ledger, for example) must refuse to run on them.
+    pub fn sync_mode(&self) -> SyncMode {
+        self.cfg.sync_mode
+    }
+
     pub fn config(&self) -> &EngineConfig {
         &self.cfg
     }

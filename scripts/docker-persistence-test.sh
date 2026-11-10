@@ -5,7 +5,7 @@
 #   2. write a collection and a document;
 #   3. `docker restart` it, read the document back;
 #   4. remove the container and start a new one on the same volume, read it back;
-#   5. also verify that the WAL was checkpointed cleanly on SIGTERM.
+#   5. verify clean offline storage after a later graceful SIGTERM.
 #
 # Requires Docker. Run by CI; see docs/TESTING.md for what has and has not been executed.
 set -euo pipefail
@@ -56,6 +56,18 @@ wait_healthy() {
   fail "container $container never became healthy"
 }
 
+wait_docker_health() {
+  local container="$1"
+  for _ in $(seq 1 60); do
+    if [ "$(docker inspect --format '{{.State.Health.Status}}' "$container" 2>/dev/null || true)" = "healthy" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  docker inspect --format '{{json .State.Health}}' "$container" >&2 || true
+  fail "Docker healthcheck did not become healthy for $container"
+}
+
 for container in "$C1" "$C2"; do
   if docker inspect "$container" > /dev/null 2>&1; then
     fail "refusing to remove pre-existing container $container"
@@ -91,10 +103,20 @@ echo "    token length: ${#TOKEN}"
 # The entrypoint refuses to start when auth.json is missing and no password is given,
 # so subsequent runs only need the volume.
 docker run -d --name "$C1" -p "127.0.0.1:${PORT}:7077" \
+  -e PREPPYDB_SYNC_MODE=always \
   -v "${VOLUME}:/var/lib/preppydb" \
   --mount "source=${CONFIG_VOLUME},target=/run/preppydb-config,readonly" \
   "$IMAGE" --config /run/preppydb-config/config.json > /dev/null
 wait_healthy "$C1"
+wait_docker_health "$C1"
+
+echo "==> verifying effective durability configuration"
+VERSION=$(curl -fsS "${BASE}/v1/version")
+echo "$VERSION" | grep -q '"sync_mode"[[:space:]]*:[[:space:]]*"always"' \
+  || fail "version endpoint did not report sync_mode=always: $VERSION"
+echo "$VERSION" | grep -q '"durable_writes"[[:space:]]*:[[:space:]]*true' \
+  || fail "version endpoint did not report durable_writes=true: $VERSION"
+echo "    sync_mode=always, durable_writes=true"
 
 AUTH=(-H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json")
 
@@ -116,10 +138,11 @@ echo "$QUERY" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' \
   || fail "Ruby planned query did not return the indexed document: $QUERY"
 echo "    Ruby planner and Rust indexed execution: passed"
 
-echo "==> checkpoint and restart the same container"
-curl -fsS -X POST "${BASE}/v1/admin/checkpoint" "${AUTH[@]}" > /dev/null
-docker restart "$C1" > /dev/null
+echo "==> crash the process with uncheckpointed WAL data and recover on the same volume"
+docker kill --signal=KILL "$C1" > /dev/null
+docker start "$C1" > /dev/null
 wait_healthy "$C1"
+wait_docker_health "$C1"
 AFTER_RESTART=$(curl -fsS "${BASE}/v1/collections/persistence/documents/survivor" "${AUTH[@]}")
 echo "$AFTER_RESTART" | grep -q "still here" || fail "document lost after restart: $AFTER_RESTART"
 echo "    restart: document survived"
@@ -127,10 +150,12 @@ echo "    restart: document survived"
 echo "==> remove the container, start a new one on the same volume"
 docker rm -f "$C1" > /dev/null
 docker run -d --name "$C2" -p "127.0.0.1:${PORT}:7077" \
+  -e PREPPYDB_SYNC_MODE=always \
   -v "${VOLUME}:/var/lib/preppydb" \
   --mount "source=${CONFIG_VOLUME},target=/run/preppydb-config,readonly" \
   "$IMAGE" --config /run/preppydb-config/config.json > /dev/null
 wait_healthy "$C2"
+wait_docker_health "$C2"
 AFTER_RECREATE=$(curl -fsS "${BASE}/v1/collections/persistence/documents/survivor" "${AUTH[@]}")
 echo "$AFTER_RECREATE" | grep -q "still here" || fail "document lost after recreation: $AFTER_RECREATE"
 echo "    recreation: document survived"
@@ -162,7 +187,7 @@ echo "==> offline verify on the stopped directory"
 OFFLINE=$(docker run --rm --user "${APP_UID}:${APP_GID}" \
   -v "${VOLUME}:${DATA_DIR}" --entrypoint preppydb "$IMAGE" verify --data-dir "${DATA_DIR}")
 echo "$OFFLINE" | grep -qE '"ok"[[:space:]]*:[[:space:]]*true' || fail "offline verify reported problems: $OFFLINE"
-echo "    offline verify clean after checkpoint + shutdown"
+echo "    offline verify clean after graceful shutdown"
 
 echo
 echo "PASS: data survived restart and container recreation"

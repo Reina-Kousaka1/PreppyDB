@@ -17,12 +17,17 @@ services:
         CARGO_PROFILE: release
     image: preppydb:local
     container_name: preppydb
-    restart: unless-stopped
+    restart: "on-failure:5"
     environment:
       PREPPYDB_ADMIN_USER: ${PREPPYDB_ADMIN_USER:-admin}
       PREPPYDB_ADMIN_PASSWORD: ${PREPPYDB_ADMIN_PASSWORD:?set PREPPYDB_ADMIN_PASSWORD (min. 12 characters) before starting}
       PREPPYDB_LISTEN: 0.0.0.0:7077
       PREPPYDB_READ_ONLY: ${PREPPYDB_READ_ONLY:-0}
+      # `always` is the only mode in which a successful write has been fsynced before
+      # the response. Anything weaker is refused by the entrypoint's validation, and a
+      # client that needs durability (see docs/MOLLY-DEPLOYMENT.md) refuses to write
+      # when /v1/version does not report durable_writes.
+      PREPPYDB_SYNC_MODE: ${PREPPYDB_SYNC_MODE:-always}
     ports:
       # Publish on the loopback interface by default. Change to "7077:7077" only if the
       # API must be reachable from other hosts, and put TLS in front of it.

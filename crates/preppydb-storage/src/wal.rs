@@ -157,6 +157,8 @@ pub struct WalWriter {
     #[cfg(test)]
     fail_next_sync: bool,
     #[cfg(test)]
+    interrupt_next_syncs: u32,
+    #[cfg(test)]
     successful_syncs: u64,
 }
 
@@ -300,6 +302,8 @@ impl WalWriter {
             #[cfg(test)]
             fail_next_sync: false,
             #[cfg(test)]
+            interrupt_next_syncs: 0,
+            #[cfg(test)]
             successful_syncs: 0,
         })
     }
@@ -351,6 +355,8 @@ impl WalWriter {
             fail_next_append: None,
             #[cfg(test)]
             fail_next_sync: false,
+            #[cfg(test)]
+            interrupt_next_syncs: 0,
             #[cfg(test)]
             successful_syncs: 0,
         })
@@ -476,18 +482,54 @@ impl WalWriter {
         self.fail_next_sync = true;
     }
 
-    /// `fsync` the current segment.
-    pub fn sync(&mut self) -> Result<()> {
+    /// Make the next `count` `fsync` calls report `EINTR`.
+    #[cfg(test)]
+    pub(crate) fn inject_interrupted_sync(&mut self, count: u32) {
+        self.interrupt_next_syncs = count;
+    }
+
+    /// One raw `fsync` call, with the test hooks for injected failures.
+    fn sync_data(&mut self) -> std::io::Result<()> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_sync) {
-            return Err(DbError::io(
-                "injected WAL sync failure",
-                std::io::Error::other("injected"),
-            ));
+            return Err(std::io::Error::other("injected"));
         }
-        self.file
-            .sync_data()
-            .map_err(|err| DbError::io(format!("syncing {}", self.current.display()), err))?;
+        #[cfg(test)]
+        if self.interrupt_next_syncs > 0 {
+            self.interrupt_next_syncs -= 1;
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        self.file.sync_data()
+    }
+
+    /// `fsync` the current segment.
+    ///
+    /// `fsync` reports `EINTR` when a signal is delivered while it is running. That is not
+    /// an I/O failure: the call simply did not complete, nothing was lost, and retrying is
+    /// safe. Treating it as a durability failure would poison the engine — and therefore
+    /// every later read and write — over an ordinary `SIGCHLD`/`SIGTERM`. The retry count
+    /// is bounded so a pathological signal storm still surfaces as an error instead of
+    /// spinning, and it is reset for every call (one commit never accumulates retries from
+    /// a previous one).
+    pub fn sync(&mut self) -> Result<()> {
+        const MAX_INTERRUPTED_RETRIES: u32 = 8;
+        let mut interrupted = 0u32;
+        loop {
+            match self.sync_data() {
+                Ok(()) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    interrupted += 1;
+                    if interrupted > MAX_INTERRUPTED_RETRIES {
+                        let context = format!("syncing {}", self.current.display());
+                        return Err(DbError::io(context, err));
+                    }
+                }
+                Err(err) => {
+                    let context = format!("syncing {}", self.current.display());
+                    return Err(DbError::io(context, err));
+                }
+            }
+        }
         self.unsynced_frames = 0;
         #[cfg(test)]
         {
@@ -866,6 +908,40 @@ mod tests {
                 expires_at: None,
             },
         )
+    }
+
+    #[test]
+    fn interrupted_sync_is_retried_and_the_commit_still_lands() {
+        let dir = tempdir("interrupted-sync");
+        let mut wal = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always).unwrap();
+        // Two interrupted fsync calls must be transparently retried, not reported as a
+        // durability failure: `EINTR` means "the call did not complete", nothing more.
+        wal.inject_interrupted_sync(2);
+        wal.append(&record(1)).unwrap();
+        assert_eq!(wal.successful_syncs(), 1);
+        assert!(!wal.has_unsynced_frames());
+        let scan = scan_segment(wal.current_path()).unwrap();
+        assert!(scan.corruption.is_none());
+        assert!(scan.torn_tail.is_none());
+        assert_eq!(scan.records.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persistent_interrupt_is_reported_and_the_frame_stays_unsynced() {
+        let dir = tempdir("interrupted-sync-exhausted");
+        let mut wal = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Always).unwrap();
+        // More interrupts than the bounded retry allows: the append must fail with a real
+        // I/O error and must *not* claim the frame is durable. The frame is in the file,
+        // which is exactly why the engine treats a failed sync as an unknown outcome.
+        wal.inject_interrupted_sync(64);
+        let error = wal.append(&record(1)).unwrap_err();
+        assert_eq!(error.code(), crate::error::codes::IO_ERROR);
+        assert_eq!(wal.successful_syncs(), 0);
+        assert!(wal.has_unsynced_frames());
+        let scan = scan_segment(wal.current_path()).unwrap();
+        assert_eq!(scan.records.len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

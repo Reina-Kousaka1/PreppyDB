@@ -71,9 +71,17 @@ covered by the tests enumerated in [docs/TESTING.md](docs/TESTING.md); the items
   Docker architectures (build only, never pushed).
 * Documentation: architecture, API, operations, data model, pricing, CLI, testing,
   security policy.
+* `GET /v1/version` reports `sync_mode` and `durable_writes`, so a client that needs
+  "acknowledged means synced" can check the running server instead of trusting a default.
+* `docs/MOLLY-STORAGE-CONTRACT.md`: the contract for an application-side adapter
+  (one collection with tenant keys, conditional `PUT`, conflict/unknown-outcome rules,
+  size and performance limits, required migration and rollback tests).
 
 ### Fixed
 
+* WAL `fsync` retries `EINTR` up to eight times before reporting an error. An interrupted
+  `fsync` is not an I/O failure — retrying it is safe — and treating it as one used to
+  poison the engine (and therefore every later read and write) over an ordinary signal.
 * OS token and salt randomness now comes directly from the platform RNG through
   `getrandom`; failure is reported instead of falling back to time and process metadata.
 * The server handles termination signals without local unsafe code, finishes in-flight
