@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_BACKUP_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_VERIFY_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 pub const ARCHIVE_MAGIC: &[u8; 8] = b"PPDBBAK1";
 pub const ARCHIVE_END: &[u8; 8] = b"PPDBEND1";
@@ -750,13 +751,15 @@ pub fn verify_backup(archive: &Path) -> Result<Json> {
     let entries = reader.entries.clone();
     let header = reader.header.clone();
     reader.verify()?;
+    let verify_id = NEXT_VERIFY_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let temp = std::env::temp_dir().join(format!(
-        "preppydb-verify-{}-{}",
+        "preppydb-verify-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos()
+            .as_nanos(),
+        verify_id
     ));
     create_restore_directory(&temp)?;
     let _temp_guard = RestoreTempDirectory(temp.clone());

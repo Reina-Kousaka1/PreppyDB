@@ -26,6 +26,7 @@ use crate::snapshot::{self, WrittenSnapshot};
 use crate::store::{reserve_undo_bytes, ApplyMode, Collection, Doc, Limits, Store, StoreUndo};
 use crate::verify_store::VerifyStore;
 use crate::wal::{self, SyncMode, WalWriter};
+use preppydb_crypto::{hex_encode, sha256::Sha256};
 use preppydb_json::Json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -37,6 +38,20 @@ use std::time::Duration;
 
 type IndexEntryIter<'a> =
     dyn Iterator<Item = (&'a Vec<u8>, &'a std::collections::BTreeSet<Arc<str>>)> + 'a;
+
+fn hash_len_bytes(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update(&(bytes.len() as u64).to_be_bytes());
+    hash.update(bytes);
+}
+
+fn inventory_record_digest(collection: &str, key: &str, document: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"PREPPYDB-INVENTORY-RECORD-V1\0");
+    hash_len_bytes(&mut hash, collection.as_bytes());
+    hash_len_bytes(&mut hash, key.as_bytes());
+    hash_len_bytes(&mut hash, document);
+    hash.finish()
+}
 
 enum VerifyReplayStore {
     Compact(VerifyStore),
@@ -379,6 +394,46 @@ pub struct CollectionStats {
     pub indexes: Vec<String>,
     pub has_schema: bool,
     pub max_docs: Option<u64>,
+}
+
+/// Independently computed inventory of the current persisted logical view.
+/// Expired documents are included because they remain physically stored until swept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryManifest {
+    pub snapshot_id: String,
+    pub sequence: u64,
+    pub generation: u64,
+    pub collection_count: u64,
+    pub document_count: u64,
+    pub serialized_bytes: u64,
+    pub sha256: String,
+    pub collections: Vec<InventoryCollection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryCollection {
+    pub name: String,
+    pub document_count: u64,
+    pub metadata_bytes: u64,
+    pub document_bytes: u64,
+    pub metadata_sha256: String,
+    pub documents_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryRecord {
+    pub key: String,
+    pub serialized_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryPage {
+    pub sequence: u64,
+    pub generation: u64,
+    pub collection: String,
+    pub records: Vec<InventoryRecord>,
+    pub next_cursor: Option<String>,
 }
 
 impl EngineStats {
@@ -1632,6 +1687,179 @@ impl Engine {
             .values()
             .map(|coll| coll.meta.clone())
             .collect())
+    }
+
+    /// Computes a complete deterministic inventory from the currently opened
+    /// persisted view while holding one read lock. This is independent of any
+    /// importer progress receipts. Expired-but-not-swept documents are included.
+    pub fn inventory_manifest(&self) -> Result<InventoryManifest> {
+        let state = self.read();
+        self.check_healthy()?;
+        let mut root = Sha256::new();
+        root.update(b"PREPPYDB-INVENTORY-V1\0");
+        root.update(&state.seq.to_be_bytes());
+
+        let mut collections = Vec::with_capacity(state.store.collections.len());
+        let mut document_count = 0_u64;
+        let mut serialized_bytes = 0_u64;
+        for (name, collection) in &state.store.collections {
+            let metadata = collection.meta.to_json().canonical_bytes();
+            let metadata_bytes =
+                u64::try_from(metadata.len()).map_err(|_| DbError::LimitExceeded {
+                    limit: "inventory_bytes",
+                    max: u64::MAX,
+                    actual: u64::MAX,
+                })?;
+            let mut documents_hash = Sha256::new();
+            documents_hash.update(b"PREPPYDB-COLLECTION-DOCUMENTS-V1\0");
+            let mut collection_bytes = 0_u64;
+            let mut count = 0_u64;
+            for (key, doc) in &collection.docs {
+                let encoded = doc.to_json().canonical_bytes();
+                let size = u64::try_from(encoded.len()).map_err(|_| DbError::LimitExceeded {
+                    limit: "inventory_bytes",
+                    max: u64::MAX,
+                    actual: u64::MAX,
+                })?;
+                let record_hash = inventory_record_digest(name, key, &encoded);
+                documents_hash.update(&record_hash);
+                hash_len_bytes(&mut documents_hash, key.as_bytes());
+                count = count.checked_add(1).ok_or(DbError::LimitExceeded {
+                    limit: "inventory_documents",
+                    max: u64::MAX,
+                    actual: u64::MAX,
+                })?;
+                collection_bytes =
+                    collection_bytes
+                        .checked_add(size)
+                        .ok_or(DbError::LimitExceeded {
+                            limit: "inventory_bytes",
+                            max: u64::MAX,
+                            actual: u64::MAX,
+                        })?;
+            }
+            let metadata_digest = preppydb_crypto::sha256::sha256(&metadata);
+            let documents_digest = documents_hash.finish();
+            hash_len_bytes(&mut root, name.as_bytes());
+            root.update(&count.to_be_bytes());
+            root.update(&metadata_bytes.to_be_bytes());
+            root.update(&collection_bytes.to_be_bytes());
+            root.update(&metadata_digest);
+            root.update(&documents_digest);
+            document_count = document_count
+                .checked_add(count)
+                .ok_or(DbError::LimitExceeded {
+                    limit: "inventory_documents",
+                    max: u64::MAX,
+                    actual: u64::MAX,
+                })?;
+            serialized_bytes = serialized_bytes
+                .checked_add(metadata_bytes)
+                .and_then(|value| value.checked_add(collection_bytes))
+                .ok_or(DbError::LimitExceeded {
+                    limit: "inventory_bytes",
+                    max: u64::MAX,
+                    actual: u64::MAX,
+                })?;
+            collections.push(InventoryCollection {
+                name: name.clone(),
+                document_count: count,
+                metadata_bytes,
+                document_bytes: collection_bytes,
+                metadata_sha256: hex_encode(&metadata_digest),
+                documents_sha256: hex_encode(&documents_digest),
+            });
+        }
+        let digest = root.finish();
+        let snapshot_id = format!(
+            "preppydb:{}:{}:{}",
+            state.generation,
+            state.seq,
+            hex_encode(&digest)
+        );
+        Ok(InventoryManifest {
+            snapshot_id,
+            sequence: state.seq,
+            generation: state.generation,
+            collection_count: u64::try_from(collections.len()).unwrap_or(u64::MAX),
+            document_count,
+            serialized_bytes,
+            sha256: hex_encode(&digest),
+            collections,
+        })
+    }
+
+    /// Returns a bounded page of record identities and SHA-256 digests only if
+    /// the target still has the manifest's exact sequence and generation. Any
+    /// intervening write/checkpoint forces the caller to restart reconciliation.
+    pub fn inventory_page(
+        &self,
+        expected_sequence: u64,
+        expected_generation: u64,
+        collection: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<InventoryPage> {
+        const MAX_INVENTORY_PAGE: usize = 500;
+        if limit == 0 || limit > MAX_INVENTORY_PAGE {
+            return Err(DbError::validation(format!(
+                "inventory page limit must be between 1 and {MAX_INVENTORY_PAGE}"
+            )));
+        }
+        if after.is_some_and(|cursor| cursor.len() > 1_024) {
+            return Err(DbError::validation("inventory cursor is too long"));
+        }
+        let state = self.read();
+        self.check_healthy()?;
+        if state.seq != expected_sequence {
+            return Err(DbError::Conflict {
+                collection: "_inventory".into(),
+                key: "sequence".into(),
+                expected: Some(expected_sequence),
+                actual: Some(state.seq),
+            });
+        }
+        if state.generation != expected_generation {
+            return Err(DbError::Conflict {
+                collection: "_inventory".into(),
+                key: "generation".into(),
+                expected: Some(expected_generation),
+                actual: Some(state.generation),
+            });
+        }
+        let coll = state.store.collection(collection)?;
+        let lower = after.map(Bound::Excluded).unwrap_or(Bound::Unbounded);
+        let mut records = Vec::with_capacity(limit);
+        let mut has_more = false;
+        for (key, doc) in coll.docs.range::<str, _>((lower, Bound::Unbounded)) {
+            if records.len() == limit {
+                has_more = true;
+                break;
+            }
+            let encoded = doc.to_json().canonical_bytes();
+            let digest = inventory_record_digest(collection, key, &encoded);
+            records.push(InventoryRecord {
+                key: key.to_string(),
+                serialized_bytes: u64::try_from(encoded.len()).map_err(|_| {
+                    DbError::LimitExceeded {
+                        limit: "inventory_record_bytes",
+                        max: u64::MAX,
+                        actual: u64::MAX,
+                    }
+                })?,
+                sha256: hex_encode(&digest),
+            });
+        }
+        let next_cursor = has_more
+            .then(|| records.last().map(|record| record.key.clone()))
+            .flatten();
+        Ok(InventoryPage {
+            sequence: state.seq,
+            generation: state.generation,
+            collection: collection.to_owned(),
+            records,
+            next_cursor,
+        })
     }
 
     pub fn collection_meta(&self, name: &str) -> Result<CollectionMeta> {
@@ -3574,6 +3802,133 @@ mod document_undo_tests {
             drop(reopened);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    fn test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "preppydb-inventory-{label}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ))
+    }
+
+    #[test]
+    fn inventory_is_complete_deterministic_and_rebuilt_after_reopen() {
+        let dir = test_dir("reopen");
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("profiles", 1))
+            .unwrap();
+        engine
+            .create_collection(CollectionMeta::new("empty", 1))
+            .unwrap();
+        engine
+            .put(
+                "profiles",
+                "guild-2",
+                Json::obj().with("guild", Json::str("2")),
+                PutOptions::default(),
+            )
+            .unwrap();
+        engine
+            .put(
+                "profiles",
+                "guild-1",
+                Json::obj().with("guild", Json::str("1")),
+                PutOptions::default(),
+            )
+            .unwrap();
+
+        let first = engine.inventory_manifest().unwrap();
+        let second = engine.inventory_manifest().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.collections[0].name, "empty");
+        assert_eq!(first.collections[0].document_count, 0);
+        assert_eq!(first.collections[1].name, "profiles");
+        assert_eq!(first.collections[1].document_count, 2);
+        assert_eq!(first.document_count, 2);
+        assert_eq!(first.collection_count, 2);
+        assert_eq!(first.sha256.len(), 64);
+
+        let page = engine
+            .inventory_page(first.sequence, first.generation, "profiles", None, 1)
+            .unwrap();
+        assert_eq!(page.records[0].key, "guild-1");
+        assert!(page.next_cursor.is_some());
+        assert_eq!(page.records[0].sha256.len(), 64);
+        let second_page = engine
+            .inventory_page(
+                first.sequence,
+                first.generation,
+                "profiles",
+                page.next_cursor.as_deref(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(second_page.records[0].key, "guild-2");
+        assert_eq!(second_page.next_cursor, None);
+
+        engine.shutdown().unwrap();
+        drop(engine);
+        let reopened = Engine::open(EngineConfig::new(&dir)).unwrap();
+        let after_restart = reopened.inventory_manifest().unwrap();
+        assert_eq!(after_restart.document_count, 2);
+        assert_eq!(after_restart.sha256, first.sha256);
+        assert_eq!(
+            reopened
+                .inventory_page(
+                    after_restart.sequence,
+                    after_restart.generation,
+                    "profiles",
+                    None,
+                    2
+                )
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+        reopened.shutdown().unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inventory_pages_fail_closed_after_any_state_change() {
+        let dir = test_dir("stale");
+        let engine = Engine::open(EngineConfig::new(&dir)).unwrap();
+        engine
+            .create_collection(CollectionMeta::new("profiles", 1))
+            .unwrap();
+        engine
+            .put(
+                "profiles",
+                "one",
+                Json::obj().with("value", Json::int(1)),
+                PutOptions::default(),
+            )
+            .unwrap();
+        let manifest = engine.inventory_manifest().unwrap();
+        engine
+            .put(
+                "profiles",
+                "two",
+                Json::obj().with("value", Json::int(2)),
+                PutOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.inventory_page(manifest.sequence, manifest.generation, "profiles", None, 10),
+            Err(DbError::Conflict { .. })
+        ));
+        engine.shutdown().unwrap();
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
