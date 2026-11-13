@@ -405,3 +405,8 @@ See [DYNAMIC-PRICING.md](DYNAMIC-PRICING.md) for invariants.
 3. On `409 conflict` (`retryable: false`), re-read and reconcile the intended change;
    do not replay the same request automatically.
 4. On `429` (`retryable: true`), retry within a bound and honour `Retry-After`.
+# Complete administrative inventory
+
+See [INVENTORY-API.md](INVENTORY-API.md) for the administrator-only
+point-in-time logical inventory and epoch-bound document pages. It is a
+read-only integrity surface, not a migration or restore endpoint.

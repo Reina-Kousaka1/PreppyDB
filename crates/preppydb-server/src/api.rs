@@ -485,6 +485,114 @@ impl ApiState {
             }),
 
             // ---- collections -------------------------------------------------
+            ("GET", ["v1", "inventory"]) => self.with_role(
+                principal,
+                Role::Admin,
+                "reading the full database inventory",
+                || {
+                    let inventory = match self.engine.inventory_manifest() {
+                        Ok(inventory) => inventory,
+                        Err(error) => return db_error(error),
+                    };
+                    let collections = inventory
+                        .collections
+                        .into_iter()
+                        .map(|collection| {
+                            Json::obj()
+                                .with("name", Json::str(collection.name))
+                                .with(
+                                    "documents",
+                                    Json::str(collection.document_count.to_string()),
+                                )
+                                .with(
+                                    "metadata_bytes",
+                                    Json::str(collection.metadata_bytes.to_string()),
+                                )
+                                .with(
+                                    "document_bytes",
+                                    Json::str(collection.document_bytes.to_string()),
+                                )
+                                .with("metadata_sha256", Json::str(collection.metadata_sha256))
+                                .with("documents_sha256", Json::str(collection.documents_sha256))
+                        })
+                        .collect();
+                    ok_data(
+                        Json::obj()
+                            .with("snapshot_id", Json::str(inventory.snapshot_id))
+                            .with("sequence", Json::str(inventory.sequence.to_string()))
+                            .with("generation", Json::str(inventory.generation.to_string()))
+                            .with("complete", Json::Bool(true))
+                            .with(
+                                "collection_count",
+                                Json::str(inventory.collection_count.to_string()),
+                            )
+                            .with(
+                                "document_count",
+                                Json::str(inventory.document_count.to_string()),
+                            )
+                            .with(
+                                "serialized_bytes",
+                                Json::str(inventory.serialized_bytes.to_string()),
+                            )
+                            .with("sha256", Json::str(inventory.sha256))
+                            .with("collections", Json::Array(collections)),
+                    )
+                },
+            ),
+            ("GET", ["v1", "inventory", name, "documents"]) => self.with_role(
+                principal,
+                Role::Admin,
+                "reading a collection inventory page",
+                || {
+                    let sequence = match required_query_u64(request, "sequence") {
+                        Ok(value) => value,
+                        Err(response) => return response,
+                    };
+                    let generation = match required_query_u64(request, "generation") {
+                        Ok(value) => value,
+                        Err(response) => return response,
+                    };
+                    let limit = match bounded_query_usize(request, "limit", 100, 500) {
+                        Ok(value) => value,
+                        Err(response) => return response,
+                    };
+                    let after = request.query_param("after");
+                    match self
+                        .engine
+                        .inventory_page(sequence, generation, name, after, limit)
+                    {
+                        Ok(page) => {
+                            let count = page.records.len() as u64;
+                            let records = page
+                                .records
+                                .into_iter()
+                                .map(|record| {
+                                    Json::obj()
+                                        .with("key", Json::str(record.key))
+                                        .with(
+                                            "serialized_bytes",
+                                            Json::str(record.serialized_bytes.to_string()),
+                                        )
+                                        .with("sha256", Json::str(record.sha256))
+                                })
+                                .collect();
+                            ok_data(
+                                Json::obj()
+                                    .with("sequence", Json::str(page.sequence.to_string()))
+                                    .with("generation", Json::str(page.generation.to_string()))
+                                    .with("collection", Json::str(page.collection))
+                                    .with("count", Json::str(count.to_string()))
+                                    .with(
+                                        "next_cursor",
+                                        page.next_cursor.map(Json::str).unwrap_or(Json::Null),
+                                    )
+                                    .with("records", Json::Array(records)),
+                            )
+                        }
+                        Err(error) => db_error(error),
+                    }
+                },
+            ),
             ("GET", ["v1", "collections"]) => {
                 self.with_role(principal, Role::Read, "listing collections", || {
                     let metadata = match self.engine.try_list_collections() {
@@ -2389,6 +2497,45 @@ fn path_segments(path: &str) -> Vec<String> {
         .collect()
 }
 
+fn required_query_u64(request: &Request, name: &str) -> Result<u64, Response> {
+    request
+        .query_param(name)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            Response::error(
+                400,
+                "invalid_request",
+                format!("query parameter '{name}' must be an unsigned integer"),
+            )
+        })
+}
+
+fn bounded_query_usize(
+    request: &Request,
+    name: &str,
+    default: usize,
+    maximum: usize,
+) -> Result<usize, Response> {
+    let Some(raw) = request.query_param(name) else {
+        return Ok(default);
+    };
+    let value = raw.parse::<usize>().map_err(|_| {
+        Response::error(
+            400,
+            "invalid_request",
+            format!("query parameter '{name}' must be an unsigned integer"),
+        )
+    })?;
+    if value == 0 || value > maximum {
+        return Err(Response::error(
+            400,
+            "invalid_request",
+            format!("query parameter '{name}' must be between 1 and {maximum}"),
+        ));
+    }
+    Ok(value)
+}
+
 fn ok_data(data: Json) -> Response {
     Response::json(
         200,
@@ -2611,6 +2758,98 @@ mod tests {
         assert_eq!(json.get_str("key"), Some("k"));
         assert_eq!(json.get("version").unwrap().as_u64(), Some(2));
         assert!(json.get("expires_at").unwrap().is_null());
+    }
+
+    #[test]
+    fn full_inventory_requires_admin_and_pages_are_epoch_bound() {
+        let (dir, state) = state_with_empty_audit("inventory", false);
+        state
+            .engine
+            .create_collection(CollectionMeta::new("profiles", 1))
+            .unwrap();
+        state
+            .engine
+            .put(
+                "profiles",
+                "guild-1",
+                Json::obj().with("guild", Json::str("1")),
+                PutOptions::default(),
+            )
+            .unwrap();
+        let (secret, _) = state
+            .auth
+            .write()
+            .unwrap()
+            .create_token("inventory-admin", vec![Role::Admin], None)
+            .unwrap();
+        let mut request = Request {
+            method: "GET".into(),
+            path: "/v1/inventory".into(),
+            query: BTreeMap::new(),
+            headers: BTreeMap::from([("authorization".into(), format!("Bearer {secret}"))]),
+            body: Vec::new(),
+            peer: "127.0.0.1".into(),
+            request_id: "inventory-test".into(),
+        };
+        let response = state.handle(&request);
+        assert_eq!(response.status, 200);
+        let body = preppydb_json::parse(std::str::from_utf8(&response.body).unwrap()).unwrap();
+        let data = body.get("data").unwrap();
+        assert_eq!(data.get("complete").and_then(Json::as_bool), Some(true));
+        assert_eq!(data.get_str("document_count"), Some("1"));
+        let sequence = data.get_str("sequence").unwrap().to_string();
+        let generation = data.get_str("generation").unwrap().to_string();
+        let inventory_digest = data.get_str("sha256").unwrap().to_string();
+        assert_eq!(inventory_digest.len(), 64);
+
+        let mut anonymous = request.clone();
+        anonymous.headers.clear();
+        assert_ne!(state.handle(&anonymous).status, 200);
+
+        request.path = "/v1/inventory/profiles/documents".into();
+        request.query = BTreeMap::from([
+            ("sequence".into(), sequence),
+            ("generation".into(), generation),
+            ("limit".into(), "10".into()),
+        ]);
+        let response = state.handle(&request);
+        assert_eq!(response.status, 200);
+        let body = preppydb_json::parse(std::str::from_utf8(&response.body).unwrap()).unwrap();
+        let records = body
+            .get_path("data.records")
+            .and_then(Json::as_array)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            body.get_path("data.count").and_then(Json::as_str),
+            Some("1")
+        );
+        assert_eq!(records[0].get_str("key"), Some("guild-1"));
+        assert_eq!(records[0].get_str("sha256").unwrap().len(), 64);
+
+        request.query.insert("limit".into(), "501".into());
+        assert_eq!(state.handle(&request).status, 400);
+        request.query.insert("limit".into(), "10".into());
+
+        state
+            .engine
+            .put(
+                "profiles",
+                "guild-2",
+                Json::obj().with("guild", Json::str("2")),
+                PutOptions::default(),
+            )
+            .unwrap();
+        let stale = state.handle(&request);
+        assert_eq!(stale.status, 409);
+        let body = preppydb_json::parse(std::str::from_utf8(&stale.body).unwrap()).unwrap();
+        assert_eq!(
+            body.get_path("error.code").and_then(Json::as_str),
+            Some("conflict")
+        );
+
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn state_with_empty_audit(tag: &str, seed_pricing_record: bool) -> (PathBuf, ApiState) {

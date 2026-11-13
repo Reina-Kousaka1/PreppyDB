@@ -305,7 +305,7 @@ jobs:
                 throw "server exited with code $($server.ExitCode) before becoming healthy"
               }
               try {
-                $health = Invoke-RestMethod -Uri "http://127.0.0.1:7070/healthz" -Headers $closeHeaders -TimeoutSec 2
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:7070/healthz" -NoProxy -Headers $closeHeaders -TimeoutSec 2
                 if ($health.status -eq "ok") { $healthy = $true; break }
               } catch { }
             }
@@ -313,12 +313,12 @@ jobs:
             $headers = @{ Authorization = "Bearer $token"; Connection = "close" }
             $stage = "create collection"
             Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections" `
-                -Headers $headers -ContentType "application/json" -Body '{"name":"windows_smoke"}' | Out-Null
+                -Headers $headers -NoProxy -ContentType "application/json" -Body '{"name":"windows_smoke"}' | Out-Null
             $stage = "insert document"
             Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents" `
-                -Headers $headers -ContentType "application/json" -Body '{"key":"k","value":{"ok":true}}' | Out-Null
+                -Headers $headers -NoProxy -ContentType "application/json" -Body '{"key":"k","value":{"ok":true}}' | Out-Null
             $stage = "read document"
-            $doc = Invoke-RestMethod -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents/k" -Headers $headers
+            $doc = Invoke-RestMethod -Uri "http://127.0.0.1:7070/v1/collections/windows_smoke/documents/k" -NoProxy -Headers $headers
             if ($doc.data.value.ok -ne $true) { throw "document did not round-trip" }
             Write-Host "smoke test passed"
           } catch {

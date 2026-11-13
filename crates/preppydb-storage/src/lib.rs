@@ -33,7 +33,8 @@ pub mod wal;
 pub use catalog::{CollectionMeta, IndexMeta};
 pub use engine::{
     CheckedOp, CollectionStats, CompactReport, DataPaths, Engine, EngineConfig, EngineStats,
-    PutOptions, RecoveryNote, RepairPolicy, ScanOptions, VerifyReport,
+    InventoryCollection, InventoryManifest, InventoryPage, InventoryRecord, PutOptions,
+    RecoveryNote, RepairPolicy, ScanOptions, VerifyReport,
 };
 pub use error::{codes, DbError, Result};
 pub use record::{Op, Record};
