@@ -106,7 +106,10 @@ impl Op {
                 Ok(Op::Put {
                     collection: need_str("c")?,
                     key: need_str("k")?,
-                    value: value.get("v").cloned().unwrap_or(Json::Null),
+                    value: value
+                        .get("v")
+                        .cloned()
+                        .ok_or_else(|| DbError::corrupt("record", "put without 'v'"))?,
                     expires_at,
                 })
             }
@@ -221,7 +224,10 @@ impl Record {
             .get("seq")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| DbError::corrupt("record", "record is missing 'seq'"))?;
-        let ts = value.get_i64("ts").unwrap_or(0);
+        let ts = value
+            .get("ts")
+            .and_then(Json::as_i64)
+            .ok_or_else(|| DbError::corrupt("record", "record has missing or invalid 'ts'"))?;
         let op_json = value
             .get("op")
             .ok_or_else(|| DbError::corrupt("record", "record is missing 'op'"))?;
@@ -301,6 +307,53 @@ mod tests {
         let json =
             preppydb_json::parse(r#"{"op":"batch","ops":[{"op":"batch","ops":[]}]}"#).unwrap();
         assert!(Op::from_json(&json).is_err());
+    }
+
+    #[test]
+    fn missing_or_malformed_record_fields_are_corruption() {
+        for payload in [
+            r#"{"seq":1,"op":{"op":"del","c":"c","k":"k"}}"#,
+            r#"{"seq":1,"ts":"now","op":{"op":"del","c":"c","k":"k"}}"#,
+            r#"{"seq":1,"ts":1,"op":{"op":"put","c":"c","k":"k"}}"#,
+        ] {
+            let error = Record::decode_payload(payload.as_bytes()).unwrap_err();
+            assert_eq!(error.code(), crate::error::codes::CORRUPT_DATA);
+        }
+    }
+
+    #[test]
+    fn decoder_does_not_panic_on_truncations_or_deterministic_byte_mutations() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let payload = Record::new(
+            17,
+            1_700_000_000_000,
+            Op::Put {
+                collection: "fuzz_collection".into(),
+                key: "fuzz_key".into(),
+                value: Json::obj().with("value", Json::str("payload")),
+                expires_at: None,
+            },
+        )
+        .encode_payload();
+
+        for end in 0..payload.len() {
+            assert!(
+                catch_unwind(|| Record::decode_payload(&payload[..end])).is_ok(),
+                "decoder panicked on prefix length {end}"
+            );
+        }
+
+        for index in 0..payload.len() {
+            for replacement in [0, b'?', b'"', 0xff] {
+                let mut mutated = payload.clone();
+                mutated[index] = replacement;
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| Record::decode_payload(&mutated))).is_ok(),
+                    "decoder panicked after mutating byte {index} to {replacement:#04x}"
+                );
+            }
+        }
     }
 
     #[test]

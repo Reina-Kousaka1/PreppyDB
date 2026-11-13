@@ -157,8 +157,15 @@ pub struct WalWriter {
     #[cfg(test)]
     fail_next_sync: bool,
     #[cfg(test)]
+    interrupted_syncs_remaining: u8,
+    #[cfg(test)]
     successful_syncs: u64,
+    #[cfg(test)]
+    sync_attempts: u64,
 }
+
+/// Retry transient interruptions without hiding persistent sync failures.
+const MAX_SYNC_INTERRUPTED_RETRIES: u8 = 8;
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -300,7 +307,11 @@ impl WalWriter {
             #[cfg(test)]
             fail_next_sync: false,
             #[cfg(test)]
+            interrupted_syncs_remaining: 0,
+            #[cfg(test)]
             successful_syncs: 0,
+            #[cfg(test)]
+            sync_attempts: 0,
         })
     }
 
@@ -352,7 +363,11 @@ impl WalWriter {
             #[cfg(test)]
             fail_next_sync: false,
             #[cfg(test)]
+            interrupted_syncs_remaining: 0,
+            #[cfg(test)]
             successful_syncs: 0,
+            #[cfg(test)]
+            sync_attempts: 0,
         })
     }
 
@@ -476,6 +491,16 @@ impl WalWriter {
         self.fail_next_sync = true;
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_interrupted_syncs(&mut self, count: u8) {
+        self.interrupted_syncs_remaining = count;
+    }
+
+    #[cfg(test)]
+    fn sync_attempts(&self) -> u64 {
+        self.sync_attempts
+    }
+
     /// `fsync` the current segment.
     pub fn sync(&mut self) -> Result<()> {
         #[cfg(test)]
@@ -485,9 +510,40 @@ impl WalWriter {
                 std::io::Error::other("injected"),
             ));
         }
-        self.file
-            .sync_data()
-            .map_err(|err| DbError::io(format!("syncing {}", self.current.display()), err))?;
+        let mut interrupted_retries = 0;
+        loop {
+            #[cfg(test)]
+            let sync_result = {
+                self.sync_attempts = self.sync_attempts.saturating_add(1);
+                if self.interrupted_syncs_remaining > 0 {
+                    self.interrupted_syncs_remaining -= 1;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "injected interrupted WAL sync",
+                    ))
+                } else {
+                    self.file.sync_data()
+                }
+            };
+            #[cfg(not(test))]
+            let sync_result = self.file.sync_data();
+
+            match sync_result {
+                Ok(()) => break,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::Interrupted
+                        && interrupted_retries < MAX_SYNC_INTERRUPTED_RETRIES =>
+                {
+                    interrupted_retries += 1;
+                }
+                Err(err) => {
+                    return Err(DbError::io(
+                        format!("syncing {}", self.current.display()),
+                        err,
+                    ));
+                }
+            }
+        }
         self.unsynced_frames = 0;
         #[cfg(test)]
         {
@@ -882,6 +938,51 @@ mod tests {
         assert_eq!(scan.records.len(), 25);
         assert_eq!(scan.records[24].seq, 25);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sync_retries_up_to_eight_interrupted_calls_then_succeeds() {
+        let dir = tempdir("sync-interrupted-retries");
+        let mut wal = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Never).unwrap();
+        wal.append(&record(1)).unwrap();
+        assert!(wal.has_unsynced_frames());
+
+        wal.inject_interrupted_syncs(MAX_SYNC_INTERRUPTED_RETRIES);
+        wal.sync().unwrap();
+
+        assert_eq!(
+            wal.sync_attempts(),
+            u64::from(MAX_SYNC_INTERRUPTED_RETRIES) + 1
+        );
+        assert_eq!(wal.successful_syncs(), 1);
+        assert!(!wal.has_unsynced_frames());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sync_does_not_report_success_or_clear_frames_after_retry_limit() {
+        let dir = tempdir("sync-interrupted-exhausted");
+        let mut wal = WalWriter::open(&dir, 1, 64 * 1024 * 1024, SyncMode::Never).unwrap();
+        wal.append(&record(1)).unwrap();
+        assert!(wal.has_unsynced_frames());
+
+        wal.inject_interrupted_syncs(MAX_SYNC_INTERRUPTED_RETRIES + 1);
+        let err = wal.sync().unwrap_err();
+
+        assert_eq!(err.code(), crate::error::codes::IO_ERROR);
+        assert_eq!(
+            wal.sync_attempts(),
+            u64::from(MAX_SYNC_INTERRUPTED_RETRIES) + 1
+        );
+        assert_eq!(wal.successful_syncs(), 0);
+        assert!(wal.has_unsynced_frames());
+
+        // The failed call did not discard pending durability work; a later retry
+        // can still sync the same WAL contents.
+        wal.sync().unwrap();
+        assert_eq!(wal.successful_syncs(), 1);
+        assert!(!wal.has_unsynced_frames());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
